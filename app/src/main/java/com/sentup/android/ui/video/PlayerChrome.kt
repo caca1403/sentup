@@ -123,12 +123,17 @@ fun PlayerChromePanel(
     contentPadding: PaddingValues = PaddingValues(start = 16.dp, end = 16.dp, top = 10.dp, bottom = 12.dp),
     content: @Composable () -> Unit
 ) {
-    val shape = playerPanelShape()
+    // Flat timeline (Koda original look): the raised rounded card is gone. Only a
+    // soft bottom scrim so the readout stays legible over any frame - the seek
+    // line itself sits directly on the picture like YouTube's.
     Box(
         modifier = modifier
             .then(if (fillWidth) Modifier.fillMaxWidth() else Modifier)
-            .sentupCard(shape = shape, elevation = 2)
-            .sentupSpecularEdge(shape)
+            .background(
+                androidx.compose.ui.graphics.Brush.verticalGradient(
+                    colors = listOf(Color.Transparent, Color.Black.copy(alpha = 0.45f))
+                )
+            )
             .padding(contentPadding)
     ) {
         content()

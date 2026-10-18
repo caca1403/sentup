@@ -1488,9 +1488,8 @@ internal fun PlayerSeekBar(
     showSeekPreview: Boolean = true,
     onScrubbingChanged: (Boolean) -> Unit = {},
     onTonalSurface: Boolean = false,
-    /** Paused grows the thumb so the exact position reads at a glance. */
-    isPlaying: Boolean = true,
-    sponsorSegments: List<SponsorSegment> = emptyList()
+    sponsorSegments: List<SponsorSegment> = emptyList(),
+    isPlaying: Boolean = true
 ) {
     var isScrubbing by remember(mediaId) { mutableStateOf(false) }
     var scrubValue by remember(mediaId) { mutableFloatStateOf(0f) }
@@ -1522,15 +1521,20 @@ internal fun PlayerSeekBar(
         onDispose { currentScrubbingChanged(false) }
     }
 
-    val bufferedColor = MaterialTheme.colorScheme.primary.copy(alpha = 0.25f)
-    // One rail language everywhere: the texture is the surface's own variant
-    // at partial opacity, never a solid grey slab, and the unwatched run stays
-    // quieter than the buffered one ahead of it.
-    val inactiveTrackColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.6f)
+    val bufferedColor = if (onTonalSurface) {
+        MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.55f)
+    } else {
+        Color.White.copy(alpha = 0.35f)
+    }
+    val inactiveTrackColor = if (onTonalSurface) {
+        MaterialTheme.colorScheme.surfaceVariant
+    } else {
+        Color.White.copy(0.3f)
+    }
     val tickColor = if (onTonalSurface) {
         MaterialTheme.colorScheme.onSurface.copy(alpha = 0.85f)
     } else {
-        MaterialTheme.colorScheme.onSurface.copy(alpha = 0.5f)
+        Color.Black.copy(alpha = 0.85f)
     }
     val sliderColors = SliderDefaults.colors(
         thumbColor = MaterialTheme.colorScheme.primary,
@@ -1559,19 +1563,7 @@ internal fun PlayerSeekBar(
     )
     val markerRing = MaterialTheme.colorScheme.primary
     val markerCenter = MaterialTheme.colorScheme.onPrimary
-    // The track is drawn in a DrawScope, which is not a composition, so the
-    // palette is read up here and handed into the Canvas rather than read there.
-    val trackPrimary = MaterialTheme.colorScheme.primary
     val density = androidx.compose.ui.platform.LocalDensity.current
-    val seekHaptics = com.sentup.android.util.rememberSentupHaptics()
-    // A small disc while playing, and the same disc grown with a halo when the
-    // finger holds it or the video is paused - the position is then the thing
-    // the eye is after, and a 13dp dot is not.
-    val thumbRadiusDp by androidx.compose.animation.core.animateFloatAsState(
-        targetValue = if (isScrubbing || !isPlaying) 9.5f else 6.5f,
-        animationSpec = androidx.compose.animation.core.tween(durationMillis = 140),
-        label = "seekThumbSize"
-    )
 
     BoxWithConstraints(modifier = modifier.height(48.dp)) {
         val trackWidthPx = constraints.maxWidth
@@ -1605,50 +1597,25 @@ internal fun PlayerSeekBar(
                     val target = scrubValue.coerceIn(0f, 1f)
                     committedSeekValue = target
                     onSeek(target)
-                    seekHaptics.confirm()
                 }
                 isScrubbing = false
                 onScrubbingChanged(false)
             },
             enabled = durationMs > 0L,
             colors = sliderColors,
-            // Material's thumb is 44dp of expressive nothing on a 4dp line, and
-            // its track is a stadium twice that thick. Both are drawn here
-            // instead: a hairline with round ends and a small disc that swells
-            // under the finger, so the bar reads as fine machinery rather than a
-            // volume control.
-            thumb = {},
             track = { sliderState ->
                 // The track slot is measured to the slider's actual travel
                 // width and placed half a thumb in from either edge. Drawing
-                // track, buffer and chapter marks here keeps them on the same
-                // geometry as the gesture, instead of using the wider 48dp touch
-                // target.
+                // buffer and chapter marks here keeps them on the same geometry
+                // as the gesture, instead of using the wider 48dp touch target.
                 Box {
+                    SliderDefaults.Track(
+                        sliderState = sliderState,
+                        enabled = durationMs > 0L,
+                        colors = sliderColors,
+                    )
                     Canvas(modifier = Modifier.matchParentSize()) {
                         val centerY = size.height / 2f
-                        val trackStroke = 4.dp.toPx()
-                        // Inset by half the stroke so both round caps stay
-                        // inside the slot at 0% and 100%.
-                        val cap = trackStroke / 2f
-                        val usableWidth = (size.width - trackStroke).coerceAtLeast(0f)
-                        val thumbX = { value: Float ->
-                            cap + value.coerceIn(0f, 1f) * usableWidth
-                        }
-                        drawLine(
-                            color = inactiveTrackColor,
-                            start = Offset(cap, centerY),
-                            end = Offset(size.width - cap, centerY),
-                            strokeWidth = trackStroke,
-                            cap = StrokeCap.Round
-                        )
-                        drawLine(
-                            color = trackPrimary,
-                            start = Offset(cap, centerY),
-                            end = Offset(thumbX(sliderState.value), centerY),
-                            strokeWidth = trackStroke,
-                            cap = StrokeCap.Round
-                        )
                         val buffered = bufferedProgress.coerceIn(0f, 1f)
                         if (buffered > displayedProgress) {
                             // A round cap extends half the stroke past each
@@ -1713,27 +1680,10 @@ internal fun PlayerSeekBar(
                             }
                         }
 
-                        // Second to last, so the marker sits over buffer,
-                        // segments and chapter ticks.
+                        // Last, so the marker sits over buffer, segments and
+                        // chapter ticks; the Slider's thumb still draws above it.
                         drawScrubReturnMarker(
                             returnPoint.markerOrigin, returnMarker, markerRing, markerCenter
-                        )
-
-                        // The thumb, last so it sits above every mark on the
-                        // line: a small disc in the palette that grows - with a
-                        // halo - while held or paused.
-                        val thumbCenter = Offset(thumbX(sliderState.value), centerY)
-                        drawCircle(
-                            color = trackPrimary.copy(
-                                alpha = if (isScrubbing || !isPlaying) 0.18f else 0f
-                            ),
-                            radius = if (isScrubbing || !isPlaying) 13.dp.toPx() else 0f,
-                            center = thumbCenter
-                        )
-                        drawCircle(
-                            color = trackPrimary,
-                            radius = thumbRadiusDp.dp.toPx(),
-                            center = thumbCenter
                         )
                     }
                 }
