@@ -166,7 +166,7 @@ fun ChannelPickerSheet(
                             avatarUrl = own?.avatarUrl,
                             selected = currentPageId == null,
                             onClick = {
-                                repository.selectChannel(null)
+                                repository.selectChannel(null, own?.name, own?.avatarUrl)
                                 onDismiss()
                             }
                         )
@@ -180,7 +180,7 @@ fun ChannelPickerSheet(
                                 avatarUrl = channel.avatarUrl,
                                 selected = channel.pageId == currentPageId,
                                 onClick = {
-                                    repository.selectChannel(channel.pageId)
+                                    repository.selectChannel(channel.pageId, channel.name, channel.avatarUrl)
                                     onDismiss()
                                 }
                             )

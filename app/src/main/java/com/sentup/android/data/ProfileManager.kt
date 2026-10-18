@@ -73,7 +73,16 @@ data class Profile(
      * anonymous. Per-profile on purpose: a single global flag would badge the
      * wrong row the moment there is more than one account.
      */
-    val expired: Boolean = false
+    val expired: Boolean = false,
+    /**
+     * The name and photo of the brand channel this profile is pointed at,
+     * captured when the user picked it. A brand channel is the same login, so
+     * [name]/[avatarUrl] keep describing the account; these describe the
+     * channel shown while [resolvedPageId] is a brand. Null falls back to the
+     * account's own identity.
+     */
+    val channelName: String? = null,
+    val channelAvatarUrl: String? = null
 ) {
     val isLocal: Boolean get() = kind == ProfileKind.LOCAL
 
@@ -304,10 +313,26 @@ class ProfileManager(context: Context) {
      * wins" rule, because going back to the primary channel is a real choice and
      * the only way to express it is with a null.
      */
-    fun setPageId(id: String, pageId: String?) {
+    fun setPageId(
+        id: String,
+        pageId: String?,
+        channelName: String? = null,
+        channelAvatarUrl: String? = null,
+    ) {
         val current = get(id) ?: return
-        if (current.channelPinned && current.pageId == pageId) return
-        upsert(current.copy(pageId = pageId, channelPinned = true))
+        val name = channelName ?: current.channelName
+        val avatar = channelAvatarUrl ?: current.channelAvatarUrl
+        if (current.channelPinned && current.pageId == pageId &&
+            current.channelName == name && current.channelAvatarUrl == avatar
+        ) return
+        upsert(
+            current.copy(
+                pageId = pageId,
+                channelPinned = true,
+                channelName = name,
+                channelAvatarUrl = avatar,
+            )
+        )
     }
 
     fun setExpired(id: String, expired: Boolean) {
@@ -540,6 +565,8 @@ class ProfileManager(context: Context) {
         put("channelPinned", channelPinned)
         put("addedAt", addedAt)
         put("expired", expired)
+        put("channelName", channelName ?: JSONObject.NULL)
+        put("channelAvatarUrl", channelAvatarUrl ?: JSONObject.NULL)
     }
 
     private fun fromJson(obj: JSONObject): Profile? {
@@ -556,7 +583,9 @@ class ProfileManager(context: Context) {
             pageId = str("pageId"),
             channelPinned = obj.optBoolean("channelPinned", false),
             addedAt = obj.optLong("addedAt", 0L),
-            expired = obj.optBoolean("expired", false)
+            expired = obj.optBoolean("expired", false),
+            channelName = str("channelName"),
+            channelAvatarUrl = str("channelAvatarUrl")
         )
     }
 

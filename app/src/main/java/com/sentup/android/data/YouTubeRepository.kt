@@ -257,10 +257,10 @@ class YouTubeRepository(private val context: Context) {
      * were all read as the channel being left, which is the same work for the
      * same reason.
      */
-    fun selectChannel(pageId: String?): Boolean {
+    fun selectChannel(pageId: String?, channelName: String? = null, channelAvatarUrl: String? = null): Boolean {
         val target = pageId?.trim()?.takeIf { it.isNotBlank() }
         if (sessionManager.activePageId() == target) return false
-        sessionManager.savePageId(target)
+        sessionManager.savePageId(target, channelName, channelAvatarUrl)
         // A brand channel's logged_in=0 no longer marks the profile expired (see
         // YouTubeHttp.noteSessionState), but a flag left by an older build or an
         // in-flight brand response could still linger; clear it optimistically on

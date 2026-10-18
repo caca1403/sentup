@@ -30,7 +30,12 @@ class SessionManager(context: Context) {
         profileManager.updateIdentity(activeId(), avatarUrl = url)
     }
 
-    fun getUserAvatar(): String? = profileManager.active().avatarUrl
+    fun getUserAvatar(): String? {
+        val active = profileManager.active()
+        if (active.isLocal) return null
+        return if (active.resolvedPageId != null) (active.channelAvatarUrl ?: active.avatarUrl)
+        else active.avatarUrl
+    }
 
     /**
      * Save session cookies obtained from WebView.
@@ -205,10 +210,15 @@ class SessionManager(context: Context) {
      * channel it was read as. [YouTubeRepository.selectChannel] is the call
      * that does both.
      */
-    fun savePageId(pageId: String?) {
+    fun savePageId(pageId: String?, channelName: String? = null, channelAvatarUrl: String? = null) {
         val active = profileManager.active()
         if (active.isLocal) return
-        profileManager.setPageId(active.id, pageId?.trim()?.takeIf { it.isNotBlank() })
+        profileManager.setPageId(
+            active.id,
+            pageId?.trim()?.takeIf { it.isNotBlank() },
+            channelName,
+            channelAvatarUrl,
+        )
     }
 
     /**
@@ -222,7 +232,12 @@ class SessionManager(context: Context) {
      */
     fun activePageId(): String? = profileManager.active().resolvedPageId
 
-    fun getUserName(): String? = profileManager.active().name.takeIf { !profileManager.active().isLocal }
+    fun getUserName(): String? {
+        val active = profileManager.active()
+        if (active.isLocal) return null
+        val name = if (active.resolvedPageId != null) (active.channelName ?: active.name) else active.name
+        return name.takeIf { it.isNotBlank() }
+    }
 
     private fun activeId(): String = profileManager.active().id
 
