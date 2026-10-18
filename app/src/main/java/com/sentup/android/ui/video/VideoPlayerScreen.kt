@@ -1574,7 +1574,7 @@ internal fun PlayerSeekBar(
     // finger holds it or the video is paused - the position is then the thing
     // the eye is after, and a 13dp dot is not.
     val thumbRadiusDp by androidx.compose.animation.core.animateFloatAsState(
-        targetValue = if (isScrubbing || !isPlaying) 12f else 8f,
+        targetValue = if (isScrubbing) 11f else 5f,
         animationSpec = androidx.compose.animation.core.tween(durationMillis = 140),
         label = "seekThumbSize"
     )
@@ -1633,7 +1633,7 @@ internal fun PlayerSeekBar(
                 Box {
                     Canvas(modifier = Modifier.matchParentSize()) {
                         val centerY = size.height / 2f
-                        val trackStroke = 6.dp.toPx()
+                        val trackStroke = 4.dp.toPx()
                         // Inset by half the stroke so both round caps stay
                         // inside the slot at 0% and 100%.
                         val cap = trackStroke / 2f
@@ -1662,7 +1662,7 @@ internal fun PlayerSeekBar(
                             // seek bar's right edge (most visible once the
                             // whole video was cached). Map the buffer onto an
                             // inset centerline so both caps remain inside it.
-                            val strokeWidth = 6.dp.toPx()
+                            val strokeWidth = 4.dp.toPx()
                             val capRadius = strokeWidth / 2f
                             val drawableWidth = (size.width - strokeWidth).coerceAtLeast(0f)
                             val startX = capRadius + displayedProgress.coerceIn(0f, 1f) * drawableWidth
@@ -1731,9 +1731,9 @@ internal fun PlayerSeekBar(
                         val thumbCenter = Offset(thumbX(sliderState.value), centerY)
                         drawCircle(
                             color = trackPrimary.copy(
-                                alpha = if (isScrubbing || !isPlaying) 0.18f else 0f
+                                alpha = if (isScrubbing) 0.18f else 0f
                             ),
-                            radius = if (isScrubbing || !isPlaying) 16.dp.toPx() else 0f,
+                            radius = if (isScrubbing) 14.dp.toPx() else 0f,
                             center = thumbCenter
                         )
                         drawCircle(
