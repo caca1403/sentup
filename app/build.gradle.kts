@@ -31,8 +31,8 @@ android {
         // platform did not gain until API 33.
         minSdk = 30
         targetSdk = 36
-        versionCode = 30
-        versionName = "5.2"
+        versionCode = 40
+        versionName = "10.0"
         manifestPlaceholders["appLabel"] = "@string/app_name"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
@@ -170,11 +170,10 @@ kotlin {
 
 // Build info available via BuildConfig
 android.defaultConfig.apply {
-    // No upstream to ask about updates: this is a personal build, so every
-    // GitHub-backed feature is switched off by leaving the path empty rather
-    // than by pointing it at somebody else's repository.
-    buildConfigField("String", "GITHUB_REPO", "\"\"")
-    buildConfigField("String", "GITHUB_USERNAME", "\"\"")
+    // Pointed at the owner's own repository so the in-app updater can read
+    // `releases/latest` and prompt for new builds.
+    buildConfigField("String", "GITHUB_REPO", "\"caca1403/sentup\"")
+    buildConfigField("String", "GITHUB_USERNAME", "\"caca1403\"")
 }
 
 dependencies {
