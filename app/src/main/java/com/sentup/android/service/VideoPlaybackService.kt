@@ -1,0 +1,685 @@
+package com.sentup.android.service
+
+import com.sentup.android.util.KLog
+
+import android.app.PendingIntent
+import android.content.Context
+import android.content.Intent
+import android.content.pm.ServiceInfo
+import android.os.Build
+import android.os.Bundle
+import androidx.core.app.NotificationCompat
+import androidx.core.app.ServiceCompat
+import androidx.core.content.ContextCompat
+import androidx.core.graphics.drawable.IconCompat
+import androidx.media3.common.AudioAttributes
+import androidx.media3.common.DeviceInfo
+import androidx.media3.common.ForwardingPlayer
+import androidx.media3.common.MediaItem
+import androidx.media3.common.MediaMetadata
+import androidx.media3.common.Metadata
+import androidx.media3.common.PlaybackException
+import androidx.media3.common.PlaybackParameters
+import androidx.media3.common.Player
+import androidx.media3.common.Timeline
+import androidx.media3.common.TrackSelectionParameters
+import androidx.media3.common.Tracks
+import androidx.media3.common.VideoSize
+import androidx.media3.common.text.Cue
+import androidx.media3.common.text.CueGroup
+import androidx.media3.common.util.UnstableApi
+import androidx.media3.session.CommandButton
+import androidx.media3.session.CustomCommandPendingIntentBuilder
+import androidx.media3.session.DefaultMediaNotificationProvider
+import androidx.media3.session.MediaNotification
+import androidx.media3.session.MediaSession
+import androidx.media3.session.MediaSessionService
+import androidx.media3.session.PlaybackPendingIntentBuilder
+import androidx.media3.session.SessionCommand
+import androidx.media3.session.SessionResult
+import com.google.common.collect.ImmutableList
+import com.google.common.util.concurrent.Futures
+import com.google.common.util.concurrent.ListenableFuture
+import com.sentup.android.MainActivity
+import com.sentup.android.R
+
+/**
+ * Publishes the video player to the rest of Android.
+ *
+ * Music has always had this through [MusicService]: a MediaSession is what puts
+ * a track on the lock screen, in the notification shade's media area and in the
+ * output switcher, and what makes headset and Bluetooth transport buttons work.
+ * Video had none of it - it was an ExoPlayer owned by a ViewModel and nothing
+ * else - so a video kept playing with the screen off with no way to pause it
+ * short of reopening the app, and the system had no idea Sentüp was playing
+ * anything at all. It was also playing audio in the background with no
+ * foreground service, which is exactly the state Android kills processes for.
+ *
+ * The player deliberately stays owned by `VideoPlayerViewModel` (see docs/playback-video.md:
+ * the video pipeline is a plain ExoPlayer, not a service, so the surface, PiP
+ * and quality switching stay in one place). This service borrows it: it wraps
+ * the ViewModel's player in a session and owns nothing but that session, and it
+ * never releases the player.
+ *
+ * Lifecycle is driven from the ViewModel - [start] when a video loads, [stop]
+ * when the player is closed or the ViewModel dies. [stop] tears the session
+ * down synchronously on the caller's thread (which is the player's application
+ * thread) so the session is always gone before the player it wraps is released.
+ */
+@UnstableApi
+class VideoPlaybackService : MediaSessionService() {
+
+    private var session: MediaSession? = null
+
+    /** The ViewModel's own player, which [session] publishes through a [QueuePlayer]. */
+    private var sessionSource: Player? = null
+    private var queuePlayer: QueuePlayer? = null
+
+    /**
+     * Kept so [promoteToForeground] can post the same notification Media3 posts,
+     * rather than a hand-built one that would differ from it in every detail.
+     */
+    private var notificationProvider: DefaultMediaNotificationProvider? = null
+
+    /**
+     * What the system's previous/next buttons do. The video player holds one
+     * ExoPlayer media item and its queue lives in `VideoPlayerViewModel`, so
+     * ExoPlayer's own answer is useless: next would be permanently dead and
+     * previous would only ever seek to zero. The ViewModel answers instead.
+     */
+    interface QueueControls {
+        val canSkipNext: Boolean
+        val canSkipPrevious: Boolean
+        fun skipNext()
+        fun skipPrevious()
+    }
+
+    /**
+     * The ViewModel's player with previous/next routed to [QueueControls].
+     *
+     * Advertising the commands is not enough on its own: the session learns
+     * what is available from `onAvailableCommandsChanged`, and ExoPlayer fires
+     * that with its single-item view whenever the item changes. Every listener
+     * is therefore wrapped so those events carry the patched set, and
+     * [publishQueueCommands] fires one itself when the queue moves without the
+     * player noticing.
+     */
+    private class QueuePlayer(
+        player: Player,
+        private val controls: () -> QueueControls?
+    ) : ForwardingPlayer(player) {
+
+        private val listeners = HashMap<Player.Listener, Player.Listener>()
+
+        private fun patch(commands: Player.Commands): Player.Commands {
+            val queue = controls()
+            val builder = commands.buildUpon().removeAll(
+                COMMAND_SEEK_TO_NEXT,
+                COMMAND_SEEK_TO_NEXT_MEDIA_ITEM,
+                COMMAND_SEEK_TO_PREVIOUS,
+                COMMAND_SEEK_TO_PREVIOUS_MEDIA_ITEM
+            )
+            if (queue?.canSkipNext == true) {
+                builder.addAll(COMMAND_SEEK_TO_NEXT, COMMAND_SEEK_TO_NEXT_MEDIA_ITEM)
+            }
+            if (queue?.canSkipPrevious == true) {
+                builder.addAll(COMMAND_SEEK_TO_PREVIOUS, COMMAND_SEEK_TO_PREVIOUS_MEDIA_ITEM)
+            }
+            return builder.build()
+        }
+
+        override fun getAvailableCommands(): Player.Commands = patch(super.getAvailableCommands())
+
+        override fun isCommandAvailable(command: Int): Boolean =
+            getAvailableCommands().contains(command)
+
+        override fun hasNextMediaItem(): Boolean = controls()?.canSkipNext == true
+
+        override fun hasPreviousMediaItem(): Boolean = controls()?.canSkipPrevious == true
+
+        override fun seekToNext() {
+            controls()?.takeIf { it.canSkipNext }?.skipNext()
+        }
+
+        override fun seekToNextMediaItem() = seekToNext()
+
+        /**
+         * The music player's rule, which every system surface expects: a few
+         * seconds in, previous restarts the video; right at the start it goes
+         * to the one before.
+         */
+        override fun seekToPrevious() {
+            val queue = controls()
+            if (queue?.canSkipPrevious == true &&
+                currentPosition <= maxSeekToPreviousPosition
+            ) {
+                queue.skipPrevious()
+            } else if (isCommandAvailable(COMMAND_SEEK_IN_CURRENT_MEDIA_ITEM)) {
+                seekTo(0L)
+            }
+        }
+
+        override fun seekToPreviousMediaItem() {
+            controls()?.takeIf { it.canSkipPrevious }?.skipPrevious()
+        }
+
+        override fun addListener(listener: Player.Listener) {
+            val patched = listeners.getOrPut(listener) { PatchingListener(listener) }
+            super.addListener(patched)
+        }
+
+        override fun removeListener(listener: Player.Listener) {
+            val patched = listeners.remove(listener) ?: return
+            super.removeListener(patched)
+        }
+
+        /** Tell every listener the queue moved. Application thread only. */
+        fun publishQueueCommands() {
+            val commands = getAvailableCommands()
+            listeners.values.toList().forEach { it.onAvailableCommandsChanged(commands) }
+        }
+
+        /**
+         * Every callback is forwarded by hand. `Player.Listener by delegate`
+         * looks equivalent and is not: Kotlin's class delegation skips Java
+         * default methods, and every method on `Player.Listener` is one, so
+         * the session heard nothing but command changes - no timeline, no
+         * playback state - and never posted the notification. [scar]
+         */
+        @Suppress("DEPRECATION", "OVERRIDE_DEPRECATION")
+        private inner class PatchingListener(
+            private val delegate: Player.Listener
+        ) : Player.Listener {
+            override fun onAvailableCommandsChanged(availableCommands: Player.Commands) =
+                delegate.onAvailableCommandsChanged(patch(availableCommands))
+
+            override fun onEvents(player: Player, events: Player.Events) =
+                delegate.onEvents(player, events)
+            override fun onTimelineChanged(timeline: Timeline, reason: Int) =
+                delegate.onTimelineChanged(timeline, reason)
+            override fun onMediaItemTransition(mediaItem: MediaItem?, reason: Int) =
+                delegate.onMediaItemTransition(mediaItem, reason)
+            override fun onTracksChanged(tracks: Tracks) = delegate.onTracksChanged(tracks)
+            override fun onMediaMetadataChanged(mediaMetadata: MediaMetadata) =
+                delegate.onMediaMetadataChanged(mediaMetadata)
+            override fun onPlaylistMetadataChanged(mediaMetadata: MediaMetadata) =
+                delegate.onPlaylistMetadataChanged(mediaMetadata)
+            override fun onIsLoadingChanged(isLoading: Boolean) = delegate.onIsLoadingChanged(isLoading)
+            override fun onLoadingChanged(isLoading: Boolean) = delegate.onLoadingChanged(isLoading)
+            override fun onTrackSelectionParametersChanged(parameters: TrackSelectionParameters) =
+                delegate.onTrackSelectionParametersChanged(parameters)
+            override fun onPlayerStateChanged(playWhenReady: Boolean, playbackState: Int) =
+                delegate.onPlayerStateChanged(playWhenReady, playbackState)
+            override fun onPlaybackStateChanged(playbackState: Int) =
+                delegate.onPlaybackStateChanged(playbackState)
+            override fun onPlayWhenReadyChanged(playWhenReady: Boolean, reason: Int) =
+                delegate.onPlayWhenReadyChanged(playWhenReady, reason)
+            override fun onPlaybackSuppressionReasonChanged(playbackSuppressionReason: Int) =
+                delegate.onPlaybackSuppressionReasonChanged(playbackSuppressionReason)
+            override fun onIsPlayingChanged(isPlaying: Boolean) = delegate.onIsPlayingChanged(isPlaying)
+            override fun onRepeatModeChanged(repeatMode: Int) = delegate.onRepeatModeChanged(repeatMode)
+            override fun onShuffleModeEnabledChanged(shuffleModeEnabled: Boolean) =
+                delegate.onShuffleModeEnabledChanged(shuffleModeEnabled)
+            override fun onPlayerError(error: PlaybackException) = delegate.onPlayerError(error)
+            override fun onPlayerErrorChanged(error: PlaybackException?) =
+                delegate.onPlayerErrorChanged(error)
+            override fun onPositionDiscontinuity(reason: Int) = delegate.onPositionDiscontinuity(reason)
+            override fun onPositionDiscontinuity(
+                oldPosition: Player.PositionInfo,
+                newPosition: Player.PositionInfo,
+                reason: Int
+            ) = delegate.onPositionDiscontinuity(oldPosition, newPosition, reason)
+            override fun onPlaybackParametersChanged(playbackParameters: PlaybackParameters) =
+                delegate.onPlaybackParametersChanged(playbackParameters)
+            override fun onSeekBackIncrementChanged(seekBackIncrementMs: Long) =
+                delegate.onSeekBackIncrementChanged(seekBackIncrementMs)
+            override fun onSeekForwardIncrementChanged(seekForwardIncrementMs: Long) =
+                delegate.onSeekForwardIncrementChanged(seekForwardIncrementMs)
+            override fun onMaxSeekToPreviousPositionChanged(maxSeekToPreviousPositionMs: Long) =
+                delegate.onMaxSeekToPreviousPositionChanged(maxSeekToPreviousPositionMs)
+            override fun onAudioSessionIdChanged(audioSessionId: Int) =
+                delegate.onAudioSessionIdChanged(audioSessionId)
+            override fun onAudioAttributesChanged(audioAttributes: AudioAttributes) =
+                delegate.onAudioAttributesChanged(audioAttributes)
+            override fun onVolumeChanged(volume: Float) = delegate.onVolumeChanged(volume)
+            override fun onSkipSilenceEnabledChanged(skipSilenceEnabled: Boolean) =
+                delegate.onSkipSilenceEnabledChanged(skipSilenceEnabled)
+            override fun onDeviceInfoChanged(deviceInfo: DeviceInfo) = delegate.onDeviceInfoChanged(deviceInfo)
+            override fun onDeviceVolumeChanged(volume: Int, muted: Boolean) =
+                delegate.onDeviceVolumeChanged(volume, muted)
+            override fun onVideoSizeChanged(videoSize: VideoSize) = delegate.onVideoSizeChanged(videoSize)
+            override fun onSurfaceSizeChanged(width: Int, height: Int) =
+                delegate.onSurfaceSizeChanged(width, height)
+            override fun onRenderedFirstFrame() = delegate.onRenderedFirstFrame()
+            override fun onCues(cues: List<Cue>) = delegate.onCues(cues)
+            override fun onCues(cueGroup: CueGroup) = delegate.onCues(cueGroup)
+            override fun onMetadata(metadata: Metadata) = delegate.onMetadata(metadata)
+        }
+    }
+
+    override fun onCreate() {
+        super.onCreate()
+
+        // Its own notification id and channel: the default provider uses one
+        // fixed id, so sharing it with MusicService would mean whichever
+        // pipeline posted last erased the other's notification.
+        val provider = DefaultMediaNotificationProvider.Builder(this)
+            .setNotificationId(NOTIFICATION_ID)
+            .setChannelId(CHANNEL_ID)
+            .setChannelName(R.string.video_playback_channel_name)
+            .build()
+            .apply { setSmallIcon(R.drawable.ic_playback_notification) }
+        notificationProvider = provider
+        setMediaNotificationProvider(provider)
+
+        instance = this
+
+        val player = pendingPlayer
+        if (player == null) {
+            // Nothing to publish - the ViewModel went away between the start
+            // request and the service actually being created, or the system
+            // restarted us stickily after the process died.
+            KLog.w(TAG, "Started without a player; stopping")
+            stopSelf()
+            return
+        }
+        ensureSession(player)
+    }
+
+    /**
+     * A service started with `startForegroundService` has a few seconds to call
+     * `startForeground` or the platform kills the process with
+     * `ForegroundServiceDidNotStartInTimeException`, so the promotion cannot
+     * wait for playback to get going.
+     *
+     * Media3 does promote by itself - [promoteToForeground] only covers the gap
+     * until it does, and its notification replaces ours (same id) as soon as its
+     * controller for the session connects.
+     */
+    override fun onStartCommand(intent: Intent?, flags: Int, startId: Int): Int {
+        // First: this is where Media3 answers the start intents it sends itself -
+        // media buttons from the headset or a car, and its own sticky restart -
+        // and it is what adds the session in those cases.
+        val result = super.onStartCommand(intent, flags, startId)
+
+        val published = sessions.firstOrNull() ?: session
+        if (published == null) {
+            // Nothing to announce: the ViewModel went away between the start
+            // request and the service coming up, or the system restarted us
+            // stickily after the process died. `onCreate` already stopped us;
+            // this only keeps such a start from leaving an empty foreground
+            // service behind.
+            stopSelf(startId)
+            return result
+        }
+
+        if (!promoteToForeground(published)) {
+            // Staying in the foreground without a notification is not an option:
+            // the platform kills the service a few seconds later, which would
+            // take the session - and with it the lock screen entry - with it.
+            KLog.w(TAG, "Could not go foreground for video playback; stopping")
+            stopSelf(startId)
+        }
+        return result
+    }
+
+    /**
+     * Post the media notification and promote, using the very provider Media3
+     * posts through so the two cannot drift apart.
+     *
+     * Deliberately not Media3's own promotion: it happens once its controller
+     * for the session has connected *and* playback has left the idle state, and
+     * a video that is buffering - or opened and not yet started - can outlast
+     * the deadline the platform gives a foreground service to promote in.
+     */
+    private fun promoteToForeground(published: MediaSession): Boolean {
+        val provider = notificationProvider
+        if (provider == null) {
+            KLog.e(TAG, "No notification provider: cannot go foreground")
+            return false
+        }
+        val notification = try {
+            provider.createNotification(
+                published,
+                seekLayout(),
+                NotificationActionFactory(),
+                // The callback is how the provider asks to be called back when a
+                // late artwork load changes the notification it built. Media3
+                // replaces ours with its own within a few hundred milliseconds,
+                // so there is nothing left to update by the time that arrives.
+                { /* no callback: our notification is short-lived by design */ }
+            )
+        } catch (e: Exception) {
+            KLog.e(TAG, "Could not build the video media notification", e)
+            return false
+        }
+
+        return try {
+            ServiceCompat.startForeground(
+                this,
+                notification.notificationId,
+                notification.notification,
+                if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.Q) {
+                    ServiceInfo.FOREGROUND_SERVICE_TYPE_MEDIA_PLAYBACK
+                } else {
+                    0
+                }
+            )
+            true
+        } catch (e: Exception) {
+            KLog.e(TAG, "startForeground refused for video playback", e)
+            false
+        }
+    }
+
+    /**
+     * The action factory Media3 builds its own notification's buttons with.
+     *
+     * Media3's factory is not public API, but the two builders it uses are, and
+     * they build the same intents it would: a media button routed through the
+     * service, and a custom command carrying its [SessionCommand]. Every method
+     * here must return a real action - the provider adds the result to the
+     * notification without checking it for null.
+     */
+    private inner class NotificationActionFactory : MediaNotification.ActionFactory {
+
+        override fun createMediaAction(
+            mediaSession: MediaSession,
+            icon: IconCompat,
+            displayName: CharSequence,
+            commandButton: Int
+        ): NotificationCompat.Action = NotificationCompat.Action.Builder(
+            icon,
+            displayName,
+            mediaButtonIntent(mediaSession, commandButton)
+        ).build()
+
+        override fun createCustomAction(
+            mediaSession: MediaSession,
+            icon: IconCompat,
+            displayName: CharSequence,
+            action: String,
+            extras: Bundle
+        ): NotificationCompat.Action = NotificationCompat.Action.Builder(
+            icon,
+            displayName,
+            customCommandIntent(mediaSession, SessionCommand(action, extras))
+        ).build()
+
+        override fun createCustomActionFromCustomCommandButton(
+            mediaSession: MediaSession,
+            customCommandButton: CommandButton
+        ): NotificationCompat.Action {
+            // Media3 only routes custom-layout buttons here after checking they
+            // carry a custom command, so this is that command and never a
+            // synthetic one.
+            val command = checkNotNull(customCommandButton.sessionCommand) {
+                "Custom layout entry ${customCommandButton.displayName} carries no command"
+            }
+            return NotificationCompat.Action.Builder(
+                IconCompat.createWithResource(this@VideoPlaybackService, customCommandButton.iconResId),
+                customCommandButton.displayName,
+                customCommandIntent(mediaSession, command)
+            ).build()
+        }
+
+        override fun createMediaActionPendingIntent(
+            mediaSession: MediaSession,
+            commandButton: Int
+        ): PendingIntent = mediaButtonIntent(mediaSession, commandButton)
+
+        private fun mediaButtonIntent(mediaSession: MediaSession, commandButton: Int): PendingIntent =
+            PlaybackPendingIntentBuilder(
+                this@VideoPlaybackService,
+                commandButton,
+                VideoPlaybackService::class.java
+            )
+                // As Media3 does it: a play command brings the service up in the
+                // foreground, a pause command need not.
+                .setStartAsForegroundService(!mediaSession.player.playWhenReady)
+                .setSessionId(mediaSession.id)
+                .build()
+
+        private fun customCommandIntent(
+            mediaSession: MediaSession,
+            command: SessionCommand
+        ): PendingIntent = CustomCommandPendingIntentBuilder(
+            this@VideoPlaybackService,
+            VideoPlaybackService::class.java,
+            command
+        )
+            .setSessionId(mediaSession.id)
+            .build()
+    }
+
+    /**
+     * Make sure a session is publishing [player], building one if there is not
+     * one already.
+     *
+     * Needed because `stopService` is asynchronous: closing a video and opening
+     * another one quickly enough finds the service still alive with its session
+     * already gone, and `onCreate` will not run a second time to rebuild it.
+     * Without this the second video would play with nothing on the lock screen.
+     */
+    private fun ensureSession(player: Player) {
+        session?.let {
+            if (sessionSource === player) return
+            releaseSession()
+        }
+        val published = QueuePlayer(player) { pendingControls }
+
+        val sessionIntent = PendingIntent.getActivity(
+            this,
+            0,
+            Intent(this, MainActivity::class.java),
+            PendingIntent.FLAG_IMMUTABLE or PendingIntent.FLAG_UPDATE_CURRENT
+        )
+
+        val built = try {
+            MediaSession.Builder(this, published)
+                // A process may not hold two sessions with the same id, and
+                // MusicService already owns the default (empty) one.
+                .setId(SESSION_ID)
+                .setSessionActivity(sessionIntent)
+                .setCallback(VideoSessionCallback())
+                .setCustomLayout(seekLayout())
+                .build()
+        } catch (e: Exception) {
+            KLog.e(TAG, "Could not build the video media session", e)
+            stopSelf()
+            return
+        }
+        session = built
+        sessionSource = player
+        queuePlayer = published
+        // Explicit, not incidental: Media3 registers a session automatically
+        // only when a MediaController binds and onGetSession answers. Nothing in
+        // Sentüp binds to this service - the ViewModel already has the player - so
+        // without this the session would exist and the notification would never
+        // be posted.
+        addSession(built)
+    }
+
+    override fun onGetSession(controllerInfo: MediaSession.ControllerInfo): MediaSession? = session
+
+    /**
+     * Swiped out of recents. The player belongs to the ViewModel, which is
+     * being torn down with the task, so pause and go away rather than leaving
+     * an undismissable foreground notification behind.
+     */
+    override fun onTaskRemoved(rootIntent: Intent?) {
+        pauseAllPlayersAndStopSelf()
+    }
+
+    override fun onDestroy() {
+        releaseSession()
+        if (instance === this) instance = null
+        super.onDestroy()
+    }
+
+    /** Drop the session without touching the player - the ViewModel owns that. */
+    private fun releaseSession() {
+        val current = session ?: return
+        session = null
+        sessionSource = null
+        queuePlayer = null
+        try {
+            removeSession(current)
+        } catch (e: Exception) {
+            // Nothing left to clean up after the failed removal, and the release
+            // below is what keeps a session from outliving its player.
+            KLog.e(TAG, "Could not remove the video media session", e)
+        }
+        current.release()
+    }
+
+    /**
+     * Back 10 / forward 10 in the media notification, matching the double-tap
+     * seek on the player and the PiP controls.
+     *
+     * These have to be custom session commands rather than
+     * [Player.COMMAND_SEEK_BACK] buttons: Media3's notification provider only
+     * promotes custom-layout entries that carry a [SessionCommand]. Previous
+     * and next, when the queue has them, take the built-in slots beside play;
+     * these two fill the extra slots after them.
+     */
+    private fun seekLayout(): ImmutableList<CommandButton> = ImmutableList.of(
+        CommandButton.Builder()
+            .setDisplayName("Back 10 seconds")
+            .setIconResId(R.drawable.ic_media_replay_10)
+            .setSessionCommand(SessionCommand(ACTION_REWIND, Bundle.EMPTY))
+            .build(),
+        CommandButton.Builder()
+            .setDisplayName("Forward 10 seconds")
+            .setIconResId(R.drawable.ic_media_forward_10)
+            .setSessionCommand(SessionCommand(ACTION_FORWARD, Bundle.EMPTY))
+            .build()
+    )
+
+    private inner class VideoSessionCallback : MediaSession.Callback {
+
+        override fun onConnect(
+            session: MediaSession,
+            controller: MediaSession.ControllerInfo
+        ): MediaSession.ConnectionResult {
+            return MediaSession.ConnectionResult.AcceptedResultBuilder(session)
+                .setAvailableSessionCommands(
+                    MediaSession.ConnectionResult.DEFAULT_SESSION_COMMANDS.buildUpon()
+                        .add(SessionCommand(ACTION_REWIND, Bundle.EMPTY))
+                        .add(SessionCommand(ACTION_FORWARD, Bundle.EMPTY))
+                        .build()
+                )
+                // Previous and next stay granted: QueuePlayer only advertises
+                // them while the ViewModel's queue has somewhere to go, and
+                // routes them there rather than to the single ExoPlayer item.
+                .build()
+        }
+
+        override fun onCustomCommand(
+            session: MediaSession,
+            controller: MediaSession.ControllerInfo,
+            customCommand: SessionCommand,
+            args: Bundle
+        ): ListenableFuture<SessionResult> {
+            when (customCommand.customAction) {
+                // seekBack/seekForward, not a raw seekTo: the player is built
+                // with 10s increments, so these agree with the UI by
+                // construction and clamp at the ends of the media for free.
+                ACTION_REWIND -> session.player.seekBack()
+                ACTION_FORWARD -> session.player.seekForward()
+                else -> return Futures.immediateFuture(
+                    SessionResult(SessionResult.RESULT_ERROR_NOT_SUPPORTED)
+                )
+            }
+            return Futures.immediateFuture(SessionResult(SessionResult.RESULT_SUCCESS))
+        }
+    }
+
+    companion object {
+        private const val TAG = "VideoPlaybackService"
+        private const val SESSION_ID = "sentup_video"
+        private const val CHANNEL_ID = "video_playback"
+
+        // Must differ from DefaultMediaNotificationProvider's default (which is
+        // what MusicService posts under) and from MusicProgressLiveUpdate's.
+        private const val NOTIFICATION_ID = 1002
+
+        const val ACTION_REWIND = "com.sentup.android.VIDEO_REWIND"
+        const val ACTION_FORWARD = "com.sentup.android.VIDEO_FORWARD"
+
+        @Volatile
+        private var instance: VideoPlaybackService? = null
+
+        /**
+         * The player the session will wrap, handed over before the service is
+         * created. Held statically because there is no DI here and a Service
+         * cannot be given constructor arguments.
+         */
+        @Volatile
+        internal var pendingPlayer: Player? = null
+            private set
+
+        /** Where previous/next go. Held for the same reason as [pendingPlayer]. */
+        @Volatile
+        private var pendingControls: QueueControls? = null
+
+        /**
+         * The queue changed - a video started, the playlist was edited, Up Next
+         * arrived - so previous/next may have become available or gone away.
+         * Call on the player's application thread.
+         */
+        fun publishQueueCommands() {
+            instance?.queuePlayer?.publishQueueCommands()
+        }
+
+        /**
+         * Publish [player] to the system. Safe to call repeatedly - once the
+         * service is up this is just a no-op start command.
+         *
+         * A foreground start rather than a plain one: video keeps playing with
+         * the screen off, which is exactly the state Android ends a background
+         * service in, and a refused plain start from the background (Android 12
+         * onwards) meant the video silently never reached the lock screen.
+         * [onStartCommand] promotes to foreground to answer it.
+         */
+        fun start(context: Context, player: Player, controls: QueueControls) {
+            pendingPlayer = player
+            pendingControls = controls
+            // A start request cancels a pending stop, but it does not re-run
+            // onCreate on a service that is still alive, so an already-running
+            // instance is asked to rebuild its session directly.
+            instance?.ensureSession(player)
+            try {
+                ContextCompat.startForegroundService(
+                    context,
+                    Intent(context, VideoPlaybackService::class.java)
+                )
+            } catch (e: Exception) {
+                // A refused foreground start costs the lock screen entry, never
+                // playback: the session above is already published if the service
+                // happened to be running.
+                KLog.w(TAG, "Could not start the video playback service", e)
+            }
+        }
+
+        /**
+         * Take the video off the system's media controls.
+         *
+         * The session is released here rather than being left to `onDestroy`
+         * because `stopService` is asynchronous: callers release the player
+         * immediately afterwards, and a session outliving its player is a
+         * crash. This runs on the caller's thread, which is the player's
+         * application thread, so the teardown is ordered correctly.
+         */
+        fun stop(context: Context) {
+            instance?.releaseSession()
+            pendingPlayer = null
+            pendingControls = null
+            try {
+                context.stopService(Intent(context, VideoPlaybackService::class.java))
+            } catch (e: Exception) {
+                KLog.w(TAG, "Could not stop the video playback service", e)
+            }
+        }
+    }
+}

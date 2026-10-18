@@ -1,0 +1,334 @@
+package com.sentup.android.ui.player
+
+import android.content.BroadcastReceiver
+import android.content.Context
+import android.content.Intent
+import android.content.IntentFilter
+import android.database.ContentObserver
+import android.net.ConnectivityManager
+import android.net.Network
+import android.net.NetworkCapabilities
+import android.os.Handler
+import android.os.Looper
+import android.os.PowerManager
+import android.provider.Settings
+import android.view.TextureView
+import android.view.View
+import androidx.compose.foundation.layout.Box
+import androidx.compose.runtime.*
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.viewinterop.AndroidView
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
+import androidx.lifecycle.compose.LocalLifecycleOwner
+import androidx.media3.common.C
+import androidx.media3.common.MediaItem
+import androidx.media3.common.PlaybackException
+import androidx.media3.common.Player
+import androidx.media3.common.util.UnstableApi
+import androidx.media3.database.StandaloneDatabaseProvider
+import androidx.media3.datasource.DefaultHttpDataSource
+import androidx.media3.datasource.ResolvingDataSource
+import androidx.media3.datasource.cache.CacheDataSource
+import androidx.media3.datasource.cache.LeastRecentlyUsedCacheEvictor
+import androidx.media3.datasource.cache.SimpleCache
+import androidx.media3.exoplayer.DefaultLoadControl
+import androidx.media3.exoplayer.ExoPlayer
+import androidx.media3.exoplayer.source.DefaultMediaSourceFactory
+import androidx.media3.ui.AspectRatioFrameLayout
+import com.sentup.android.data.IncognitoMode
+import com.sentup.android.data.MotionArtworkQuality
+import com.sentup.android.data.MotionArtworkRepository
+import com.sentup.android.data.MotionArtworkResolver
+import com.sentup.android.data.Song
+import com.sentup.android.data.ThemePreferences
+import com.sentup.android.ui.components.SongArtwork
+import java.io.File
+import java.io.IOException
+import kotlinx.coroutines.delay
+
+internal val LocalMotionArtwork = staticCompositionLocalOf<MotionArtworkSession?> { null }
+
+/** Whether the motion loop should be advancing; false freezes it on its last frame. */
+internal val LocalMotionArtworkPlaying = staticCompositionLocalOf { true }
+
+/** Only hero artwork opts in. Queue rows, backgrounds and the mini-player remain ordinary images. */
+@Composable
+internal fun PlayerArtwork(
+    song: Song,
+    contentDescription: String?,
+    modifier: Modifier = Modifier,
+    contentScale: ContentScale = ContentScale.Crop,
+    motionEligible: Boolean = true,
+) {
+    val session = LocalMotionArtwork.current?.takeIf { it.songId == song.id && motionEligible }
+    val motionPlaying = LocalMotionArtworkPlaying.current
+    Box(modifier) {
+        SongArtwork(song, contentDescription, Modifier.matchParentSize(), contentScale)
+        if (session != null && !session.failed) {
+            key(session) {
+                MotionArtworkSurface(session, motionPlaying, contentScale, Modifier.matchParentSize())
+            }
+        }
+    }
+}
+
+@Composable
+internal fun rememberMotionArtworkSession(song: Song, active: Boolean): MotionArtworkSession? {
+    val context = LocalContext.current.applicationContext
+    val preferences = remember(context) { ThemePreferences(context) }
+    val enabled by preferences.motionArtwork.collectAsState()
+    val wifiOnly by preferences.motionArtworkWifiOnly.collectAsState()
+    val quality by preferences.motionArtworkQuality.collectAsState()
+    val localOnly by preferences.localOnlyMode.collectAsState()
+    val incognito by remember(context) { IncognitoMode.enabled(context) }.collectAsState()
+    val repository = remember(context) { MotionArtworkRepository(context) }
+    // No network observer, catalog request or video decoder until this feature is opted into.
+    if (!enabled || !active || localOnly || incognito) return null
+    val allowed = rememberMotionArtworkAllowed(wifiOnly)
+    if (!allowed) return null
+    // The old chain keeps playing while a changed tier resolves, so the picker never drops the
+    // cover back to a still frame on its way to a sharper one.
+    var urls by remember(song) { mutableStateOf(emptyList<String>()) }
+    LaunchedEffect(song, repository, quality) { urls = repository.resolve(song, quality) }
+    val chain = urls.takeIf { it.isNotEmpty() } ?: return null
+    var session by remember(song, chain, quality) { mutableStateOf<MotionArtworkSession?>(null) }
+    DisposableEffect(song, chain, quality) {
+        val created = MotionArtworkSession.create(context, song.id, chain, quality)
+        session = created
+        onDispose { created?.release() }
+    }
+    return session
+}
+
+/** Observe changes, not a one-time Wi-Fi check: switching to mobile data stops artwork immediately. */
+@Composable
+private fun rememberMotionArtworkAllowed(wifiOnly: Boolean): Boolean {
+    val context = LocalContext.current
+    val lifecycle = LocalLifecycleOwner.current.lifecycle
+    var allowed by remember(wifiOnly, lifecycle) { mutableStateOf(false) }
+    DisposableEffect(context, lifecycle, wifiOnly) {
+        val handler = Handler(Looper.getMainLooper())
+        val connectivity = context.getSystemService(ConnectivityManager::class.java)
+        val power = context.getSystemService(PowerManager::class.java)
+        var disposed = false
+        fun update() {
+            if (disposed) return
+            val capabilities = connectivity.getNetworkCapabilities(connectivity.activeNetwork)
+            val connected = capabilities?.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED) == true
+            val wifi = capabilities?.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) == true &&
+                capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_NOT_METERED)
+            val reducedMotion = Settings.Global.getFloat(context.contentResolver, Settings.Global.ANIMATOR_DURATION_SCALE, 1f) == 0f
+            allowed = connected && (!wifiOnly || wifi) && !power.isPowerSaveMode && !reducedMotion &&
+                connectivity.restrictBackgroundStatus != ConnectivityManager.RESTRICT_BACKGROUND_STATUS_ENABLED &&
+                lifecycle.currentState.isAtLeast(Lifecycle.State.RESUMED)
+        }
+        val network = object : ConnectivityManager.NetworkCallback() {
+            override fun onAvailable(network: Network) { handler.post { update() } }
+            override fun onLost(network: Network) { handler.post { update() } }
+            override fun onCapabilitiesChanged(network: Network, capabilities: NetworkCapabilities) { handler.post { update() } }
+        }
+        val receiver = object : BroadcastReceiver() {
+            override fun onReceive(context: Context?, intent: Intent?) { update() }
+        }
+        val observer = object : ContentObserver(handler) {
+            override fun onChange(selfChange: Boolean) { update() }
+        }
+        val lifecycleObserver = LifecycleEventObserver { _, _ -> update() }
+        connectivity.registerDefaultNetworkCallback(network)
+        context.registerReceiver(receiver, IntentFilter().apply {
+            addAction(PowerManager.ACTION_POWER_SAVE_MODE_CHANGED)
+            addAction(ConnectivityManager.ACTION_RESTRICT_BACKGROUND_CHANGED)
+        })
+        context.contentResolver.registerContentObserver(Settings.Global.getUriFor(Settings.Global.ANIMATOR_DURATION_SCALE), false, observer)
+        lifecycle.addObserver(lifecycleObserver)
+        update()
+        onDispose {
+            disposed = true
+            connectivity.unregisterNetworkCallback(network)
+            context.unregisterReceiver(receiver)
+            context.contentResolver.unregisterContentObserver(observer)
+            lifecycle.removeObserver(lifecycleObserver)
+        }
+    }
+    return allowed
+}
+
+/** One muted decoder per expanded player, with a bounded disk cache so looping does not redownload segments. */
+@androidx.annotation.OptIn(UnstableApi::class)
+internal class MotionArtworkSession private constructor(
+    context: Context,
+    val songId: String,
+    private val chain: List<String>,
+    quality: MotionArtworkQuality,
+    private val database: StandaloneDatabaseProvider,
+    private val cache: SimpleCache,
+) {
+    var firstFrame by mutableStateOf(false)
+        private set
+    var failed by mutableStateOf(false)
+        private set
+
+    /** Which link of the fallback chain is playing. Read by the watchdog so it re-arms per attempt. */
+    var attempt by mutableStateOf(0)
+        private set
+    private var surface: TextureView? = null
+    private val player = ExoPlayer.Builder(context)
+        .setMediaSourceFactory(DefaultMediaSourceFactory(CacheDataSource.Factory().setCache(cache)
+            .setUpstreamDataSourceFactory(ResolvingDataSource.Factory(
+                DefaultHttpDataSource.Factory().setConnectTimeoutMs(8_000).setReadTimeoutMs(8_000)
+            ) { dataSpec ->
+                if (!MotionArtworkResolver.isMediaUrl(dataSpec.uri.toString())) throw IOException("Untrusted artwork media host")
+                dataSpec
+            })))
+        .setLoadControl(DefaultLoadControl.Builder().setBufferDurationsMs(2_000, 5_000, 500, 1_000)
+            .setTargetBufferBytes(targetBufferBytes(quality)).setPrioritizeTimeOverSizeThresholds(false).build())
+        .build().apply {
+            volume = 0f
+            setAudioAttributes(androidx.media3.common.AudioAttributes.DEFAULT, false)
+            setHandleAudioBecomingNoisy(false)
+            trackSelectionParameters = trackSelectionParameters.buildUpon().setTrackTypeDisabled(C.TRACK_TYPE_AUDIO, true)
+                .setTrackTypeDisabled(C.TRACK_TYPE_TEXT, true).build()
+            repeatMode = Player.REPEAT_MODE_ONE
+            addListener(object : Player.Listener {
+                override fun onRenderedFirstFrame() { firstFrame = true }
+                override fun onPlayerError(error: PlaybackException) { stepDown() }
+            })
+            setMediaItem(MediaItem.fromUri(chain.first()))
+        }
+
+    fun attach(view: TextureView, autoplay: Boolean = true) {
+        if (failed) return
+        firstFrame = false
+        surface = view
+        player.setVideoTextureView(view)
+        player.prepare()
+        if (autoplay) player.play() else player.pause()
+    }
+
+    /**
+     * Freeze or resume the loop without tearing it down. A paused player keeps
+     * rendering its last frame into the TextureView, which is what holds the
+     * frozen artwork over the static cover instead of dropping back to it.
+     */
+    fun setPlaying(playing: Boolean) {
+        if (failed) return
+        if (playing) player.play() else player.pause()
+    }
+
+    fun detach(view: TextureView) {
+        if (surface !== view) return
+        player.clearVideoTextureView(view)
+        player.stop()
+        surface = null
+        firstFrame = false
+    }
+
+    fun release() {
+        surface = null
+        player.release()
+        cache.release()
+        database.close()
+    }
+
+    fun fail() {
+        failed = true
+        firstFrame = false
+        player.stop()
+    }
+
+    /**
+     * The top tier hands the device a 2160x2160 HEVC clip and not every decoder takes one, so a
+     * failure walks the resolver's chain down to a rung that will play rather than abandoning the
+     * cover. Only an exhausted chain is a real failure.
+     */
+    fun stepDown() {
+        if (failed) return
+        val next = chain.getOrNull(attempt + 1)
+        if (next == null || surface == null) {
+            fail()
+            return
+        }
+        attempt++
+        firstFrame = false
+        player.setMediaItem(MediaItem.fromUri(next))
+        player.prepare()
+        player.play()
+    }
+
+    companion object {
+        /** A single 2160 loop can run to tens of megabytes, so the store is sized by the tier that fills it. */
+        private fun cacheBytes(quality: MotionArtworkQuality): Long = when (quality) {
+            MotionArtworkQuality.SAVER, MotionArtworkQuality.BALANCED -> 32L * 1024 * 1024
+            MotionArtworkQuality.HIGH -> 128L * 1024 * 1024
+            MotionArtworkQuality.MAXIMUM -> 256L * 1024 * 1024
+        }
+
+        private fun targetBufferBytes(quality: MotionArtworkQuality): Int = when (quality) {
+            MotionArtworkQuality.SAVER, MotionArtworkQuality.BALANCED -> 4 * 1024 * 1024
+            MotionArtworkQuality.HIGH -> 24 * 1024 * 1024
+            MotionArtworkQuality.MAXIMUM -> 48 * 1024 * 1024
+        }
+
+        fun create(
+            context: Context,
+            songId: String,
+            chain: List<String>,
+            quality: MotionArtworkQuality,
+        ): MotionArtworkSession? {
+            if (chain.isEmpty()) return null
+            val database = StandaloneDatabaseProvider(context)
+            var cache: SimpleCache? = null
+            return try {
+                cache = SimpleCache(File(context.cacheDir, "motion-artwork-media"), LeastRecentlyUsedCacheEvictor(cacheBytes(quality)), database)
+                MotionArtworkSession(context, songId, chain, quality, database, cache)
+            } catch (_: RuntimeException) {
+                // Disk/cache ownership failure must not break the music player.
+                cache?.release()
+                database.close()
+                null
+            }
+        }
+    }
+}
+
+@androidx.annotation.OptIn(UnstableApi::class)
+@Composable
+private fun MotionArtworkSurface(
+    session: MotionArtworkSession,
+    playing: Boolean,
+    contentScale: ContentScale,
+    modifier: Modifier,
+) {
+    LaunchedEffect(session, session.attempt) {
+        delay(12_000)
+        if (!session.firstFrame) session.stepDown()
+    }
+    // Follows the music rather than the surface lifetime: pausing freezes the
+    // loop on its last frame (firstFrame stays true, so the alpha below holds)
+    // and resuming continues it, with no re-prepare either way.
+    LaunchedEffect(session, playing) {
+        session.setPlaying(playing)
+    }
+    AndroidView(
+        modifier = modifier,
+        factory = { context ->
+            AspectRatioFrameLayout(context).apply {
+                setAspectRatio(1f)
+                importantForAccessibility = View.IMPORTANT_FOR_ACCESSIBILITY_NO_HIDE_DESCENDANTS
+                addView(TextureView(context).apply {
+                    isOpaque = false
+                    alpha = 0f
+                    session.attach(this, autoplay = playing)
+                }, android.widget.FrameLayout.LayoutParams(-1, -1))
+            }
+        },
+        update = { view ->
+            view.resizeMode = if (contentScale == ContentScale.Crop) AspectRatioFrameLayout.RESIZE_MODE_ZOOM else AspectRatioFrameLayout.RESIZE_MODE_FIT
+            view.getChildAt(0).alpha = if (session.firstFrame && !session.failed) 1f else 0f
+        },
+        onRelease = { view -> session.detach(view.getChildAt(0) as TextureView) },
+    )
+}

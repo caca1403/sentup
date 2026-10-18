@@ -1,0 +1,10 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!--
+        The window colour in dark mode: the launcher mark's own tile
+        (#051A08). Declared rather than left to the platform default because the
+        platform default for a Material window is white, and a white window
+        under a dark app is the flash every launch used to have.
+    -->
+    <color name="sentup_window">#FF051A08</color>
+</resources>

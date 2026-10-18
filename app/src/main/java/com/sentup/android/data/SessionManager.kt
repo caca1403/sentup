@@ -1,0 +1,249 @@
+package com.sentup.android.data
+
+import com.sentup.android.util.KLog
+
+import android.content.Context
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+
+/**
+ * The active profile's YouTube session.
+ *
+ * **This class deliberately kept its entire public API when profiles arrived.**
+ * Twenty-seven call sites in [YouTubeRepository] alone ask it for cookies or
+ * for [isLoggedIn], and NewPipe's downloader holds one instance for the life of
+ * the process. All of them resolve the session fresh on every call, so
+ * redirecting what "the session" means - which is all [ProfileManager.setActive]
+ * does - moves the whole app onto another account without touching any of them.
+ * That is why switching accounts needs no re-authentication and works offline.
+ *
+ * A [ProfileKind.LOCAL] profile simply has no cookies, so [isLoggedIn] is false
+ * and every signed-out path in the app runs exactly as it always has.
+ */
+class SessionManager(context: Context) {
+
+    private val appContext = context.applicationContext
+    private val profileManager = ProfileManager(context)
+
+    fun saveUserAvatar(url: String) {
+        profileManager.updateIdentity(activeId(), avatarUrl = url)
+    }
+
+    fun getUserAvatar(): String? = profileManager.active().avatarUrl
+
+    /**
+     * Save session cookies obtained from WebView.
+     *
+     * A deliberate sign-in, so it bumps the session generation: anything still
+     * in flight for the previous login stops counting as the current one. The
+     * rotation path is [mergeResponseCookies], which keeps the generation. Use
+     * [startSession] when the user has just logged in.
+     *
+     * A rotation arriving while a local profile is active is dropped: there is
+     * no account to refresh, and writing it would quietly turn a device-only
+     * profile into a signed-in one.
+     */
+    fun saveCookies(cookies: String) {
+        val active = profileManager.active()
+        if (active.isLocal) return
+        profileManager.saveCookiesFor(active.id, cookies)
+    }
+
+    /**
+     * Begin a session the user has just signed into.
+     *
+     * When a local profile is active this promotes the sign-in into a new
+     * YouTube profile and switches to it, so the existing login flow keeps
+     * working unchanged and simply produces a profile as a side effect. The new
+     * profile starts with a copy of the local one's history, likes and feed
+     * data, since to the person signing in nothing should have gone anywhere
+     * ([AccountSwitcher.copyProfileScopedData]).
+     *
+     * [scar] This switch used to skip [AccountSwitcher]'s invalidation, so the
+     * process-wide stores kept the local profile's data in memory and their
+     * next write stored it under the new profile's keys.
+     */
+    fun startSession(cookies: String) {
+        val active = profileManager.active()
+        if (active.isLocal) {
+            val known = profileManager.profiles.value.mapTo(HashSet()) { it.id }
+            val profile = profileManager.addYouTubeProfile(cookies)
+            if (profile.id !in known) {
+                AccountSwitcher.copyProfileScopedData(appContext, active.id, profile.id)
+            }
+            profileManager.setActive(profile.id) { AccountSwitcher.prepareForActiveProfile(appContext) }
+        } else {
+            profileManager.saveCookiesFor(active.id, cookies)
+        }
+        setSessionExpired(false)
+    }
+
+    /**
+     * Record that YouTube answered an authenticated request as anonymous, or
+     * that it accepted one. Cookies are left alone either way - they are the
+     * only thing a later refresh has to work with, and clearing them on a
+     * single bad response would sign people out over a hiccup.
+     *
+     * The verdict is stored against the profile it came from, so with several
+     * accounts in the roster the badge lands on the right row.
+     */
+    fun setSessionExpired(expired: Boolean) {
+        val active = profileManager.active()
+        if (active.isLocal) return
+        profileManager.setExpired(active.id, expired)
+        if (_sessionExpired.value != expired) {
+            if (expired) KLog.w(TAG, "YouTube rejected the session as signed out")
+            _sessionExpired.value = expired
+        }
+    }
+
+    /** Get the active profile's stored session cookies. */
+    fun getCookies(): String? {
+        val active = profileManager.active()
+        if (active.isLocal) return null
+        return profileManager.cookiesFor(active.id)
+    }
+
+    /**
+     * Sign the active profile out.
+     *
+     * With a roster this means removing that profile and falling back to
+     * another, rather than wiping the store: signing out of one account must
+     * not take the others with it. When it is the only profile left, it is
+     * emptied into a device-only profile instead, so the app always has an
+     * identity to run as.
+     */
+    fun clearSession() {
+        val active = profileManager.active()
+        // Both branches change who the app is: another profile, or this one
+        // without its account. Same invalidation as a switch, which this used
+        // to skip (see startSession).
+        if (!profileManager.remove(active.id) { AccountSwitcher.prepareForActiveProfile(appContext) }) {
+            profileManager.replaceWithFreshLocal(active.id)
+            AccountSwitcher.prepareForActiveProfile(appContext)
+        }
+        refreshExpiredFromProfile()
+    }
+
+    /**
+     * Check if user is logged in.
+     *
+     * Deliberately still just "cookies exist", so requests keep going out and
+     * a rotation can revive a session that looked dead. [sessionExpired] is
+     * what the UI should read before showing account-only content.
+     */
+    fun isLoggedIn(): Boolean = !getCookies().isNullOrBlank()
+
+    /**
+     * The login to send the next request for, or null when there is none.
+     *
+     * Everything account-scoped goes out bound to one of these rather than to
+     * "whatever cookies are stored now", so a rotation or an account switch
+     * that lands while the call is in flight is attributed to the profile that
+     * made it. See [YouTubeSession].
+     */
+    internal fun captureSession(): YouTubeSession? = profileManager.captureSession()
+
+    /**
+     * [session] refreshed to the cookies stored now, or null if that login is
+     * over: the profile was removed, another one is active, or the user signed
+     * in again. A cookie rotation is not the login ending.
+     */
+    internal fun currentSession(session: YouTubeSession): YouTubeSession? = profileManager.currentSession(session)
+
+    internal fun mergeResponseCookies(session: YouTubeSession, updates: Map<String, String>) =
+        profileManager.mergeSessionCookies(session, updates)
+
+    /** [setSessionExpired], attributed to the login the response came back for. */
+    internal fun noteSessionExpired(session: YouTubeSession, expired: Boolean) {
+        // False when the verdict belongs to a login that is no longer the
+        // active one: applying it then would badge the wrong account.
+        if (!profileManager.noteSessionExpired(session, expired)) return
+        if (_sessionExpired.value != expired) {
+            if (expired) KLog.w(TAG, "YouTube rejected the session as signed out")
+            _sessionExpired.value = expired
+        }
+    }
+
+    internal fun updateSessionIdentity(
+        session: YouTubeSession, name: String? = null, avatarUrl: String? = null, datasyncId: String? = null,
+    ) = profileManager.updateSessionIdentity(session, name, avatarUrl, datasyncId)
+
+    fun saveUserName(name: String) {
+        profileManager.updateIdentity(activeId(), name = name)
+    }
+
+    /**
+     * Record YouTube's own identifier for the account behind the active
+     * profile.
+     *
+     * Nothing wrote this until backups needed it, which meant
+     * [ProfileManager.addYouTubeProfile]'s dedupe by [Profile.datasyncId] had
+     * never once fired: signing back into an account already in the roster
+     * added a second identical row instead of repairing the first, and a
+     * restored backup could not tell that an account on the file was the one
+     * this device is already signed into.
+     */
+    fun saveDatasyncId(datasyncId: String) {
+        if (datasyncId.isBlank()) return
+        profileManager.updateIdentity(activeId(), datasyncId = datasyncId)
+    }
+
+    /**
+     * Point the active profile at one of its account's channels - a "marka
+     * hesabı" - or back at the account's primary channel with null.
+     *
+     * Nothing here talks to YouTube. The choice is carried on every later
+     * request as `X-Goog-PageId` (see
+     * [com.sentup.android.data.youtube.authenticate]), which is what moves the
+     * whole app - feed, subscriptions, likes, history - onto that channel, and
+     * the profile keeps it across restarts because it is stored on [Profile].
+     *
+     * **The caller must invalidate the profile-scoped caches afterwards**, the
+     * way an account switch does: everything already loaded belongs to the
+     * channel it was read as. [YouTubeRepository.selectChannel] is the call
+     * that does both.
+     */
+    fun savePageId(pageId: String?) {
+        val active = profileManager.active()
+        if (active.isLocal) return
+        profileManager.setPageId(active.id, pageId?.trim()?.takeIf { it.isNotBlank() })
+    }
+
+    /**
+     * The channel the active profile is pointed at, or null for the account's
+     * own channel.
+     *
+     * The same rule the session is built with ([resolvePageId]), read back for
+     * the UI: the picker ticks a row by comparing this against each channel's
+     * page id, so it has to agree with what the network layer is actually
+     * sending.
+     */
+    fun activePageId(): String? = profileManager.active().resolvedPageId
+
+    fun getUserName(): String? = profileManager.active().name.takeIf { !profileManager.active().isLocal }
+
+    private fun activeId(): String = profileManager.active().id
+
+    /** Re-read the active profile's expired verdict, after a switch. */
+    fun refreshExpiredFromProfile() {
+        _sessionExpired.value = profileManager.active().expired
+    }
+
+    companion object {
+        private const val TAG = "SessionManager"
+
+        /**
+         * True once YouTube has answered an authenticated call as anonymous.
+         *
+         * Companion-scoped on purpose: with no DI every ViewModel news up its
+         * own SessionManager, so an instance flow would never reach the screens
+         * that need to react - the same reason visitorData is cached up here.
+         * It mirrors the *active* profile's flag; the durable per-profile value
+         * lives on [Profile.expired].
+         */
+        private val _sessionExpired = MutableStateFlow(false)
+        val sessionExpired: StateFlow<Boolean> = _sessionExpired.asStateFlow()
+    }
+}

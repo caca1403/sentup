@@ -1,0 +1,341 @@
+package com.sentup.android.ui.player
+import androidx.compose.ui.res.pluralStringResource
+import androidx.compose.ui.res.stringResource
+import com.sentup.android.R
+
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.WindowInsets
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.navigationBars
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.windowInsetsPadding
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.itemsIndexed
+import androidx.compose.material.icons.rounded.Check
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.filled.Add
+import androidx.compose.material.icons.rounded.Add
+import androidx.compose.material.icons.rounded.PlaylistPlay
+import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.Button
+import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.HorizontalDivider
+import androidx.compose.material3.Icon
+import androidx.compose.material3.ListItem
+import androidx.compose.material3.ListItemDefaults
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.ModalBottomSheet
+import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.Surface
+import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
+import androidx.compose.material3.rememberModalBottomSheetState
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.collectAsState
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
+import androidx.compose.ui.focus.FocusRequester
+import androidx.compose.ui.focus.focusRequester
+import androidx.compose.ui.text.TextRange
+import androidx.compose.ui.text.input.TextFieldValue
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.dp
+import coil.compose.AsyncImage
+import com.sentup.android.data.PlaylistDisplayItem
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+fun AddToPlaylistSheet(
+    playlists: List<PlaylistDisplayItem>,
+    onPlaylistClick: (PlaylistDisplayItem) -> Unit,
+    onCreateNewClick: (String, String?) -> Unit,
+    onDismissRequest: () -> Unit,
+    /**
+     * Playlists already holding the item. With [onToggle] set, rows carry a
+     * check box and a tap adds or removes instead of closing the sheet.
+     */
+    containing: Set<String> = emptySet(),
+    /** The account half of [containing] is still loading. */
+    membershipLoading: Boolean = false,
+    onToggle: ((PlaylistDisplayItem, Boolean) -> Unit)? = null,
+) {
+    val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
+    var showCreateDialog by remember { mutableStateOf(false) }
+
+    if (showCreateDialog) {
+        CreatePlaylistDialog(
+            onDismiss = { showCreateDialog = false },
+            onCreate = { name, desc ->
+                onCreateNewClick(name, desc)
+                showCreateDialog = false
+                // Don't dismiss sheet yet, let user see it added or auto dismiss? cause Sheet scrolling or dismis UX is SO SHIT istfg
+                // Probably better to dismiss sheet or show success.
+                // For now we dismiss sheet logic is handled by caller usually or we stay open.
+            }
+        )
+    }
+
+    ModalBottomSheet(
+        onDismissRequest = onDismissRequest,
+        sheetState = sheetState,
+        contentWindowInsets = { WindowInsets(0) },
+        containerColor = MaterialTheme.colorScheme.surface,
+        tonalElevation = 0.dp
+    ) {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .windowInsetsPadding(WindowInsets.navigationBars)
+                .padding(bottom = 16.dp)
+        ) {
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                modifier = Modifier.padding(horizontal = 24.dp, vertical = 16.dp)
+            ) {
+                Text(
+                    stringResource(R.string.add_to_playlist_title),
+                    style = MaterialTheme.typography.titleLarge,
+                    fontWeight = FontWeight.Bold,
+                    modifier = Modifier.weight(1f)
+                )
+                if (membershipLoading) {
+                    androidx.compose.material3.LoadingIndicator(modifier = Modifier.size(28.dp))
+                }
+            }
+
+            // New playlist stands on its own as a tonal pill; the playlists
+            // follow as one segmented group. A playlist that already holds the
+            // item is the group's selected state - filled, fully rounded and
+            // ticked - the way OpenStream marks the chosen quality or track.
+            LazyColumn(
+                modifier = Modifier.fillMaxWidth(),
+                contentPadding = androidx.compose.foundation.layout.PaddingValues(horizontal = 16.dp),
+                verticalArrangement = Arrangement.spacedBy(ListItemDefaults.SegmentedGap)
+            ) {
+                item(key = "new_playlist") {
+                    androidx.compose.material3.SegmentedListItem(
+                        onClick = { showCreateDialog = true },
+                        shapes = ListItemDefaults.segmentedShapes(index = 0, count = 1),
+                        colors = ListItemDefaults.segmentedColors(
+                            containerColor = MaterialTheme.colorScheme.secondaryContainer,
+                            contentColor = MaterialTheme.colorScheme.onSecondaryContainer,
+                            leadingContentColor = MaterialTheme.colorScheme.onSecondaryContainer
+                        ),
+                        leadingContent = {
+                            Surface(
+                                shape = RoundedCornerShape(12.dp),
+                                color = MaterialTheme.colorScheme.secondary,
+                                modifier = Modifier.size(48.dp)
+                            ) {
+                                AccessIcon(Icons.Rounded.Add, tint = MaterialTheme.colorScheme.onSecondary)
+                            }
+                        },
+                        modifier = Modifier.padding(bottom = 10.dp)
+                    ) {
+                        Text(stringResource(R.string.new_playlist_label), fontWeight = FontWeight.SemiBold)
+                    }
+                }
+
+                itemsIndexed(playlists, key = { _, it -> it.id }) { index, playlist ->
+                    val isIn = onToggle != null && playlist.id in containing
+                    val onRowClick = {
+                        if (onToggle != null) onToggle(playlist, !isIn) else onPlaylistClick(playlist)
+                    }
+                    androidx.compose.material3.SegmentedListItem(
+                        selected = isIn,
+                        onClick = onRowClick,
+                        shapes = ListItemDefaults.segmentedShapes(index = index, count = playlists.size),
+                        colors = com.sentup.android.ui.components.segmentedColorsOver(MaterialTheme.colorScheme.surface),
+                        modifier = Modifier.animateItem(),
+                        leadingContent = {
+                            Surface(
+                                shape = RoundedCornerShape(12.dp),
+                                color = MaterialTheme.colorScheme.surfaceContainerHigh,
+                                modifier = Modifier.size(48.dp)
+                            ) {
+                                if (playlist.thumbnailUrl != null) {
+                                    AsyncImage(
+                                        model = playlist.thumbnailUrl,
+                                        contentDescription = null,
+                                        contentScale = ContentScale.Crop,
+                                        modifier = Modifier.fillMaxSize()
+                                    )
+                                } else {
+                                    AccessIcon(
+                                        Icons.Rounded.PlaylistPlay,
+                                        tint = MaterialTheme.colorScheme.onSurfaceVariant
+                                    )
+                                }
+                            }
+                        },
+                        supportingContent = {
+                            Text(
+                                if (playlist.itemCount >= 0) pluralStringResource(R.plurals.n_songs, playlist.itemCount, playlist.itemCount)
+                                else playlist.uploaderName.ifBlank { stringResource(R.string.label_playlist) },
+                                maxLines = 1,
+                                overflow = TextOverflow.Ellipsis
+                            )
+                        },
+                        trailingContent = if (onToggle != null) {
+                            {
+                                androidx.compose.animation.AnimatedVisibility(
+                                    visible = isIn,
+                                    enter = androidx.compose.animation.scaleIn() + androidx.compose.animation.fadeIn(),
+                                    exit = androidx.compose.animation.scaleOut() + androidx.compose.animation.fadeOut()
+                                ) {
+                                    Icon(
+                                        Icons.Rounded.Check,
+                                        contentDescription = stringResource(R.string.cd_in_playlist)
+                                    )
+                                }
+                            }
+                        } else null
+                    ) {
+                        Text(
+                            playlist.name,
+                            fontWeight = if (isIn) FontWeight.Bold else FontWeight.Medium,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis
+                        )
+                    }
+                }
+            }
+            Spacer(modifier = Modifier.height(16.dp))
+        }
+    }
+}
+
+/**
+ * [AddToPlaylistSheet] for one song, with check marks: device playlists are
+ * read locally, the account's with one request per open, and a tap adds or
+ * removes without closing. A device file only lists device playlists, since an
+ * account playlist can only hold YouTube songs.
+ */
+@Composable
+fun SongPlaylistPicker(
+    song: com.sentup.android.data.Song,
+    viewModel: PlayerViewModel,
+    onDismiss: () -> Unit,
+) {
+    val haptics = com.sentup.android.util.rememberSentupHaptics()
+    val items by viewModel.addToPlaylistItems.collectAsState()
+    val localContents by viewModel.localPlaylistContents.collectAsState()
+    val accountContaining by viewModel.accountPlaylistsContaining.collectAsState()
+    val loading by viewModel.isPlaylistMembershipLoading.collectAsState()
+    LaunchedEffect(song.id) { viewModel.loadPlaylistMembership(song) }
+
+    val localIds = localContents.map { it.id }.toSet()
+    val containing = localContents.filter { list -> list.songs.any { it.id == song.id } }
+        .map { it.id }
+        .toSet() + accountContaining
+    val isYouTube = song.source == com.sentup.android.data.SongSource.YOUTUBE
+
+    AddToPlaylistSheet(
+        playlists = if (isYouTube) items else items.filter { it.id in localIds },
+        onPlaylistClick = {},
+        onCreateNewClick = { name, desc ->
+            viewModel.createPlaylistWithSong(name, desc, song)
+            onDismiss()
+        },
+        onDismissRequest = onDismiss,
+        containing = containing,
+        membershipLoading = loading && isYouTube,
+        onToggle = { playlist, add ->
+            haptics.performHapticFeedback(
+                if (add) androidx.compose.ui.hapticfeedback.HapticFeedbackType.ToggleOn
+                else androidx.compose.ui.hapticfeedback.HapticFeedbackType.ToggleOff
+            )
+            viewModel.setPlaylistMembership(playlist.id, song, add)
+        },
+    )
+}
+
+@Composable
+private fun AccessIcon(icon: androidx.compose.ui.graphics.vector.ImageVector, tint: Color) {
+    androidx.compose.foundation.layout.Box(contentAlignment = Alignment.Center) {
+        Icon(icon, null, tint = tint)
+    }
+}
+
+@Composable
+fun CreatePlaylistDialog(
+    onDismiss: () -> Unit,
+    onCreate: (String, String?) -> Unit,
+    /**
+     * Pre-filled name, selected so it can be overwritten in one gesture.
+     * Empty by default, which keeps the existing create flows untouched: no
+     * pre-fill means no selection and no autofocus change.
+     */
+    initialName: String = "",
+    /** False for a store with no description (local video playlists). */
+    withDescription: Boolean = true
+) {
+    var nameField by remember(initialName) {
+        mutableStateOf(TextFieldValue(initialName, selection = TextRange(0, initialName.length)))
+    }
+    var description by remember { mutableStateOf("") }
+    val nameFocus = remember { FocusRequester() }
+    if (initialName.isNotEmpty()) {
+        LaunchedEffect(nameFocus) { nameFocus.requestFocus() }
+    }
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text(stringResource(R.string.new_playlist_label)) },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(16.dp)) {
+                OutlinedTextField(
+                    value = nameField,
+                    onValueChange = { nameField = it },
+                    label = { Text(stringResource(R.string.name_label)) },
+                    singleLine = true,
+                    shape = RoundedCornerShape(16.dp),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .focusRequester(nameFocus)
+                )
+                if (withDescription) {
+                    OutlinedTextField(
+                        value = description,
+                        onValueChange = { description = it },
+                        label = { Text(stringResource(R.string.description_optional_label)) },
+                        shape = RoundedCornerShape(16.dp),
+                        modifier = Modifier.fillMaxWidth()
+                    )
+                }
+            }
+        },
+        confirmButton = {
+            Button(
+                onClick = { onCreate(nameField.text, description.ifBlank { null }) },
+                enabled = nameField.text.isNotBlank()
+            ) {
+                Text(stringResource(R.string.action_create))
+            }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) {
+                Text(stringResource(R.string.action_cancel))
+            }
+        }
+    )
+}

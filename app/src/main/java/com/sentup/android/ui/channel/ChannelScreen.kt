@@ -1,0 +1,969 @@
+package com.sentup.android.ui.channel
+import androidx.compose.ui.res.stringResource
+import com.sentup.android.R
+
+import androidx.activity.compose.BackHandler
+import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.animateColorAsState
+import androidx.compose.animation.core.Spring
+import androidx.compose.animation.core.animateFloatAsState
+import androidx.compose.animation.core.spring
+import androidx.compose.animation.core.tween
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
+import androidx.compose.animation.slideInVertically
+import androidx.compose.animation.slideOutVertically
+import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.gestures.awaitEachGesture
+import androidx.compose.foundation.interaction.MutableInteractionSource
+import androidx.compose.foundation.interaction.collectIsPressedAsState
+import androidx.compose.foundation.gestures.awaitFirstDown
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.PaddingValues
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.WindowInsets
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.statusBars
+import androidx.compose.foundation.layout.windowInsetsPadding
+import androidx.compose.foundation.lazy.grid.GridCells
+import androidx.compose.foundation.lazy.grid.GridItemSpan
+import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
+import androidx.compose.foundation.lazy.grid.rememberLazyGridState
+import androidx.compose.foundation.lazy.LazyRow
+import androidx.compose.foundation.lazy.rememberLazyListState
+import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.rounded.ArrowBack
+import androidx.compose.material.icons.rounded.Block
+import androidx.compose.material.icons.rounded.MoreVert
+import androidx.compose.material.icons.rounded.MusicNote
+import androidx.compose.material.icons.rounded.Search
+import androidx.compose.material.icons.rounded.Share
+import androidx.compose.material.icons.rounded.VideoLibrary
+import androidx.compose.material3.ContainedLoadingIndicator
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
+import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.ExperimentalMaterial3ExpressiveApi
+import androidx.compose.material3.FilledIconButton
+import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButtonDefaults
+import androidx.compose.material3.LoadingIndicator
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.Surface
+import androidx.compose.material3.Text
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.derivedStateOf
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
+import androidx.compose.runtime.collectAsState
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.scale
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.geometry.Rect
+import androidx.compose.ui.input.pointer.pointerInput
+import androidx.compose.ui.layout.boundsInWindow
+import androidx.compose.ui.layout.onGloballyPositioned
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.dp
+import androidx.lifecycle.viewmodel.compose.viewModel
+import com.sentup.android.data.ChannelTabKind
+import com.sentup.android.data.ShortsItem
+import com.sentup.android.data.VideoItem
+import com.sentup.android.data.VideoPlaylist
+import com.sentup.android.data.VideoQueue
+import com.sentup.android.ui.components.PredictiveBackStack
+import com.sentup.android.ui.home.HomeViewModel
+import com.sentup.android.ui.video.VideoOptionsSheetHost
+import com.sentup.android.ui.video.VideoPlaylistDetail
+import com.sentup.android.ui.theme.sentupPage
+
+/**
+ * A creator's page: banner, identity, and every tab the channel actually has.
+ *
+ * **What makes this a screen rather than the bottom sheet it replaces** is that
+ * deciding whether to follow someone is answered by a banner, an about text, an
+ * upload cadence and what else they make - and a sheet holding one flat list of
+ * uploads can show none of it.
+ *
+ * Three things about the structure are worth knowing before changing it:
+ *
+ * - **The tab row is built from the response, not from an enum.** A channel
+ *   with no Shorts has no Shorts tab, a musician has "Releases" and a teacher
+ *   has "Courses", and none of that needed code. See
+ *   [com.sentup.android.data.ChannelPage].
+ * - **One scroller, not one per tab.** The header, the tab row and the content
+ *   share a single [LazyVerticalGrid] on a six-column base, so a video spans
+ *   six, a playlist three and a Short two. That is what lets the header scroll
+ *   away under the tabs instead of the page being a fixed header with a
+ *   scrolling well underneath it, and it is why switching tabs keeps the reading
+ *   position rather than snapping to the top.
+ * - **Opening a playlist is an in-screen child**, layered over this page through
+ *   [PredictiveBackStack] so a back gesture previews the channel underneath.
+ *   Opening another *channel* is a real navigation, because that is a different
+ *   creator and belongs in the back stack.
+ */
+@OptIn(ExperimentalMaterial3Api::class, ExperimentalMaterial3ExpressiveApi::class)
+@Composable
+fun ChannelScreen(
+    channelId: String,
+    homeViewModel: HomeViewModel,
+    onBack: () -> Unit,
+    onPlayVideo: (VideoItem) -> Unit,
+    onPlayQueue: (VideoQueue) -> Unit,
+    onOpenShorts: (List<ShortsItem>, Int) -> Unit,
+    onOpenChannel: (String) -> Unit,
+    onEnqueueVideo: (VideoItem, Boolean) -> Unit,
+    onLoginClick: () -> Unit,
+    /**
+     * Opens this creator's music-mode artist page. Null in builds or call sites
+     * where music mode is not reachable; the row is then simply absent rather
+     * than present and inert.
+     */
+    onOpenMusicArtist: ((channelId: String, name: String) -> Unit)? = null,
+    contentPadding: PaddingValues = PaddingValues(),
+    viewModel: ChannelViewModel = viewModel()
+) {
+    LaunchedEffect(channelId) { viewModel.load(channelId) }
+
+    var openPlaylist by remember { mutableStateOf<VideoPlaylist?>(null) }
+
+    PredictiveBackStack(
+        childOpen = openPlaylist != null,
+        onBack = { openPlaylist = null },
+        background = {
+            ChannelRoot(
+                viewModel = viewModel,
+                homeViewModel = homeViewModel,
+                onBack = onBack,
+                onPlayVideo = onPlayVideo,
+                onOpenShorts = onOpenShorts,
+                onOpenChannel = onOpenChannel,
+                onOpenPlaylist = { playlist ->
+                    homeViewModel.loadPlaylistVideos(playlist.playlistId)
+                    openPlaylist = playlist
+                },
+                onEnqueueVideo = onEnqueueVideo,
+                onLoginClick = onLoginClick,
+                onOpenMusicArtist = onOpenMusicArtist,
+                contentPadding = contentPadding
+            )
+        },
+        foreground = {
+            openPlaylist?.let { playlist ->
+                VideoPlaylistDetail(
+                    playlist = playlist,
+                    viewModel = homeViewModel,
+                    onVideoClick = onPlayVideo,
+                    onBack = { openPlaylist = null },
+                    contentPadding = contentPadding,
+                    // Someone else's playlist; removal is not the viewer's to do.
+                    allowRemove = false,
+                    onPlayQueue = onPlayQueue,
+                    onEnqueueVideo = onEnqueueVideo,
+                    onOpenChannel = onOpenChannel
+                )
+            }
+        }
+    )
+}
+
+@OptIn(ExperimentalMaterial3Api::class, ExperimentalMaterial3ExpressiveApi::class)
+@Composable
+private fun ChannelRoot(
+    viewModel: ChannelViewModel,
+    homeViewModel: HomeViewModel,
+    onBack: () -> Unit,
+    onPlayVideo: (VideoItem) -> Unit,
+    onOpenShorts: (List<ShortsItem>, Int) -> Unit,
+    onOpenChannel: (String) -> Unit,
+    onOpenPlaylist: (VideoPlaylist) -> Unit,
+    onEnqueueVideo: (VideoItem, Boolean) -> Unit,
+    onLoginClick: () -> Unit,
+    onOpenMusicArtist: ((channelId: String, name: String) -> Unit)?,
+    contentPadding: PaddingValues
+) {
+    val context = LocalContext.current
+    val header by viewModel.header.collectAsState()
+    val tabs by viewModel.tabs.collectAsState()
+    val selectedTab by viewModel.selectedTab.collectAsState()
+    val pages by viewModel.pages.collectAsState()
+    val loadingTabs by viewModel.loadingTabs.collectAsState()
+    val isLoadingPage by viewModel.isLoadingPage.collectAsState()
+    val isLoadingMore by viewModel.isLoadingMore.collectAsState()
+    val loadFailed by viewModel.loadFailed.collectAsState()
+    val isSubscribed by viewModel.isSubscribed.collectAsState()
+    val bell by viewModel.bell.collectAsState()
+    val bellBusy by viewModel.bellBusy.collectAsState()
+    val isBlocked by viewModel.isBlocked.collectAsState()
+    val about by viewModel.about.collectAsState()
+    val isAboutLoading by viewModel.isAboutLoading.collectAsState()
+    val searchQuery by viewModel.searchQuery.collectAsState()
+    val searchResults by viewModel.searchResults.collectAsState()
+    val isSearching by viewModel.isSearching.collectAsState()
+    val searchRan by viewModel.searchRan.collectAsState()
+
+    val gridState = rememberLazyGridState()
+    var searchMode by remember { mutableStateOf(false) }
+    var optionsTarget by remember { mutableStateOf<VideoItem?>(null) }
+    // Same haptic the tab strip itself plays, so a gesture switch and a tap
+    // switch feel identical.
+    val haptics = com.sentup.android.util.rememberSentupHaptics()
+    val density = LocalDensity.current
+    // Window-space bounds of the tab strip and of the grid, so the swipe
+    // detector can tell a flick that started on the strip - scrolling it to a
+    // hidden tab - from one that started on the content, which switches tabs.
+    // Plain refs, never read in composition: the detector reads .value through
+    // these stable State objects, so no restart is needed as they move.
+    val tabStripBounds = remember { mutableStateOf<Rect?>(null) }
+    val gridOrigin = remember { mutableStateOf(Offset.Zero) }
+
+    // The About panel is a tab in this UI and an engagement panel on YouTube's
+    // side, so it is fetched the moment it is opened rather than with the page.
+    LaunchedEffect(selectedTab) {
+        if (selectedTab == ChannelTabKind.ABOUT) viewModel.loadAbout()
+    }
+
+    /**
+     * Back leaves search before it leaves the channel, and that step is
+     * deliberately not previewable: closing search widens the page in place,
+     * so peeling the screen would animate a departure that is not happening.
+     */
+    BackHandler(enabled = searchMode) {
+        searchMode = false
+        viewModel.clearSearch()
+    }
+
+    // Distance scrolled through the header, which drives both the banner's
+    // parallax and the moment the compact title takes over. Read through
+    // derivedStateOf so a scroll does not recompose the whole page per frame.
+    val headerOffsetPx by remember {
+        derivedStateOf {
+            if (gridState.firstVisibleItemIndex > 0) Float.MAX_VALUE
+            else gridState.firstVisibleItemScrollOffset.toFloat()
+        }
+    }
+    val titleCollapsed by remember {
+        derivedStateOf { gridState.firstVisibleItemIndex > 0 || headerOffsetPx > 220f }
+    }
+
+    // Endless paging: ask for the next page while there is still a screenful to
+    // scroll, so the grid never visibly stops at the bottom waiting.
+    val nearEnd by remember {
+        derivedStateOf {
+            val info = gridState.layoutInfo
+            val last = info.visibleItemsInfo.lastOrNull()?.index ?: 0
+            info.totalItemsCount > 0 && last >= info.totalItemsCount - 6
+        }
+    }
+    LaunchedEffect(nearEnd, selectedTab, pages) {
+        if (nearEnd && !searchMode) viewModel.loadMore(selectedTab)
+    }
+
+    optionsTarget?.let { video ->
+        VideoOptionsSheetHost(
+            video = video,
+            viewModel = homeViewModel,
+            onDismiss = { optionsTarget = null },
+            onEnqueue = { next -> onEnqueueVideo(video, next) },
+            // "Don't recommend this channel" is the page you are standing on,
+            // and there is a Block row in the overflow menu that says so
+            // plainly. Two ways to do the same thing, one of them phrased as if
+            // it were about a single video, is worse than one.
+            allowBlockChannel = false
+        )
+    }
+
+    // Fullscreen post-photo viewer: images plus the tapped index. A Dialog,
+    // so it needs no Box coordination with the grid underneath.
+    var photoViewer by remember { mutableStateOf<Pair<List<String>, Int>?>(null) }
+    photoViewer?.let { (images, index) ->
+        ChannelPhotoViewer(
+            images = images,
+            startIndex = index,
+            onDismiss = { photoViewer = null }
+        )
+    }
+
+    // A community post's comments: the shared comments panel in a tall sheet,
+    // with the post pinned above the thread so replies keep their context.
+    val commentsPost by viewModel.commentsPost.collectAsState()
+    var showCommentSignIn by remember { mutableStateOf(false) }
+    commentsPost?.let { post ->
+        val thread = viewModel.postComments
+        val isLoggedInNow by viewModel.isLoggedIn.collectAsState()
+        val threadComments by thread.comments.collectAsState()
+        val threadReplies by thread.replies.collectAsState()
+        val loadingReplyIds by thread.loadingReplyIds.collectAsState()
+        val isThreadLoading by thread.isLoading.collectAsState()
+        val isThreadLoadingMore by thread.isLoadingMore.collectAsState()
+        val isThreadAvailable by thread.isAvailable.collectAsState()
+        val canComment by thread.canComment.collectAsState()
+        val isPosting by thread.isPosting.collectAsState()
+        com.sentup.android.ui.video.CommentsSheet(
+            comments = threadComments,
+            replies = threadReplies,
+            loadingReplyIds = loadingReplyIds,
+            isLoading = isThreadLoading,
+            isLoadingMore = isThreadLoadingMore,
+            commentsAvailable = isThreadAvailable,
+            canComment = canComment,
+            isPosting = isPosting,
+            onLoadMore = thread::loadMore,
+            onLoadReplies = thread::loadReplies,
+            onPostComment = thread::postComment,
+            onPostReply = thread::postReply,
+            // Signed out, a like would be refused and flicker back; ask for
+            // the sign-in instead, as the players do.
+            onLikeComment = { comment ->
+                if (isLoggedInNow) thread.toggleLike(comment) else showCommentSignIn = true
+            },
+            onDeleteComment = thread::delete,
+            onDismiss = viewModel::closePostComments,
+            onOpenAuthor = { channelId ->
+                viewModel.closePostComments()
+                onOpenChannel(channelId)
+            },
+            heightFraction = 0.92f,
+            header = { PostCommentsContext(post) },
+            unavailableMessage = stringResource(R.string.ch_post_comments_unavailable)
+        )
+    }
+    if (showCommentSignIn) {
+        com.sentup.android.ui.auth.YouTubeAuthDialog(
+            onDismiss = { showCommentSignIn = false },
+            onAuthSuccess = {
+                showCommentSignIn = false
+                viewModel.onLoginStateChanged()
+                // The thread was fetched signed out: no composer, no like state.
+                viewModel.reloadPostComments()
+            }
+        )
+    }
+
+    Box(
+        modifier = Modifier
+            .fillMaxSize()
+            .sentupPage()
+    ) {
+        when {
+            isLoadingPage -> ChannelLoading()
+            loadFailed || header == null -> ChannelUnavailable(onBack = onBack)
+            else -> {
+                val currentHeader = header!!
+                val page = pages[selectedTab]
+                val isTabLoading = selectedTab in loadingTabs
+
+                LazyVerticalGrid(
+                    columns = GridCells.Fixed(CHANNEL_GRID_COLUMNS),
+                    state = gridState,
+                    // One gutter for the whole page, so a video card, a
+                    // playlist tile and a Short all line up on the same edge
+                    // without any of them carrying padding of its own. The two
+                    // things that must ignore it - the banner and the tab strip
+                    // - bleed back over it.
+                    contentPadding = PaddingValues(
+                        start = CHANNEL_GUTTER,
+                        end = CHANNEL_GUTTER,
+                        bottom = contentPadding.calculateBottomPadding() + 120.dp
+                    ),
+                    horizontalArrangement = Arrangement.spacedBy(12.dp),
+                    verticalArrangement = Arrangement.spacedBy(12.dp),
+                    // Gesture tab switch, deliberately without a pager: a fast
+                    // horizontal flick anywhere on the grid moves to the next
+                    // (swipe left) or previous (swipe right) tab and the content
+                    // just swaps, exactly as if the strip had been tapped. No
+                    // follow-the-finger animation, by request.
+                    //
+                    // Observe-only: nothing here is ever consumed, so vertical
+                    // scrolling and the shelf rows keep working untouched. The
+                    // price is that a fast horizontal flick *starting on* a
+                    // shelf row both scrolls the shelf and switches the tab.
+                    // Slow shelf browsing never trips it - the duration and
+                    // distance gates below only pass for a deliberate flick -
+                    // and multi-touch (pinch) is ignored outright. Flicks that
+                    // start on the tab strip itself are ignored too: those
+                    // belong to the strip's own scroll, reaching a hidden tab.
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .onGloballyPositioned {
+                            gridOrigin.value = it.boundsInWindow().topLeft
+                        }
+                        .pointerInput(tabs, selectedTab, searchMode) {
+                            if (searchMode) return@pointerInput
+                            val minDistancePx = with(density) { 96.dp.toPx() }
+                            awaitEachGesture {
+                                val down = awaitFirstDown(requireUnconsumed = false)
+                                val touch = gridOrigin.value + down.position
+                                if (tabStripBounds.value?.contains(touch) == true) {
+                                    return@awaitEachGesture
+                                }
+                                var totalX = 0f
+                                var totalY = 0f
+                                val startTime = down.uptimeMillis
+                                var endTime = startTime
+                                var aborted = false
+                                while (true) {
+                                    val event = awaitPointerEvent()
+                                    if (event.changes.size > 1) {
+                                        aborted = true
+                                        break
+                                    }
+                                    for (change in event.changes) {
+                                        totalX += change.position.x - change.previousPosition.x
+                                        totalY += change.position.y - change.previousPosition.y
+                                    }
+                                    endTime = event.changes.firstOrNull()?.uptimeMillis ?: endTime
+                                    if (event.changes.all { !it.pressed }) break
+                                }
+                                if (aborted) return@awaitEachGesture
+                                val duration = endTime - startTime
+                                if (duration in 1..400 &&
+                                    kotlin.math.abs(totalX) >= minDistancePx &&
+                                    kotlin.math.abs(totalX) >= 1.5f * kotlin.math.abs(totalY)
+                                ) {
+                                    // Same order the strip shows: the dead
+                                    // Search tab is excluded on both sides.
+                                    val entries = channelTabEntries(tabs)
+                                    val index = entries.indexOfFirst { it.kind == selectedTab }
+                                    val target = if (totalX < 0f) entries.getOrNull(index + 1)
+                                    else entries.getOrNull(index - 1)
+                                    if (target != null && target.kind != selectedTab) {
+                                        haptics.subtle()
+                                        viewModel.selectTab(target.kind)
+                                    }
+                                }
+                            }
+                        }
+                ) {
+                    item(key = "header", span = { GridItemSpan(maxLineSpan) }) {
+                        CreatorHeader(
+                            modifier = Modifier.bleedHorizontally(),
+                            name = currentHeader.name,
+                            avatarUrl = currentHeader.avatarUrl,
+                            bannerUrl = currentHeader.bannerUrl,
+                            isVerified = currentHeader.isVerified,
+                            metadata = creatorMetadata(
+                                currentHeader.handle,
+                                currentHeader.subscriberCountText,
+                                currentHeader.videoCountText
+                            ),
+                            description = currentHeader.descriptionPreview,
+                            onDescriptionClick = {
+                                viewModel.selectTab(ChannelTabKind.ABOUT)
+                            },
+                            scrollOffsetPx = headerOffsetPx,
+                            actions = {
+                                ChannelHeaderActions(
+                                    isSubscribed = isSubscribed,
+                                    isBlocked = isBlocked,
+                                    canSearch = tabs.any { it.kind == ChannelTabKind.SEARCH },
+                                    onSubscribeClick = {
+                                        if (viewModel.subscribeNeedsLogin()) onLoginClick()
+                                        else viewModel.toggleSubscribe()
+                                    },
+                                    bell = bell,
+                                    bellBusy = bellBusy,
+                                    channelName = currentHeader.name,
+                                    onBellChosen = viewModel::setBell,
+                                    onShareClick = { shareChannel(context, currentHeader.shareUrl) },
+                                    onSearchClick = { searchMode = true },
+                                    onBlockClick = { viewModel.toggleBlocked() },
+                                    onOpenMusicArtist = onOpenMusicArtist?.let { open ->
+                                        { open(currentHeader.channelId, currentHeader.name) }
+                                    }
+                                )
+                            }
+                        )
+                    }
+
+                    item(key = "tabs", span = { GridItemSpan(maxLineSpan) }) {
+                        ChannelTabRow(
+                            tabs = tabs,
+                            selected = selectedTab,
+                            onSelect = viewModel::selectTab,
+                            modifier = Modifier
+                                .bleedHorizontally()
+                                .onGloballyPositioned {
+                                    tabStripBounds.value = it.boundsInWindow()
+                                }
+                        )
+                    }
+
+                    channelTabContent(
+                        tabKind = selectedTab,
+                        page = page,
+                        isTabLoading = isTabLoading,
+                        about = about,
+                        isAboutLoading = isAboutLoading,
+                        onPlayVideo = onPlayVideo,
+                        onVideoLongPress = { optionsTarget = it },
+                        onOpenShorts = onOpenShorts,
+                        onOpenPlaylist = onOpenPlaylist,
+                        onOpenChannel = onOpenChannel,
+                        onSelectSort = { viewModel.selectSort(it, selectedTab) },
+                        onOpenPhotos = { images, index -> photoViewer = images to index },
+                        onOpenComments = viewModel::openPostComments
+                    )
+
+                    if (isLoadingMore) {
+                        item(key = "loading_more", span = { GridItemSpan(maxLineSpan) }) {
+                            Box(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .padding(24.dp),
+                                contentAlignment = Alignment.Center
+                            ) {
+                                LoadingIndicator(modifier = Modifier.size(36.dp))
+                            }
+                        }
+                    }
+                }
+
+                // Sits above the grid so the title can fade in over the banner
+                // as it scrolls away, rather than pushing the content down.
+                ChannelTopBar(
+                    title = currentHeader.name,
+                    showTitle = titleCollapsed,
+                    onBack = onBack
+                )
+
+                // Search takes the whole surface. It is a mode rather than a
+                // tab because it needs the keyboard and a text field, and
+                // burying that behind a tab chip would make the one thing
+                // people open a big channel to do the hardest thing to find.
+                AnimatedVisibility(
+                    visible = searchMode,
+                    enter = slideInVertically(
+                        animationSpec = spring(stiffness = Spring.StiffnessMediumLow),
+                        initialOffsetY = { -it / 6 }
+                    ) + fadeIn(),
+                    exit = slideOutVertically(targetOffsetY = { -it / 6 }) + fadeOut()
+                ) {
+                    ChannelSearchPane(
+                        channelName = currentHeader.name,
+                        query = searchQuery,
+                        results = searchResults,
+                        isSearching = isSearching,
+                        searchRan = searchRan,
+                        onQueryChange = viewModel::setSearchQuery,
+                        onVideoClick = onPlayVideo,
+                        onVideoLongPress = { optionsTarget = it },
+                        onOpenChannel = onOpenChannel,
+                        onClose = {
+                            searchMode = false
+                            viewModel.clearSearch()
+                        },
+                        contentPadding = contentPadding
+                    )
+                }
+            }
+        }
+    }
+}
+
+/**
+ * The scrollable tab row: a floating strip of pills, not a connected bar.
+ *
+ * The connected toggle group read as one object cut into slices — every tab
+ * the same width of strip, the selection a recoloured segment of something
+ * that was never one thing to begin with. Each tab is now its own pill
+ * ([SentupRadii.pill]): the chosen one carries the accent fill, the others a
+ * quiet container, and pressing pushes the pill inward instead of flashing
+ * it. A LazyRow rather than a scrolled Row for exactly this: the selected
+ * index scrolls itself into view.
+ */
+@Composable
+private fun ChannelTabRow(
+    tabs: List<com.sentup.android.data.ChannelTab>,
+    selected: ChannelTabKind,
+    onSelect: (ChannelTabKind) -> Unit,
+    modifier: Modifier = Modifier
+) {
+    val listState = rememberLazyListState()
+    // About is not one of YouTube's tabs - it is a panel behind the header's
+    // description - but it belongs in the row, because as far as the reader is
+    // concerned it is another thing this channel has.
+    val entries = remember(tabs) { channelTabEntries(tabs) }
+    val haptics = com.sentup.android.util.rememberSentupHaptics()
+
+    // The strip follows the selection, so a gesture switch onto a hidden tab
+    // (About lives off the right edge) never leaves the active button out of
+    // sight.
+    androidx.compose.runtime.LaunchedEffect(selected, entries) {
+        val index = entries.indexOfFirst { it.kind == selected }
+        if (index >= 0) listState.animateScrollToItem(index)
+    }
+
+    LazyRow(
+        state = listState,
+        modifier = modifier
+            .fillMaxWidth()
+            .padding(horizontal = CHANNEL_GUTTER, vertical = 8.dp),
+        horizontalArrangement = Arrangement.spacedBy(8.dp)
+    ) {
+        items(
+            count = entries.size,
+            // Kind alone is not unique: a channel can hold two OTHER tabs at
+            // once (Store plus Courses), which crashed the strip with a
+            // duplicate key the moment it measured on scroll.
+            key = { index -> "${entries[index].kind}_$index" }
+        ) { index ->
+            val tab = entries[index]
+            val isSelected = tab.kind == selected
+            // The About entry is the UI's own, and its tab title is the one
+            // string on this page that is not whatever YouTube named the row,
+            // so it is the one label read from resources.
+            val label = if (tab.kind == ChannelTabKind.ABOUT) {
+                stringResource(R.string.ch_tab_about)
+            } else {
+                tab.title
+            }
+            ChannelPillTab(
+                label = label,
+                selected = isSelected,
+                onClick = {
+                    if (!isSelected) {
+                        haptics.subtle()
+                        onSelect(tab.kind)
+                    }
+                }
+            )
+        }
+    }
+}
+
+/** One tab in [ChannelTabRow]: a pill, filled with the accent when chosen. */
+@Composable
+private fun ChannelPillTab(
+    label: String,
+    selected: Boolean,
+    onClick: () -> Unit
+) {
+    val interactionSource = remember { MutableInteractionSource() }
+    val pressed by interactionSource.collectIsPressedAsState()
+    val scale by animateFloatAsState(
+        targetValue = if (pressed) 0.97f else 1f,
+        animationSpec = tween(durationMillis = 90),
+        label = "channelPillPress"
+    )
+    val container by animateColorAsState(
+        targetValue = if (selected) {
+            MaterialTheme.colorScheme.primary
+        } else {
+            MaterialTheme.colorScheme.surfaceContainerHigh
+        },
+        animationSpec = tween(durationMillis = 140),
+        label = "channelPillContainer"
+    )
+    val ink by animateColorAsState(
+        targetValue = if (selected) {
+            MaterialTheme.colorScheme.onPrimary
+        } else {
+            MaterialTheme.colorScheme.onSurface
+        },
+        animationSpec = tween(durationMillis = 140),
+        label = "channelPillInk"
+    )
+    Box(
+        modifier = Modifier
+            .scale(scale)
+            .clip(CircleShape)
+            .background(container)
+            .clickable(
+                interactionSource = interactionSource,
+                indication = null,
+                onClick = onClick
+            )
+            .heightIn(min = 40.dp)
+            .padding(horizontal = 18.dp, vertical = 10.dp),
+        contentAlignment = Alignment.Center
+    ) {
+        Text(
+            text = label,
+            style = MaterialTheme.typography.labelLarge,
+            fontWeight = if (selected) FontWeight.Bold else FontWeight.Medium,
+            color = ink,
+            maxLines = 1
+        )
+    }
+}
+
+/**
+ * The row of actions under the identity: Subscribe, Share, Search and the
+ * overflow.
+ *
+ * Subscribe is the only one that gets the full width it needs, because it is
+ * the decision the page exists to support. Everything else is an icon.
+ */
+@OptIn(ExperimentalMaterial3ExpressiveApi::class)
+@Composable
+private fun ChannelHeaderActions(
+    isSubscribed: Boolean,
+    isBlocked: Boolean,
+    canSearch: Boolean,
+    onSubscribeClick: () -> Unit,
+    /** The account bell; null hides it (signed out, device-only follow, or none served). */
+    bell: com.sentup.android.data.ChannelBell?,
+    bellBusy: Boolean,
+    channelName: String,
+    onBellChosen: (com.sentup.android.data.BellLevel) -> Unit,
+    onShareClick: () -> Unit,
+    onSearchClick: () -> Unit,
+    onBlockClick: () -> Unit,
+    onOpenMusicArtist: (() -> Unit)?
+) {
+    var menuOpen by remember { mutableStateOf(false) }
+
+    Row(
+        modifier = Modifier.fillMaxWidth(),
+        verticalAlignment = Alignment.CenterVertically,
+        horizontalArrangement = Arrangement.spacedBy(10.dp)
+    ) {
+        SubscribeButton(
+            isSubscribed = isSubscribed,
+            onClick = onSubscribeClick,
+            modifier = Modifier.weight(1f)
+        )
+        // Beside Subscribe rather than among the icons: it is the second half
+        // of the subscribed state, and arrives and leaves with it.
+        if (bell != null) {
+            ChannelBellButton(
+                bell = bell,
+                channelName = channelName,
+                onLevelChosen = onBellChosen,
+                busy = bellBusy
+            )
+        }
+        if (canSearch) {
+            ChannelIconAction(
+                icon = Icons.Rounded.Search,
+                contentDescription = stringResource(R.string.ch_search_channel),
+                onClick = onSearchClick
+            )
+        }
+        ChannelIconAction(
+            icon = Icons.Rounded.Share,
+            contentDescription = stringResource(R.string.ch_share_channel),
+            onClick = onShareClick
+        )
+        Box {
+            ChannelIconAction(
+                icon = Icons.Rounded.MoreVert,
+                contentDescription = stringResource(R.string.cd_more_options),
+                onClick = { menuOpen = true }
+            )
+            DropdownMenu(
+                expanded = menuOpen,
+                onDismissRequest = { menuOpen = false }
+            ) {
+                if (onOpenMusicArtist != null) {
+                    DropdownMenuItem(
+                        text = { Text(stringResource(R.string.ch_open_artist_page)) },
+                        leadingIcon = { Icon(Icons.Rounded.MusicNote, contentDescription = null) },
+                        onClick = {
+                            menuOpen = false
+                            onOpenMusicArtist()
+                        }
+                    )
+                }
+                DropdownMenuItem(
+                    text = {
+                        Text(if (isBlocked) stringResource(R.string.ch_recommend_again) else stringResource(R.string.video_options_dont_recommend_channel))
+                    },
+                    leadingIcon = { Icon(Icons.Rounded.Block, contentDescription = null) },
+                    onClick = {
+                        menuOpen = false
+                        onBlockClick()
+                    }
+                )
+            }
+        }
+    }
+}
+
+@OptIn(ExperimentalMaterial3ExpressiveApi::class)
+@Composable
+private fun ChannelIconAction(
+    icon: androidx.compose.ui.graphics.vector.ImageVector,
+    contentDescription: String,
+    onClick: () -> Unit
+) {
+    FilledIconButton(
+        onClick = onClick,
+        modifier = Modifier.size(44.dp),
+        shape = CircleShape,
+        colors = IconButtonDefaults.filledIconButtonColors(
+            containerColor = MaterialTheme.colorScheme.surfaceContainerHighest,
+            contentColor = MaterialTheme.colorScheme.onSurfaceVariant
+        )
+    ) {
+        Icon(icon, contentDescription = contentDescription, modifier = Modifier.size(20.dp))
+    }
+}
+
+/**
+ * Back button always, channel name only once the header has scrolled past.
+ *
+ * The bar itself stays transparent over the banner and gains a surface as the
+ * title arrives, so the artwork is never covered by a strip of solid colour it
+ * does not need.
+ */
+@Composable
+private fun ChannelTopBar(
+    title: String,
+    showTitle: Boolean,
+    onBack: () -> Unit
+) {
+    val barAlpha by animateFloatAsState(
+        targetValue = if (showTitle) 1f else 0f,
+        animationSpec = spring(stiffness = Spring.StiffnessMediumLow),
+        label = "channelTopBar"
+    )
+
+    Box(
+        modifier = Modifier
+            .fillMaxWidth()
+            .background(
+                MaterialTheme.colorScheme.surface.copy(alpha = barAlpha * 0.94f)
+            )
+            .windowInsetsPadding(WindowInsets.statusBars)
+            .height(60.dp)
+            .padding(horizontal = 12.dp)
+    ) {
+        FilledIconButton(
+            onClick = onBack,
+            modifier = Modifier
+                .align(Alignment.CenterStart)
+                .size(44.dp),
+            shape = CircleShape,
+            colors = IconButtonDefaults.filledIconButtonColors(
+                // Legible over artwork while the bar is clear, and settling
+                // into the ordinary surface treatment once it is not.
+                containerColor = MaterialTheme.colorScheme.surfaceContainerHigh
+                    .copy(alpha = 0.4f + 0.5f * (1f - barAlpha)),
+                contentColor = MaterialTheme.colorScheme.onSurface
+            )
+        ) {
+            Icon(
+                Icons.AutoMirrored.Rounded.ArrowBack,
+                contentDescription = stringResource(R.string.cd_back)
+            )
+        }
+        Text(
+            text = title,
+            style = MaterialTheme.typography.titleMedium,
+            fontWeight = FontWeight.Bold,
+            color = MaterialTheme.colorScheme.onSurface.copy(alpha = barAlpha),
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
+            modifier = Modifier
+                .align(Alignment.CenterStart)
+                .padding(start = 56.dp, end = 16.dp)
+        )
+    }
+}
+
+@OptIn(ExperimentalMaterial3ExpressiveApi::class)
+@Composable
+private fun ChannelLoading() {
+    Box(modifier = Modifier.fillMaxSize(), contentAlignment = Alignment.Center) {
+        ContainedLoadingIndicator()
+    }
+}
+
+/**
+ * The channel could not be loaded at all - a deleted or terminated channel, a
+ * handle that resolves to nothing, or no connection.
+ *
+ * Deliberately does not blame the network, because most of the time it is not
+ * the network, and telling someone to check a connection that is plainly
+ * working sends them fixing the wrong thing.
+ */
+@Composable
+private fun ChannelUnavailable(onBack: () -> Unit) {
+    Column(
+        modifier = Modifier
+            .fillMaxSize()
+            .padding(32.dp),
+        horizontalAlignment = Alignment.CenterHorizontally,
+        verticalArrangement = Arrangement.Center
+    ) {
+        Surface(
+            shape = CircleShape,
+            color = MaterialTheme.colorScheme.surfaceContainerHigh,
+            modifier = Modifier.size(72.dp)
+        ) {
+            Box(contentAlignment = Alignment.Center) {
+                Icon(
+                    Icons.Rounded.VideoLibrary,
+                    contentDescription = null,
+                    tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.size(32.dp)
+                )
+            }
+        }
+        Spacer(Modifier.height(20.dp))
+        Text(
+            text = stringResource(R.string.ch_unavailable_title),
+            style = MaterialTheme.typography.titleMedium,
+            fontWeight = FontWeight.Bold,
+            color = MaterialTheme.colorScheme.onSurface,
+            textAlign = TextAlign.Center
+        )
+        Spacer(Modifier.height(8.dp))
+        Text(
+            text = stringResource(R.string.ch_unavailable_body),
+            style = MaterialTheme.typography.bodyMedium,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            textAlign = TextAlign.Center
+        )
+        Spacer(Modifier.height(24.dp))
+        Surface(
+            onClick = onBack,
+            shape = CircleShape,
+            color = MaterialTheme.colorScheme.primary,
+            contentColor = MaterialTheme.colorScheme.onPrimary
+        ) {
+            Text(
+                text = stringResource(R.string.cd_back),
+                style = MaterialTheme.typography.labelLarge,
+                fontWeight = FontWeight.Bold,
+                modifier = Modifier.padding(horizontal = 24.dp, vertical = 12.dp)
+            )
+        }
+    }
+}
+
+private fun shareChannel(context: android.content.Context, url: String) {
+    val intent = android.content.Intent(android.content.Intent.ACTION_SEND)
+        .setType("text/plain")
+        .putExtra(android.content.Intent.EXTRA_TEXT, url)
+    runCatching {
+        context.startActivity(android.content.Intent.createChooser(intent, context.getString(R.string.ch_share_chooser)))
+    }
+}
+
+/**
+ * Six, so one row divides cleanly into one video, two playlists or three
+ * Shorts without any tab needing a scroller of its own.
+ */
+internal const val CHANNEL_GRID_COLUMNS = 6

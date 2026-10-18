@@ -1,0 +1,972 @@
+package com.sentup.android.service
+
+import com.sentup.android.util.KLog
+
+import androidx.media3.common.C
+import androidx.media3.common.MediaItem
+import androidx.media3.common.PlaybackParameters
+import androidx.media3.common.Player
+import androidx.media3.common.util.UnstableApi
+import androidx.media3.exoplayer.ExoPlayer
+import android.os.SystemClock
+import kotlinx.coroutines.CoroutineScope
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.currentCoroutineContext
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.ensureActive
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.withTimeoutOrNull
+import kotlin.math.cos
+import kotlin.math.sin
+
+/**
+ * Two ExoPlayers alternating whole tracks, so a transition is a real overlap.
+ *
+ * **Why two engines and not one.** One player renders one item at a time, which
+ * is why the previous implementation faded the outgoing track to silence, let
+ * it end, and faded the incoming one up: a dip in the middle, the one thing a
+ * crossfade is defined by not being. And a track cannot be *handed* from one
+ * engine to another mid-play - resuming the same audio on a second pipeline a
+ * few milliseconds off produces a click, and matching the position exactly
+ * produces comb filtering between two copies of the same signal. So whichever
+ * engine starts a track finishes it, and the engines alternate. Everything
+ * below follows from that.
+ *
+ * **The session follows the audible player.** `MediaSession` wraps exactly one
+ * `Player`, and the notification, Bluetooth, Android Auto and the app's own
+ * `MediaController` all read through it, so at the end of a transition the
+ * session is re-pointed at whichever engine is now carrying the music
+ * ([onActiveChanged]). Before that moment the standby holds **only the next
+ * item**, and the full queue is spliced around it with `addMediaItems` at swap
+ * time. That ordering is deliberate twice over: `addMediaItems` does not
+ * interrupt the item already playing, and building the surrounding queue from
+ * the live timeline at swap time rather than from a snapshot taken at fade
+ * start means a queue edited during the fade - or an item replaced by the
+ * prefetcher, which happens constantly - lands correctly instead of being
+ * reverted.
+ *
+ * **The curve is equal power.** `ExoPlayer.volume` is a linear amplitude
+ * scalar and power goes as amplitude squared, so cosine out against sine in
+ * keeps the summed energy flat: no dB conversion and no lookup table. Two
+ * linear ramps would instead dip about 6 dB at the midpoint, which is the hole
+ * that makes an amateur crossfade recognisable.
+ *
+ * **The ramp is driven from playback position, not from a step counter.** The
+ * old fade ticked on the one-second progress loop, so a three second fade got
+ * about three volume updates and stepped audibly. This resolves the curve from
+ * the outgoing player's actual `currentPosition` every frame or so, which means
+ * a buffer stall or a seek cannot desync the two halves from each other.
+ *
+ * Every volume written is `trackGain * curve * duckGain`: the loudness
+ * correction for the whole track, the transition curve, and audio focus
+ * ducking. None of the three may be dropped, and in particular no ramp may end
+ * at a bare 1.0 - that would undo the loudness correction at exactly the moment
+ * the next track starts.
+ */
+@UnstableApi
+class CrossfadeEngine(
+    private val scope: CoroutineScope,
+    /**
+     * Builds one configured player. Called twice. Both must be built with
+     * `handleAudioFocus = false` - see [AudioFocusController] for why two
+     * players cannot each manage focus - and given the same audio session id,
+     * or an external equalizer would attach to alternate tracks only.
+     */
+    playerFactory: () -> ExoPlayer,
+    /** Re-point the `MediaSession` at the newly audible player. */
+    private val onActiveChanged: (ExoPlayer) -> Unit,
+    /** The loudness correction for the media item playing on [player]. */
+    private val gainFor: (player: ExoPlayer) -> Float,
+    /** Per-player transition filter. Zero must be a true bypass. */
+    private val setFilterSweep: (player: ExoPlayer, amount: Float) -> Unit = { _, _ -> },
+    /** Per-player echo, for an echo-out. Zero must be a true bypass. */
+    private val setEcho: (player: ExoPlayer, amount: Float, delayMs: Int) -> Unit = { _, _, _ -> },
+) {
+
+    private val playerA: ExoPlayer = playerFactory()
+    private val playerB: ExoPlayer = playerFactory()
+
+    /** The engine the session points at and the user is listening to. */
+    var active: ExoPlayer = playerA
+        private set
+
+    private val standby: ExoPlayer get() = if (active === playerA) playerB else playerA
+
+    /** Global attenuation from audio focus ducking. */
+    @Volatile
+    var duckGain: Float = 1f
+        set(value) {
+            field = value
+            applyIdleVolumes()
+        }
+
+    private var fadeJob: Job? = null
+    private var tempoReleaseJob: Job? = null
+
+    /** True from the moment the standby starts until the swap completes. */
+    val isFading: Boolean get() = fadeJob?.isActive == true
+
+    /**
+     * The media id the standby is playing, so the caller can tell a transition
+     * that is already under way from one that still needs starting.
+     */
+    private var fadingIntoId: String? = null
+
+    private data class PendingTransition(
+        val outgoing: ExoPlayer,
+        val outgoingItem: MediaItem,
+        val incomingItem: MediaItem,
+        val targetIndex: Int,
+    )
+
+    private var pendingTransition: PendingTransition? = null
+
+    /**
+     * How far the running overlap has mixed, 0 to 1, or null while there is
+     * no curve yet (the standby still preparing or waiting for its cue).
+     * [settleForPause] reads it to decide which track a pause belongs to.
+     */
+    private var mixProgress: Float? = null
+
+    /** A transport command can arrive before the fade's next validation tick. */
+    val pendingTargetIndex: Int?
+        get() = pendingTransition?.takeIf { pending ->
+            active === pending.outgoing &&
+                active.currentMediaItem?.isSameQueueItemAs(pending.outgoingItem) == true &&
+                pending.targetIndex in 0 until active.mediaItemCount &&
+                active.getMediaItemAt(pending.targetIndex).isSameQueueItemAs(pending.incomingItem)
+        }?.targetIndex
+
+    private var movedListener: Player.Listener? = null
+    private var shuffleEnabled = false
+    private var shuffleSeed = 0L
+    private var repeatMode = Player.REPEAT_MODE_OFF
+
+    private var shuffleRandom = java.util.Random()
+
+    init {
+        playerA.setShuffleOrder(QueueShuffleOrder.startingAt(0, C.INDEX_UNSET, shuffleRandom))
+        playerB.setShuffleOrder(QueueShuffleOrder.startingAt(0, C.INDEX_UNSET, shuffleRandom))
+    }
+
+    /**
+     * Turning shuffle on (or a new seed) reshuffles the audible queue with the
+     * current song first, so nothing is stranded before it. The permutation
+     * then lives on the active player and is copied across at each swap, so a
+     * crossfade can never generate a different order.
+     */
+    fun setShuffleState(enabled: Boolean, seed: Long) {
+        if (shuffleEnabled != enabled || shuffleSeed != seed) cancelTransition()
+        val reshuffle = enabled && (!shuffleEnabled || shuffleSeed != seed)
+        shuffleEnabled = enabled
+        shuffleSeed = seed
+        if (reshuffle) {
+            shuffleRandom = java.util.Random(seed)
+            active.setShuffleOrder(
+                QueueShuffleOrder.startingAt(active.mediaItemCount, active.currentMediaItemIndex, shuffleRandom)
+            )
+        }
+        applyModes(playerA)
+        applyModes(playerB)
+    }
+
+    fun setRepeatMode(mode: Int) {
+        if (repeatMode != mode) cancelTransition()
+        repeatMode = mode
+        playerA.repeatMode = mode
+        playerB.repeatMode = mode
+    }
+
+    /**
+     * The user's playback rate, and the engine's definition of "normal".
+     *
+     * Every tempo write below is relative to this rather than to 1.0. The
+     * transition speeds this engine applies are small corrections around the
+     * source tempo - [MIN_TRANSITION_SPEED]..[MAX_TRANSITION_SPEED], about eight
+     * percent either way - so they multiply the base rather than replacing it,
+     * and the tempo release eases back to the base instead of to 1.0. Before
+     * this existed every resting write here was a literal 1.0, so any
+     * transition would have snapped a user who had chosen another speed back
+     * to the recorded one, mid-song and without warning.
+     */
+    private var baseSpeed = 1f
+
+    /** [PlaybackParameters] at the user's rate: this engine's resting tempo. */
+    private fun baseParameters() = PlaybackParameters(baseSpeed, 1f)
+
+    /** The sink clamps above 8x while the player reports the unclamped rate. */
+    private fun transitionSpeed(factor: Float) = (baseSpeed * factor).coerceAtMost(MAX_SINK_SPEED)
+
+    /**
+     * Change the resting tempo of both engines.
+     *
+     * A running overlap is abandoned rather than retuned, for the reason
+     * [setShuffleState] and [setRepeatMode] abandon one: the plan behind it -
+     * its cue, its beat alignment, and the clock speeds [runFade] captured
+     * before its loop started - was made against the tempo that just changed.
+     * The caller's ordinary advance is a better answer than a mix drifting
+     * against a moved clock.
+     */
+    fun setBaseSpeed(speed: Float) {
+        val next = speed.coerceAtLeast(MIN_BASE_SPEED)
+        if (kotlin.math.abs(next - baseSpeed) < 0.001f) return
+        baseSpeed = next
+        cancelTransition()
+        playerA.playbackParameters = baseParameters()
+        playerB.playbackParameters = baseParameters()
+    }
+
+    /**
+     * Use [order] as the audible queue's permutation, for a queue arranged by
+     * hand or a restored session. The caller checks it addresses every queue
+     * index exactly once.
+     */
+    fun setExplicitShuffleOrder(order: IntArray) {
+        if (order.size != active.mediaItemCount) return
+        cancelTransition()
+        active.setShuffleOrder(QueueShuffleOrder.of(order, shuffleRandom))
+    }
+
+    fun setPauseAtEndOfMediaItems(enabled: Boolean) {
+        playerA.pauseAtEndOfMediaItems = enabled
+        playerB.pauseAtEndOfMediaItems = enabled
+    }
+
+    private fun applyModes(target: ExoPlayer) {
+        target.shuffleModeEnabled = shuffleEnabled
+        target.repeatMode = repeatMode
+    }
+
+    /**
+     * Follow the audible player only.
+     *
+     * Registered on both engines it would fire twice, and the standby's events
+     * are meaningless to the service: the standby transitions into a single
+     * item it was handed directly, which is not a queue advance and must not
+     * drive validation or prefetching. The listener moves with [active]
+     * instead, and [onActiveChanged] is the signal that a swap happened, since
+     * the incoming player never emits a transition of its own.
+     */
+    fun setActiveListener(listener: Player.Listener) {
+        movedListener?.let {
+            playerA.removeListener(it)
+            playerB.removeListener(it)
+        }
+        movedListener = listener
+        active.addListener(listener)
+    }
+
+    /**
+     * Push the resting volume to both engines.
+     *
+     * Only touches a player that is not being ramped: a write landing mid-fade
+     * would fight the curve for one frame and be heard as a stutter.
+     */
+    fun applyIdleVolumes() {
+        if (isFading) return
+        active.volume = gainFor(active) * duckGain
+        standby.volume = 0f
+    }
+
+    /**
+     * Begin overlapping [nextItem] with what [active] is playing.
+     *
+     * @param durationMs how long the overlap runs. Clamped against what is
+     *   actually left of the outgoing track, because a fade longer than the
+     *   remainder would still be ramping when the track ended.
+     * @return false when the transition could not be started, in which case the
+     *   caller should let the active player advance on its own.
+     */
+    fun startTransition(
+        nextItem: MediaItem,
+        durationMs: Long,
+        targetIndex: Int = active.getNextMediaItemIndex(),
+        incomingStartMs: Long = 0L,
+        incomingSpeed: Float = 1f,
+        filterSweepStrength: Float = 0f,
+        /** Natural transitions prepare early, then begin at this remainder. */
+        startAtRemainingMs: Long? = null,
+        /** How the two tracks are handed over; see [TransitionStyle]. */
+        style: TransitionStyle = TransitionStyle.BLEND,
+        /** The echo's repeat time for [TransitionStyle.ECHO_OUT]. */
+        echoDelayMs: Int = 0,
+    ): Boolean {
+        if (isFading) return false
+        val outgoing = active
+        val incoming = standby
+
+        if (targetIndex !in 0 until outgoing.mediaItemCount) return false
+        if (targetIndex == outgoing.currentMediaItemIndex ||
+            nextItem.mediaId == outgoing.currentMediaItem?.mediaId
+        ) return false
+        if (!outgoing.getMediaItemAt(targetIndex).isSameQueueItemAs(nextItem)) return false
+        val remaining = outgoing.duration - outgoing.currentPosition
+        if (outgoing.duration <= 0 || remaining <= 0) return false
+        // Leave a beat at the end: ending the fade exactly on the track
+        // boundary races the player's own advance.
+        val fadeMs = durationMs.coerceAtMost(remaining - END_GUARD_MS)
+        if (fadeMs < MIN_FADE_MS) return false
+
+        // What the overlap is fading *out* of. Every index below addresses the
+        // queue as it stands right now, so if the outgoing player leaves this
+        // track the whole plan is stale - see [runFade] and [completeSwap].
+        // No outgoing track means there is nothing to overlap and nothing to
+        // anchor on; the caller's ordinary advance is the right answer.
+        val outgoingItem = outgoing.currentMediaItem ?: return false
+
+        // A preceding swap can still be easing its tempo back to normal.
+        // Retire that writer before this overlap captures either clock speed.
+        tempoReleaseJob?.cancel()
+        tempoReleaseJob = null
+        outgoing.playbackParameters = baseParameters()
+
+        return try {
+            fadingIntoId = nextItem.mediaId
+            mixProgress = null
+            pendingTransition = PendingTransition(outgoing, outgoingItem, nextItem, targetIndex)
+            // One item only. The rest of the queue is spliced around it at swap
+            // time, from the live timeline rather than a stale snapshot.
+            incoming.setMediaItem(nextItem, incomingStartMs.coerceAtLeast(0L))
+            incoming.playbackParameters = PlaybackParameters(
+                transitionSpeed(incomingSpeed.coerceIn(MIN_TRANSITION_SPEED, MAX_TRANSITION_SPEED)),
+                1f
+            )
+            incoming.volume = 0f
+            incoming.prepare()
+            incoming.playWhenReady = false
+
+            fadeJob = scope.launch {
+                runFade(
+                    outgoing, incoming, fadeMs, targetIndex, outgoingItem,
+                    filterSweepStrength.coerceIn(0f, 1f),
+                    startAtRemainingMs,
+                    style,
+                    echoDelayMs,
+                )
+            }.also { job ->
+                job.invokeOnCompletion {
+                    if (fadeJob === job) fadeJob = null
+                }
+            }
+            true
+        } catch (e: Exception) {
+            KLog.e(TAG, "Could not start transition", e)
+            fadingIntoId = null
+            pendingTransition = null
+            runCatching { incoming.stop() }
+                .onFailure { KLog.w(TAG, "Could not stop the incoming player: ${it.message}") }
+            false
+        }
+    }
+
+    private suspend fun runFade(
+        outgoing: ExoPlayer,
+        incoming: ExoPlayer,
+        requestedFadeMs: Long,
+        targetIndex: Int,
+        outgoingItem: MediaItem,
+        filterSweepStrength: Float,
+        startAtRemainingMs: Long?,
+        style: TransitionStyle,
+        echoDelayMs: Int,
+    ) {
+        fun queueStillMatches(): Boolean =
+            active === outgoing &&
+                outgoing.currentMediaItem?.isSameQueueItemAs(outgoingItem) == true &&
+                targetIndex in 0 until outgoing.mediaItemCount &&
+                incoming.currentMediaItem?.let {
+                    outgoing.getMediaItemAt(targetIndex).isSameQueueItemAs(it)
+                } == true &&
+                (startAtRemainingMs == null || outgoing.getNextMediaItemIndex() == targetIndex)
+
+        try {
+            val ready = withTimeoutOrNull(STANDBY_READY_TIMEOUT_MS) {
+                while (incoming.playbackState != Player.STATE_READY) {
+                    currentCoroutineContext().ensureActive()
+                    if (!queueStillMatches() || !outgoing.playWhenReady) {
+                        return@withTimeoutOrNull false
+                    }
+                    if (incoming.playerError != null || incoming.playbackState == Player.STATE_ENDED) {
+                        return@withTimeoutOrNull false
+                    }
+                    delay(RAMP_INTERVAL_MS)
+                }
+                true
+            } == true
+            if (!ready) {
+                KLog.w(TAG, "Standby was not ready in time; abandoning the overlap")
+                abortInto(outgoing, incoming)
+                return
+            }
+
+            if (startAtRemainingMs != null) {
+                while (outgoing.duration - outgoing.currentPosition > startAtRemainingMs) {
+                    currentCoroutineContext().ensureActive()
+                    if (!queueStillMatches() ||
+                        !outgoing.isPlaying || incoming.playbackState != Player.STATE_READY
+                    ) {
+                        abortInto(outgoing, incoming)
+                        return
+                    }
+                    delay(RAMP_INTERVAL_MS)
+                }
+            }
+
+            if (!queueStillMatches() || !outgoing.isPlaying) {
+                abortInto(outgoing, incoming)
+                return
+            }
+
+            val outGain = gainFor(outgoing)
+            val inGain = gainFor(incoming)
+            val incomingBeforeStart = incoming.currentPosition
+            incoming.playWhenReady = true
+
+            // STATE_READY means decoded data exists, not that the audio sink's
+            // clock has begun. Starting the fade on READY alone makes the
+            // incoming beat device-latency late and can create a dip. Keep the
+            // outgoing track untouched until the incoming position advances.
+            val clockStarted = withTimeoutOrNull(INCOMING_CLOCK_TIMEOUT_MS) {
+                while (!incoming.isPlaying ||
+                    incoming.currentPosition <= incomingBeforeStart + MIN_CLOCK_ADVANCE_MS
+                ) {
+                    currentCoroutineContext().ensureActive()
+                    if (!queueStillMatches() || !outgoing.isPlaying ||
+                        incoming.playerError != null ||
+                        incoming.playbackState == Player.STATE_IDLE ||
+                        incoming.playbackState == Player.STATE_ENDED
+                    ) return@withTimeoutOrNull false
+                    delay(RAMP_INTERVAL_MS)
+                }
+                true
+            } == true
+            if (!clockStarted) {
+                KLog.w(TAG, "Incoming playback clock did not start; abandoning the overlap")
+                abortInto(outgoing, incoming)
+                return
+            }
+
+            val remaining = outgoing.duration - outgoing.currentPosition
+            val fadeMs = requestedFadeMs.coerceAtMost(remaining - END_GUARD_MS)
+            if (fadeMs < MIN_FADE_MS) {
+                abortInto(outgoing, incoming)
+                return
+            }
+
+            val outgoingStartPosition = outgoing.currentPosition
+            val incomingStartPosition = incoming.currentPosition
+            val outgoingSpeed = outgoing.playbackParameters.speed.coerceAtLeast(0.01f)
+            val incomingSpeed = incoming.playbackParameters.speed.coerceAtLeast(0.01f)
+            var incomingStallStartedMs = 0L
+            var maxClockDriftMs = 0L
+            var lastClockDriftMs = 0L
+            var clockDriftOffsetMs = 0L
+
+            while (scope.isActive) {
+                currentCoroutineContext().ensureActive()
+                // Check the occurrence before reading clocks or touching
+                // volume. A rebuilt queue may contain the same media id at the
+                // same index; only the queue-item id distinguishes it from the
+                // transition this coroutine was created for.
+                if (!queueStillMatches() || !outgoing.playWhenReady) {
+                    KLog.w(TAG, "Queue moved under the overlap; abandoning it")
+                    abortInto(outgoing, incoming)
+                    return
+                }
+                // If the audible player buffers, pause the muted/quiet player
+                // so it cannot run ahead. If only the incoming player buffers,
+                // hold the curve briefly with the outgoing track still audible;
+                // a longer stall abandons the overlap instead of fading toward
+                // a player that is not producing audio.
+                if (outgoing.playWhenReady && !outgoing.isPlaying && incoming.isPlaying) {
+                    incoming.playWhenReady = false
+                } else if (outgoing.isPlaying && !incoming.playWhenReady) {
+                    incoming.playWhenReady = true
+                }
+
+                if (outgoing.isPlaying && incoming.playWhenReady && !incoming.isPlaying) {
+                    if (incomingStallStartedMs == 0L) {
+                        incomingStallStartedMs = SystemClock.elapsedRealtime()
+                    } else if (SystemClock.elapsedRealtime() - incomingStallStartedMs >=
+                        MAX_INCOMING_STALL_MS
+                    ) {
+                        KLog.w(TAG, "Incoming engine stalled mid-fade; abandoning the overlap")
+                        abortInto(outgoing, incoming)
+                        return
+                    }
+                } else {
+                    incomingStallStartedMs = 0L
+                }
+
+                val outgoingElapsedMs = (
+                    (outgoing.currentPosition - outgoingStartPosition).coerceAtLeast(0L) /
+                        outgoingSpeed
+                    ).toLong()
+                val incomingElapsedMs = (
+                    (incoming.currentPosition - incomingStartPosition).coerceAtLeast(0L) /
+                        incomingSpeed
+                    ).toLong()
+                // The reported clocks are estimates, and their errors arrive
+                // two ways. *Gradually*: the incoming player's AudioTrack is
+                // always fresh, and Media3's sink slews onto the AudioTimestamp
+                // clock at up to 10% of elapsed time per read [verified
+                // September 2026 against the 1.11.0 AudioTrackPositionTracker
+                // bytecode], accruing to the device's output latency. And as a
+                // *step*: that slew limit lives on the playback thread, while
+                // this loop reads ExoPlayerImpl's app-thread position, which
+                // extrapolates between internal anchors and re-anchors in one
+                // read - so the same settle can land as a single ~250ms step
+                // [measured September 2026, emulator: 249-280ms at every fade
+                // The spikes also *oscillate*: a read can land ~250ms off the
+                // trend and the next read return to it [measured September
+                // 2026, emulator: alternating +/-250ms pairs within 25-50ms],
+                // so the budget is *net* re-anchored displacement, never a sum
+                // of absolute steps - a spike and its return cancel, where a
+                // real discontinuity (a seek this coroutine missed, a reset)
+                // displaces the clock and never comes back. Its bound is the
+                // 1s discrepancy Media3 will smooth at all
+                // (MAX_POSITION_DRIFT_FOR_SMOOTHING_US), which caps every
+                // sanctioned correction. The audible discontinuities all
+                // announce themselves elsewhere: the service cancels on
+                // seeks, queueStillMatches catches item changes, STATE_IDLE
+                // catches errors.
+                val clockDriftMs = outgoingElapsedMs - incomingElapsedMs
+                val clockStepMs = clockDriftMs - lastClockDriftMs
+                lastClockDriftMs = clockDriftMs
+                if (kotlin.math.abs(clockStepMs) > MAX_CLOCK_STEP_MS) {
+                    clockDriftOffsetMs += clockStepMs
+                    if (kotlin.math.abs(clockDriftOffsetMs) > MAX_CLOCK_SETTLE_MS) {
+                        KLog.w(
+                            TAG,
+                            "Playback clock jumped by ${kotlin.math.abs(clockStepMs)}ms " +
+                                "(${clockDriftOffsetMs}ms net); abandoning the overlap"
+                        )
+                        abortInto(outgoing, incoming)
+                        return
+                    }
+                    KLog.d(TAG, "Playback clock stepped ${clockStepMs}ms; re-anchoring the overlap clock")
+                }
+                val residualDriftMs = clockDriftMs - clockDriftOffsetMs
+                maxClockDriftMs = maxOf(maxClockDriftMs, kotlin.math.abs(residualDriftMs))
+                if (kotlin.math.abs(residualDriftMs) > MAX_CLOCK_DRIFT_MS) {
+                    KLog.w(TAG, "Playback clocks diverged by ${kotlin.math.abs(residualDriftMs)}ms; abandoning the overlap")
+                    abortInto(outgoing, incoming)
+                    return
+                }
+                // The quieter player determines safe progress. In particular,
+                // the outgoing side never disappears ahead of incoming audio.
+                val elapsedMs = minOf(outgoingElapsedMs, incomingElapsedMs)
+                val t = (elapsedMs.toFloat() / fadeMs).coerceIn(0f, 1f)
+                mixProgress = t
+
+                // Equal power: cos^2 + sin^2 == 1, so the summed energy is flat
+                // across the transition instead of dipping in the middle.
+                val angle = t * (Math.PI.toFloat() / 2f)
+                outgoing.volume = outGain * cos(angle) * duckGain
+                incoming.volume = inGain * sin(angle) * duckGain
+                when (style) {
+                    TransitionStyle.BLEND -> setFilterSweep(outgoing, filterSweepStrength * t)
+                    // The low end changes hands in the middle. Two basslines
+                    // at once is the mud in a long blend, so the incoming
+                    // track arrives without its bass, and around the midpoint
+                    // it takes the bass over as the outgoing one gives it up.
+                    TransitionStyle.BASS_SWAP -> {
+                        val handover = smoothStep(BASS_SWAP_FROM, BASS_SWAP_TO, t)
+                        setFilterSweep(incoming, BASS_CUT_SWEEP * (1f - handover))
+                        setFilterSweep(
+                            outgoing,
+                            maxOf(BASS_CUT_SWEEP * handover, filterSweepStrength * t)
+                        )
+                    }
+                    // The outgoing track is cut loose into its own echo, so
+                    // two tempos that cannot be matched never play against
+                    // each other: what overlaps the new song is a repeat
+                    // dying away, not a second beat.
+                    TransitionStyle.ECHO_OUT ->
+                        setEcho(outgoing, smoothStep(ECHO_FROM, ECHO_TO, t), echoDelayMs)
+                }
+
+                if (t >= 1f) break
+                // The outgoing track running out is completion, not a race to
+                // lose. [fadeMs] was planned as remaining minus END_GUARD_MS
+                // on the outgoing clock, but the curve advances on the slower
+                // of two estimated clocks, and the incoming clock's settle
+                // legitimately lags by more than the guard. Waiting for t to
+                // reach 1 then lets Media3 advance the outgoing player itself
+                // - it still holds the full queue - which restarts, from zero
+                // and at full volume, the very song the standby has spent the
+                // whole fade audibly bringing in. Swap now: at worst the
+                // outgoing loses its final guard-window tail, which the fade
+                // had already planned to spend.
+                if (outgoing.duration > 0 &&
+                    outgoing.duration - outgoing.currentPosition <= END_GUARD_MS
+                ) break
+                // The outgoing player ending early (a short file, an error)
+                // must not leave this spinning against a frozen position.
+                if (outgoing.playbackState == Player.STATE_ENDED) break
+                // A fatal error drives a player to STATE_IDLE, and the service's
+                // listener is not on the standby, so nothing else would notice.
+                // Swapping onto a dead engine would be silence with a running
+                // progress bar, so abandon and let the outgoing track finish.
+                if (incoming.playbackState == Player.STATE_IDLE) {
+                    KLog.w(TAG, "Standby engine died mid-fade; abandoning the overlap")
+                    abortInto(outgoing, incoming)
+                    return
+                }
+                delay(RAMP_INTERVAL_MS)
+            }
+            currentCoroutineContext().ensureActive()
+            KLog.d(TAG, "Transition clocks completed with max drift=${maxClockDriftMs}ms")
+            completeSwap(outgoing, incoming, gainFor(incoming), targetIndex, outgoingItem)
+        } catch (e: CancellationException) {
+            // cancelTransition owns synchronous cleanup. Repeating it later
+            // from this cancelled coroutine can clear a new transition that
+            // has already reused the standby player.
+            throw e
+        } catch (e: Exception) {
+            KLog.e(TAG, "Transition failed; keeping the outgoing player", e)
+            abortInto(outgoing, incoming)
+        }
+    }
+
+    /**
+     * Hand the session to [incoming] and retire [outgoing].
+     *
+     * The queue is rebuilt here rather than at fade start: `addMediaItems` does
+     * not disturb the item already playing, and reading the surrounding items
+     * from the outgoing timeline *now* picks up anything that changed during
+     * the fade - a reorder, a removal, or one of the prefetcher's
+     * `replaceMediaItem` calls.
+     */
+    private fun completeSwap(
+        outgoing: ExoPlayer,
+        incoming: ExoPlayer,
+        inGain: Float,
+        targetIndex: Int,
+        outgoingItem: MediaItem,
+    ) {
+        try {
+            // The outgoing track is the anchor for everything below. A queue
+            // replaced during the fade - the user tapping another song in the
+            // list they are listening to - moves it, and the id check on
+            // [targetIndex] alone does not catch that: reopening the same
+            // playlist puts the same song back at the same index, so the guard
+            // passes and the session is handed to the standby playing a track
+            // nobody asked for. Anchoring on what the fade started from is what
+            // makes that case impossible rather than merely unlikely.
+            if (outgoing.currentMediaItem?.isSameQueueItemAs(outgoingItem) != true ||
+                targetIndex !in 0 until outgoing.mediaItemCount ||
+                incoming.currentMediaItem?.let {
+                    outgoing.getMediaItemAt(targetIndex).isSameQueueItemAs(it)
+                } != true
+            ) {
+                abortInto(outgoing, incoming)
+                return
+            }
+
+            val before = ArrayList<MediaItem>(targetIndex.coerceAtLeast(0))
+            for (i in 0 until targetIndex.coerceAtMost(outgoing.mediaItemCount)) {
+                before.add(outgoing.getMediaItemAt(i))
+            }
+            val after = ArrayList<MediaItem>()
+            for (i in (targetIndex + 1) until outgoing.mediaItemCount) {
+                after.add(outgoing.getMediaItemAt(i))
+            }
+
+            if (after.isNotEmpty()) incoming.addMediaItems(after)
+            // Prepended last, so the indices used above stay valid while the
+            // trailing items are appended.
+            if (before.isNotEmpty()) incoming.addMediaItems(0, before)
+
+            // Carry the permutation the listener has been walking, edits and
+            // all; a regenerated one would replay or skip songs.
+            val order = outgoing.shuffleOrder
+            if (order.length == incoming.mediaItemCount) {
+                incoming.setShuffleOrder(QueueShuffleOrder.copyOf(order, shuffleRandom))
+            }
+            applyModes(incoming)
+            incoming.volume = inGain * duckGain
+
+            movedListener?.let {
+                outgoing.removeListener(it)
+                incoming.addListener(it)
+            }
+            active = incoming
+            onActiveChanged(incoming)
+
+            // Only after the session has moved: stopping the outgoing player
+            // first would publish a stopped state through it on the way out.
+            // Once the session has moved, retiring the old player must never
+            // roll back by stopping and clearing the newly audible one.
+            runCatching {
+                outgoing.volume = 0f
+                outgoing.stop()
+                outgoing.clearMediaItems()
+                outgoing.playbackParameters = baseParameters()
+                clearEffects(outgoing)
+                clearEffects(incoming)
+            }.onFailure { KLog.w(TAG, "Could not fully retire outgoing player: ${it.message}") }
+            runCatching { releaseTempo(incoming) }
+                .onFailure { KLog.w(TAG, "Could not release the incoming tempo: ${it.message}") }
+        } catch (e: Exception) {
+            KLog.e(TAG, "Swap failed; falling back to the outgoing player", e)
+            if (active === incoming) {
+                active = outgoing
+                movedListener?.let {
+                    incoming.removeListener(it)
+                    outgoing.addListener(it)
+                }
+                runCatching { onActiveChanged(outgoing) }
+                    .onFailure { KLog.w(TAG, "Could not report the reverted active player: ${it.message}") }
+            }
+            runCatching {
+                incoming.stop()
+                incoming.clearMediaItems()
+                incoming.playbackParameters = baseParameters()
+                clearEffects(incoming)
+                clearEffects(outgoing)
+                outgoing.volume = gainFor(outgoing) * duckGain
+            }.onFailure { KLog.w(TAG, "Could not reset the players after a failed swap: ${it.message}") }
+        } finally {
+            fadingIntoId = null
+            pendingTransition = null
+            mixProgress = null
+        }
+    }
+
+    /**
+     * Give up on an overlap that is already running and restore [outgoing].
+     *
+     * Separate from [cancelTransition] because it runs from inside the fade
+     * coroutine, where cancelling the job would cancel the caller.
+     */
+    private fun abortInto(outgoing: ExoPlayer, incoming: ExoPlayer) {
+        fadingIntoId = null
+        pendingTransition = null
+        mixProgress = null
+        runCatching {
+            incoming.stop()
+            incoming.clearMediaItems()
+            incoming.volume = 0f
+            incoming.playbackParameters = baseParameters()
+            clearEffects(incoming)
+            clearEffects(outgoing)
+            outgoing.volume = gainFor(outgoing) * duckGain
+        }.onFailure { KLog.w(TAG, "Could not clean up an aborted transition: ${it.message}") }
+    }
+
+    /** Take every transition effect off [player]: filter and echo both. */
+    private fun clearEffects(player: ExoPlayer) {
+        setFilterSweep(player, 0f)
+        setEcho(player, 0f, 0)
+    }
+
+    private fun smoothStep(from: Float, to: Float, value: Float): Float {
+        val x = ((value - from) / (to - from)).coerceIn(0f, 1f)
+        return x * x * (3f - 2f * x)
+    }
+
+    /**
+     * Stop a transition and leave the active player as it was.
+     *
+     * Used when something makes the pending transition wrong - the user skips,
+     * the queue changes under it, playback pauses.
+     */
+    fun cancelTransition() {
+        tempoReleaseJob?.cancel()
+        tempoReleaseJob = null
+        active.playbackParameters = baseParameters()
+        val job = fadeJob
+        if (job?.isActive == true) job.cancel()
+        fadeJob = null
+        fadingIntoId = null
+        pendingTransition = null
+        mixProgress = null
+        runCatching {
+            standby.stop()
+            standby.clearMediaItems()
+            standby.volume = 0f
+            standby.playbackParameters = baseParameters()
+            clearEffects(standby)
+            clearEffects(active)
+            active.volume = gainFor(active) * duckGain
+        }.onFailure { KLog.w(TAG, "Could not reset the players after a cancel: ${it.message}") }
+    }
+
+    /**
+     * Playback was paused - by the user, audio focus, unplugged headphones or
+     * the sleep timer - while an overlap was running.
+     *
+     * [cancelTransition] alone keeps the outgoing track, which is wrong once
+     * the mix is past halfway: by then the incoming track is what is being
+     * heard, and dropping it meant a resume went back to the last seconds of
+     * the old song and then played the new song's opening a second time. Past
+     * the equal-power midpoint the swap completes now instead, with the
+     * incoming player paused where it is, so the pause lands on the song the
+     * listener was actually hearing. Before the midpoint the overlap is
+     * dropped as before; the incoming track had been quieter than the one
+     * being paused, so hearing its opening again on resume is the lesser
+     * surprise.
+     *
+     * Call from the audible player's pause event, before the fade's own next
+     * tick sees the pause and abandons the overlap by itself.
+     */
+    fun settleForPause() {
+        val job = fadeJob
+        val pending = pendingTransition
+        val progress = mixProgress
+        if (job?.isActive != true || pending == null || progress == null ||
+            progress < PAUSE_HANDOVER_PROGRESS || active !== pending.outgoing
+        ) {
+            cancelTransition()
+            return
+        }
+        val incoming = standby
+        // Stop the fade first, so nothing writes volumes or swaps behind this.
+        job.cancel()
+        fadeJob = null
+        incoming.playWhenReady = false
+        completeSwap(
+            outgoing = pending.outgoing,
+            incoming = incoming,
+            inGain = gainFor(incoming),
+            targetIndex = pending.targetIndex,
+            outgoingItem = pending.outgoingItem,
+        )
+    }
+
+    /** Ease the small tempo correction back to the source tempo after mixing. */
+    private fun releaseTempo(player: ExoPlayer) {
+        tempoReleaseJob?.cancel()
+        val start = player.playbackParameters.speed
+        if (kotlin.math.abs(start - baseSpeed) < 0.001f) {
+            player.playbackParameters = baseParameters()
+            return
+        }
+        val occurrence = player.currentMediaItem ?: return
+        tempoReleaseJob = scope.launch {
+            val steps = (TEMPO_RELEASE_MS / TEMPO_RELEASE_STEP_MS).toInt()
+            repeat(steps) { index ->
+                if (active !== player || isFading ||
+                    player.currentMediaItem?.isSameQueueItemAs(occurrence) != true
+                ) return@launch
+                val t = (index + 1f) / steps
+                player.playbackParameters =
+                    PlaybackParameters(start + (baseSpeed - start) * t, 1f)
+                delay(TEMPO_RELEASE_STEP_MS)
+            }
+        }
+    }
+
+    /** Both engines share one id, or an external equalizer attaches to half. */
+    fun setAudioSessionId(sessionId: Int) {
+        playerA.audioSessionId = sessionId
+        playerB.audioSessionId = sessionId
+    }
+
+    fun release() {
+        fadeJob?.cancel()
+        tempoReleaseJob?.cancel()
+        clearEffects(playerA)
+        clearEffects(playerB)
+        runCatching { playerA.release() }
+            .onFailure { KLog.w(TAG, "Could not release player A: ${it.message}") }
+        runCatching { playerB.release() }
+            .onFailure { KLog.w(TAG, "Could not release player B: ${it.message}") }
+    }
+
+    companion object {
+        private const val TAG = "CrossfadeEngine"
+
+        /**
+         * Roughly one frame. Fine enough that the ramp is inaudible - the old
+         * one-second progress tick gave a three second fade about three steps -
+         * and coarse enough not to be a hot loop.
+         */
+        private const val RAMP_INTERVAL_MS = 16L
+
+        /** A fade shorter than this is not worth the swap; cut instead. */
+        private const val MIN_FADE_MS = 250L
+
+        /** Never let the fade run into the track's own end. */
+        private const val END_GUARD_MS = 250L
+
+        /** A prepared, warmed next item should become ready almost instantly. */
+        private const val STANDBY_READY_TIMEOUT_MS = 1_500L
+        private const val INCOMING_CLOCK_TIMEOUT_MS = 750L
+        private const val MIN_CLOCK_ADVANCE_MS = 8L
+        private const val MAX_INCOMING_STALL_MS = 350L
+
+        /**
+         * The equal-power crossover: from here the incoming track is at least
+         * as loud as the outgoing one, so a pause belongs to it.
+         */
+        private const val PAUSE_HANDOVER_PROGRESS = 0.5f
+
+        /**
+         * A drift change this large between two 16ms ticks is a step, not the
+         * sink's gradual slew (at most ~10% of the interval, a couple of
+         * milliseconds per tick). A step is *detected* here but only
+         * re-anchored, not aborted - the app-thread position re-anchors onto
+         * the renderer clock in single reads, so a legitimate settle arrives
+         * as one step of roughly the output latency.
+         */
+        private const val MAX_CLOCK_STEP_MS = 150L
+
+        /**
+         * Net re-anchored displacement the fade tolerates before treating the
+         * clock as broken. Net, not a sum of absolute steps: reads spike off
+         * the trend and return within a tick or two, and summing the churn
+         * burned any budget in seconds while nothing had actually moved. The
+         * bound is derived from the sink rather than guessed: Media3 only
+         * smooths a discrepancy below MAX_POSITION_DRIFT_FOR_SMOOTHING_US
+         * (1s), so every sanctioned correction - slewed, stepped, or
+         * flickering - stays under 1000ms of net displacement. Past this is a
+         * real discontinuity (an unnoticed seek, a reset) and the plan behind
+         * the fade is mistimed.
+         */
+        private const val MAX_CLOCK_SETTLE_MS = 1_100L
+
+        /**
+         * Backstop for gradual runaway divergence, measured net of
+         * re-anchored steps, with the same 1s-ceiling derivation as
+         * [MAX_CLOCK_SETTLE_MS]. History of this number: a flat 150ms cap
+         * abandoned every overlap on higher-latency outputs, which is how
+         * crossfade and AutoMix silently stopped working outside low-latency
+         * wired output, and 750ms would have kept that failure for long
+         * AutoMix overlaps (10% of a 15s fade out-accrues it).
+         */
+        private const val MAX_CLOCK_DRIFT_MS = 1_100L
+        /**
+         * Media3's own floor. DefaultAudioSink constrains the rate to
+         * 0.1f..8f, and a request below it is clamped by the sink while the
+         * player goes on reporting the value it was handed - which would
+         * desync [runFade]'s clock normalization from the audio it is mixing.
+         */
+        private const val MIN_BASE_SPEED = 0.1f
+        // Eight percent either way. It was four while the tempo change went
+        // through Sonic, which warbles on music; the music stretcher
+        // ([MusicTimeStretcher]) holds up further out, and eight is the range
+        // a DJ's pitch fader covers with key lock on.
+        private const val MIN_TRANSITION_SPEED = 0.92f
+        private const val MAX_TRANSITION_SPEED = 1.08f
+        private const val MAX_SINK_SPEED = 8f
+        private const val TEMPO_RELEASE_MS = 4_000L
+        // Few steps on purpose: DefaultAudioSink drains and rebuilds its
+        // processor chain for every rate change [verified September 2026,
+        // 1.11.0 afterDrainParameters], and each rebuild can click. Eight
+        // steps of at most 1% tempo are inaudible as jumps.
+        private const val TEMPO_RELEASE_STEP_MS = 500L
+
+        /** The filter amount that takes a track's bass out: about 190 Hz. */
+        private const val BASS_CUT_SWEEP = 0.5f
+        /** Where in the overlap the low end changes hands. */
+        private const val BASS_SWAP_FROM = 0.42f
+        private const val BASS_SWAP_TO = 0.58f
+        /** The echo-out cuts the outgoing track loose early in the overlap. */
+        private const val ECHO_FROM = 0.05f
+        private const val ECHO_TO = 0.4f
+    }
+}

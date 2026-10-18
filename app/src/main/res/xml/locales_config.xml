@@ -1,0 +1,18 @@
+<?xml version="1.0" encoding="utf-8"?>
+<!--
+  The languages Sentüp actually speaks.
+
+  Every locale listed here is a promise that choosing it yields a fully
+  translated app. Android offers these in its own per-app language settings, so
+  a half-finished translation listed here becomes a button that switches the
+  app's language and then leaves 85% of it in English - which is worse than not
+  offering the language at all. Turkish is the app's first language and is
+  complete; English is the base the translations are written against.
+
+  Adding a language means adding it *here only after* its strings.xml covers
+  the base, not before.
+-->
+<locale-config xmlns:android="http://schemas.android.com/apk/res/android">
+    <locale android:name="tr" />
+    <locale android:name="en" />
+</locale-config>

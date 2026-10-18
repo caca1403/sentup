@@ -1,0 +1,1456 @@
+package com.sentup.android.ui.video
+import com.sentup.android.ui.components.DismissibleSnackbarHost
+import androidx.compose.ui.res.pluralStringResource
+import androidx.compose.ui.res.stringResource
+import com.sentup.android.R
+
+import androidx.compose.animation.AnimatedContent
+import androidx.compose.animation.core.snap
+import androidx.compose.animation.EnterTransition
+import androidx.compose.animation.ExitTransition
+import androidx.compose.animation.SizeTransform
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
+import androidx.compose.animation.slideInHorizontally
+import androidx.compose.animation.slideOutHorizontally
+import androidx.compose.animation.togetherWith
+import androidx.compose.foundation.background
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.combinedClickable
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.PaddingValues
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.WindowInsets
+import androidx.compose.foundation.layout.aspectRatio
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.statusBars
+import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.windowInsetsPadding
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.LazyListState
+import androidx.compose.foundation.lazy.LazyRow
+import androidx.compose.foundation.lazy.items
+import androidx.compose.foundation.lazy.itemsIndexed
+import androidx.compose.foundation.lazy.rememberLazyListState
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.rounded.ArrowBack
+import androidx.compose.material.icons.automirrored.rounded.PlaylistPlay
+import androidx.compose.material.icons.rounded.Add
+import androidx.compose.material.icons.rounded.Bookmark
+import androidx.compose.material.icons.rounded.BookmarkAdd
+import androidx.compose.material.icons.rounded.BookmarkAdded
+import androidx.compose.material.icons.rounded.BookmarkRemove
+import androidx.compose.material.icons.rounded.ChevronRight
+import androidx.compose.material.icons.rounded.Delete
+import androidx.compose.material.icons.rounded.DeleteSweep
+import androidx.compose.material.icons.rounded.DownloadDone
+import androidx.compose.material.icons.rounded.Edit
+import androidx.compose.material.icons.rounded.History
+import androidx.compose.material.icons.rounded.Login
+import androidx.compose.material.icons.rounded.PhoneAndroid
+import androidx.compose.material.icons.rounded.MoreVert
+import androidx.compose.material.icons.rounded.Share
+import androidx.compose.material.icons.rounded.ThumbUp
+import androidx.compose.material.icons.rounded.VideoLibrary
+import androidx.compose.material.icons.rounded.WatchLater
+import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.Button
+import androidx.compose.material3.ButtonDefaults
+import androidx.compose.material3.DropdownMenu
+import androidx.compose.material3.DropdownMenuItem
+import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.ExperimentalMaterial3ExpressiveApi
+import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
+import androidx.compose.material3.IconButtonDefaults
+import androidx.compose.material3.LoadingIndicator
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedTextField
+import androidx.compose.material3.SnackbarDuration
+import androidx.compose.material3.SnackbarHostState
+import androidx.compose.material3.SnackbarResult
+import androidx.compose.material3.Surface
+import androidx.compose.material3.Text
+import com.sentup.android.ui.theme.SentupDivider
+import androidx.compose.material3.TextButton
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.collectAsState
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Brush
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.hapticfeedback.HapticFeedbackType
+import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalHapticFeedback
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.dp
+import coil.compose.AsyncImage
+import com.sentup.android.ui.components.VideoThumbnail
+import com.sentup.android.ui.components.VideoThumbnailBadge
+import com.sentup.android.data.LocalVideoPlaylistsRepository
+import com.sentup.android.data.VideoItem
+import com.sentup.android.data.VideoPlaylist
+import com.sentup.android.ui.components.ExpressivePullToRefresh
+import com.sentup.android.ui.components.PlaylistRowSkeleton
+import com.sentup.android.ui.components.SkeletonList
+import com.sentup.android.ui.components.PredictiveBackStack
+import com.sentup.android.ui.downloads.VideoPlaylistDownloadAction
+import com.sentup.android.ui.home.HomeViewModel
+
+/**
+ * Feeds with no keepable playlist behind them. Watch Later and Liked videos are
+ * the account's own built-ins, already in the library by definition, and the
+ * music side's synthesized entries ("LM" likes, "RTM" Supermix) are assembled
+ * rather than published. Same list as `LibraryScreen`'s, in the ids video mode
+ * uses them under.
+ */
+internal val NON_SAVABLE_VIDEO_PLAYLIST_IDS =
+    setOf("WL", "VLWL", "LL", "VLLL", "LM", "VLLM", "RTM")
+
+/**
+ * The account's feeds that take a removal but never appear in the playlist
+ * list, since `getVideoPlaylists` filters both of them out of it.
+ */
+private val WRITABLE_PINNED_PLAYLIST_IDS = setOf("WL", "VLWL", "LL", "VLLL")
+
+/** Internal navigation state of the Library tab. */
+private sealed interface LibraryPage {
+    data object Root : LibraryPage
+    data object History : LibraryPage
+    data class Playlist(val playlist: VideoPlaylist) : LibraryPage
+
+    /**
+     * The device's own videos. One page rather than two, because the step in
+     * to a folder is owned by DeviceVideosScreen - which local-only mode hosts
+     * directly, with no Library around it.
+     */
+    data object DeviceVideos : LibraryPage
+}
+
+/**
+ * Video-mode Library tab: pinned Watch Later / Liked videos entries, a watch
+ * history preview and the user's YouTube playlists, with playlist drill-in.
+ */
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+fun VideoLibraryContent(
+    viewModel: HomeViewModel,
+    onOpenDownloads: () -> Unit,
+    /** Open a creator's page, from the long-press sheet on any video row. */
+    onOpenChannel: ((String) -> Unit)? = null,
+    onVideoClick: (VideoItem) -> Unit,
+    /**
+     * Play a video *as part of* the playlist it was tapped in, so the rest of it
+     * becomes the queue. Separate from [onVideoClick] because the two mean
+     * different things: everywhere else here (history, the pinned feeds) a tap
+     * really is a one-off video.
+     */
+    onPlayQueue: ((com.sentup.android.data.VideoQueue) -> Unit)? = null,
+    /**
+     * Play a file from the device, with the list it was tapped in as the queue.
+     *
+     * Separate from [onPlayQueue] because a device video is not a [VideoItem]
+     * the rest of the app can act on - there is no id to resolve, no channel
+     * and nothing to fetch - so the player is handed the files themselves and
+     * builds its own queue over local sources.
+     */
+    onPlayDeviceVideos: ((List<com.sentup.android.data.LocalVideo>, com.sentup.android.data.LocalVideo) -> Unit)? = null,
+    onLoginClick: () -> Unit,
+    contentPadding: PaddingValues,
+    /** Queue a video from the history or playlist pages. */
+    onEnqueueVideo: ((VideoItem, Boolean) -> Unit)? = null,
+    /**
+     * Open straight onto a playlist, for callers outside the Library that have
+     * one in hand - a playlist link shared into the app. Same hand-off shape as
+     * the music Library's `initialPlaylist`: the caller clears it through the
+     * consumed callback, so coming back to the tab later lands on the list
+     * rather than re-opening the playlist.
+     */
+    initialPlaylist: VideoPlaylist? = null,
+    onInitialPlaylistConsumed: () -> Unit = {},
+    /**
+     * Hoisted by HomeScreen for the tab's root page only. History and playlist
+     * pages are drill-ins popped with Back, so scrolling the root beneath them
+     * would act on a list the user cannot see.
+     */
+    rootListState: LazyListState = rememberLazyListState()
+) {
+    val isYouTubeConnected by viewModel.isYouTubeConnected.collectAsState()
+    val historyVideos by viewModel.historyVideos.collectAsState()
+    val playlists by viewModel.videoPlaylists.collectAsState()
+    val isPlaylistsLoading by viewModel.isVideoPlaylistsLoading.collectAsState()
+    // Playlists kept as references, from either mode. Device-local, so unlike
+    // the account's own they are there signed out.
+    val savedPlaylists by viewModel.savedVideoPlaylists.collectAsState()
+
+    val deviceVideos by viewModel.deviceVideos.collectAsState()
+    val deviceFolders by viewModel.deviceVideoFolders.collectAsState()
+    val isDeviceVideosLoading by viewModel.isDeviceVideosLoading.collectAsState()
+    val hasScannedDeviceVideos by viewModel.hasScannedDeviceVideos.collectAsState()
+    val videoAccess = com.sentup.android.ui.components.rememberVideoMediaAccessState()
+    // Sort belongs to the session rather than to a page, so walking between
+    // folders keeps the order the user chose instead of resetting each time.
+    var deviceSort by remember { mutableStateOf(com.sentup.android.data.LocalVideoSort.RECENT) }
+
+    var page by remember { mutableStateOf<LibraryPage>(LibraryPage.Root) }
+
+    // Long press on the root's history row. Hosted at this level rather than
+    // inside LibraryRoot because the sheet acts on the ViewModel, which the
+    // root composable deliberately does not take.
+    val context = LocalContext.current
+    var rootOptionsTarget by remember { mutableStateOf<VideoItem?>(null) }
+    val rootRemoval by viewModel.lastHistoryRemoval.collectAsState()
+    val rootRemovalSnackbar = remember { SnackbarHostState() }
+    rootOptionsTarget?.let { video ->
+        VideoOptionsSheetHost(
+            video = video,
+            viewModel = viewModel,
+            onDismiss = { rootOptionsTarget = null },
+            onEnqueue = onEnqueueVideo?.let { enqueue -> { next -> enqueue(video, next) } },
+            // The preview row is history, so removing an entry has the same
+            // visible meaning here as on the history page itself.
+            onRemoveFromHistory = { viewModel.removeVideoFromHistory(video) },
+            onOpenChannel = onOpenChannel
+        )
+    }
+
+    LaunchedEffect(isYouTubeConnected) {
+        if (historyVideos.isEmpty()) viewModel.loadYouTubeHistory()
+        if (isYouTubeConnected) viewModel.loadVideoPlaylists()
+    }
+
+    // Scanned only once the section is actually open, and re-scanned whenever
+    // access widens - a partial grant extended through the picker returns more
+    // files, and nothing else would tell the list to look again.
+    LaunchedEffect(page, videoAccess.access) {
+        if (page == LibraryPage.DeviceVideos && videoAccess.isReadable) viewModel.loadDeviceVideos()
+    }
+
+    // Handed a playlist from outside the tab. Loads its videos the same way
+    // opening one from the root does, since the page reads them off the
+    // ViewModel rather than fetching its own.
+    LaunchedEffect(initialPlaylist) {
+        val playlist = initialPlaylist ?: return@LaunchedEffect
+        viewModel.loadPlaylistVideos(playlist.playlistId)
+        page = LibraryPage.Playlist(playlist)
+        onInitialPlaylistConsumed()
+    }
+
+    PredictiveBackStack(
+        childOpen = page != LibraryPage.Root,
+        onBack = { page = LibraryPage.Root },
+        background = {
+            Box(modifier = Modifier.fillMaxSize()) {
+            LibraryRoot(
+                isLoggedIn = isYouTubeConnected,
+                historyVideos = historyVideos,
+                playlists = playlists,
+                savedPlaylists = savedPlaylists,
+                isPlaylistsLoading = isPlaylistsLoading,
+                onVideoClick = onVideoClick,
+                onVideoLongPress = { rootOptionsTarget = it },
+                onLoginClick = onLoginClick,
+                onOpenHistory = { page = LibraryPage.History },
+                onOpenDeviceVideos = { page = LibraryPage.DeviceVideos },
+                onOpenDownloads = onOpenDownloads,
+                onOpenPlaylist = { playlist ->
+                    viewModel.loadPlaylistVideos(playlist.playlistId)
+                    page = LibraryPage.Playlist(playlist)
+                },
+                onCreatePlaylist = { name, onDevice ->
+                    viewModel.createVideoPlaylist(name, onDevice)
+                },
+                onDeletePlaylist = { playlist -> viewModel.deleteVideoPlaylist(playlist.playlistId) },
+                onRenamePlaylist = { playlist, name ->
+                    viewModel.renameLocalVideoPlaylist(playlist.playlistId, name)
+                },
+                onRemoveSavedPlaylist = { playlist ->
+                    viewModel.removeSavedPlaylist(playlist.playlistId)
+                },
+                listState = rootListState,
+                onRefresh = {
+                    viewModel.loadYouTubeHistory()
+                    if (isYouTubeConnected) viewModel.loadVideoPlaylists(force = true)
+                },
+                contentPadding = contentPadding,
+                importAction = {
+                    com.sentup.android.ui.library.PlaylistImportButton(viewModel, videos = true)
+                },
+                fromMusicMode = viewModel.musicPlaylistsForVideo.collectAsState().value
+            )
+
+            // Undo for a removal taken from the root's history row. Hosted here
+            // rather than app-wide because the action exists on exactly one
+            // page, and gated on that page because the history page composes its
+            // own host over the same flow - both alive would show it twice.
+            LaunchedEffect(rootRemoval?.id, page) {
+                val removal = rootRemoval?.takeIf { page == LibraryPage.Root }
+                    ?: return@LaunchedEffect
+                val result = rootRemovalSnackbar.showSnackbar(
+                    message = context.getString(R.string.vh_removed_from_history),
+                    actionLabel = context.getString(R.string.undo),
+                    withDismissAction = false,
+                    duration = SnackbarDuration.Short
+                )
+                if (result == SnackbarResult.ActionPerformed) {
+                    viewModel.undoHistoryRemoval()
+                } else {
+                    viewModel.clearHistoryRemoval()
+                }
+            }
+            DismissibleSnackbarHost(
+                hostState = rootRemovalSnackbar,
+                modifier = Modifier
+                    .align(Alignment.BottomCenter)
+                    // Clear of whatever the host puts at the bottom - the nav
+                    // bar, the mini player when one is up.
+                    .padding(bottom = contentPadding.calculateBottomPadding())
+            )
+            }
+        }
+    ) { committedByGesture ->
+    AnimatedContent(
+        targetState = page,
+        label = "LibraryPage",
+        transitionSpec = {
+            val content = when {
+                // The finger already performed this exit.
+                committedByGesture -> EnterTransition.None togetherWith ExitTransition.None
+                targetState == LibraryPage.Root ->
+                    fadeIn() togetherWith (slideOutHorizontally { it } + fadeOut())
+                else ->
+                    (slideInHorizontally { it } + fadeIn()) togetherWith
+                        (slideOutHorizontally { -it / 3 } + fadeOut())
+            }
+            // The Root state of this layer is empty, so the default
+            // SizeTransform would animate the container between nothing and
+            // full screen and clip the page to it on the way.
+            content using SizeTransform(clip = false) { _, _ -> snap() }
+        }
+    ) { target ->
+        when (target) {
+            // The root lives underneath now; this layer is empty over it, and
+            // full size so both states measure the same.
+            is LibraryPage.Root -> Spacer(Modifier.fillMaxSize())
+
+            is LibraryPage.History -> Column(
+                modifier = Modifier
+                    .fillMaxSize()
+                    .background(MaterialTheme.colorScheme.background)
+            ) {
+                var confirmClearHistory by remember { mutableStateOf(false) }
+                if (confirmClearHistory) {
+                    ClearHistoryDialog(
+                        onDismiss = { confirmClearHistory = false },
+                        onConfirm = {
+                            viewModel.clearVideoHistory()
+                            confirmClearHistory = false
+                        }
+                    )
+                }
+                SubPageTopBar(
+                    title = stringResource(R.string.vl_watch_history),
+                    onBack = { page = LibraryPage.Root },
+                    actions = {
+                        // Only offered when there is something to clear, so the
+                        // control never promises an action that would do nothing.
+                        if (historyVideos.isNotEmpty()) {
+                            IconButton(onClick = { confirmClearHistory = true }) {
+                                Icon(
+                                    Icons.Rounded.DeleteSweep,
+                                    contentDescription = stringResource(R.string.vh_clear_history),
+                                    tint = MaterialTheme.colorScheme.onSurfaceVariant
+                                )
+                            }
+                        }
+                    }
+                )
+                VideoHistoryContent(
+                    viewModel = viewModel,
+                    onVideoClick = onVideoClick,
+                    onLoginClick = onLoginClick,
+                    contentPadding = contentPadding,
+                    showHero = false,
+                    onEnqueueVideo = onEnqueueVideo,
+                    onOpenChannel = onOpenChannel
+                )
+            }
+
+            is LibraryPage.DeviceVideos -> DeviceVideosScreen(
+                videos = deviceVideos,
+                folders = deviceFolders,
+                access = videoAccess.access,
+                isLoading = isDeviceVideosLoading,
+                hasScanned = hasScannedDeviceVideos,
+                sort = deviceSort,
+                onSortChange = { deviceSort = it },
+                onRequestAccess = { videoAccess.launchRequest() },
+                onRefresh = { viewModel.loadDeviceVideos() },
+                onPlay = { ordered, video -> onPlayDeviceVideos?.invoke(ordered, video) },
+                // SubPageTopBar above already sits in the status bar area, so
+                // the grid must not take the top inset a second time - the same
+                // split VideoHistoryContent makes between its embedded and
+                // standalone forms.
+                contentPadding = PaddingValues(
+                    bottom = contentPadding.calculateBottomPadding()
+                ),
+                topBar = {
+                    SubPageTopBar(
+                        title = stringResource(R.string.dv_on_this_device),
+                        onBack = { page = LibraryPage.Root }
+                    )
+                },
+                folderTopBar = { title, onBack -> SubPageTopBar(title = title, onBack = onBack) },
+                modifier = Modifier.background(MaterialTheme.colorScheme.background)
+            )
+
+            is LibraryPage.Playlist -> VideoPlaylistDetail(
+                playlist = target.playlist,
+                viewModel = viewModel,
+                onVideoClick = onVideoClick,
+                onPlayQueue = onPlayQueue,
+                onBack = { page = LibraryPage.Root },
+                contentPadding = contentPadding,
+                // Removing a row is a write, so it is offered only on the
+                // playlists the user can actually write to: the pinned feeds,
+                // the account's own and the device's. Derived rather than
+                // passed in, because this tab opens playlists that are not the
+                // user's - saved ones from the root, shared ones handed in
+                // through initialPlaylist - and on those the write fails, which
+                // showed as the row disappearing and coming back.
+                allowRemove = target.playlist.playlistId in WRITABLE_PINNED_PLAYLIST_IDS ||
+                    playlists.any { it.playlistId == target.playlist.playlistId },
+                onEnqueueVideo = onEnqueueVideo,
+                onOpenChannel = onOpenChannel
+            )
+        }
+    }
+    }
+}
+
+@OptIn(ExperimentalMaterial3Api::class)
+@Composable
+private fun LibraryRoot(
+    isLoggedIn: Boolean,
+    historyVideos: List<VideoItem>,
+    playlists: List<VideoPlaylist>,
+    savedPlaylists: List<VideoPlaylist>,
+    isPlaylistsLoading: Boolean,
+    onVideoClick: (VideoItem) -> Unit,
+    /**
+     * Long press on a history card. Same sheet as every other video card in the
+     * app - the preview row is a history list, not a decoration, so a card here
+     * has exactly as much to act on as one on the history page itself.
+     */
+    onVideoLongPress: (VideoItem) -> Unit,
+    onLoginClick: () -> Unit,
+    onOpenHistory: () -> Unit,
+    onOpenDeviceVideos: () -> Unit,
+    onOpenDownloads: () -> Unit,
+    onOpenPlaylist: (VideoPlaylist) -> Unit,
+    /** Name, and whether it goes on the device rather than to the account. */
+    onCreatePlaylist: (String, Boolean) -> Unit,
+    onDeletePlaylist: (VideoPlaylist) -> Unit,
+    onRenamePlaylist: (VideoPlaylist, String) -> Unit,
+    onRemoveSavedPlaylist: (VideoPlaylist) -> Unit,
+    onRefresh: () -> Unit,
+    contentPadding: PaddingValues,
+    listState: LazyListState = rememberLazyListState(),
+    /** The playlist import button; supplied by the caller, which holds the ViewModel. */
+    importAction: @Composable () -> Unit = {},
+    /** Music mode's device playlists, as videos. */
+    fromMusicMode: List<VideoPlaylist> = emptyList()
+) {
+    var showCreateDialog by remember { mutableStateOf(false) }
+
+    if (showCreateDialog) {
+        CreateVideoPlaylistDialog(
+            canUseAccount = isLoggedIn,
+            onDismiss = { showCreateDialog = false },
+            onCreate = { name, onDevice ->
+                onCreatePlaylist(name, onDevice)
+                showCreateDialog = false
+            }
+        )
+    }
+
+    ExpressivePullToRefresh(
+        // The pull spinner only represents a refresh over existing playlists;
+        // the empty first load is the skeleton's job below.
+        isRefreshing = isPlaylistsLoading && playlists.isNotEmpty(),
+        onRefresh = onRefresh,
+        modifier = Modifier.fillMaxSize()
+    ) {
+        LazyColumn(
+            state = listState,
+            modifier = Modifier
+                .fillMaxSize()
+                .background(MaterialTheme.colorScheme.background),
+            contentPadding = contentPadding,
+            verticalArrangement = Arrangement.spacedBy(16.dp)
+        ) {
+            item {
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = 20.dp)
+                        .padding(top = 16.dp)
+                ) {
+                    Text(
+                        text = stringResource(R.string.tab_library),
+                        style = MaterialTheme.typography.headlineSmall,
+                        fontWeight = FontWeight.Bold,
+                        color = MaterialTheme.colorScheme.onBackground
+                    )
+                    Spacer(modifier = Modifier.height(4.dp))
+                    Text(
+                        text = stringResource(R.string.vl_library_sub),
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                }
+            }
+
+            // Four big doors: Watch Later, Liked, History and the device, plus
+            // downloads as a slim row under them. No fetching, no entrance
+            // animation - just there.
+            if (isLoggedIn) {
+                item {
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(horizontal = 16.dp),
+                        horizontalArrangement = Arrangement.spacedBy(12.dp)
+                    ) {
+                        BigNavButton(
+                            title = stringResource(R.string.video_options_watch_later),
+                            subtitle = null,
+                            icon = Icons.Rounded.WatchLater,
+                            tileColor = MaterialTheme.colorScheme.primaryContainer,
+                            onTileColor = MaterialTheme.colorScheme.onPrimaryContainer,
+                            onClick = {
+                                onOpenPlaylist(VideoPlaylist("WL", "Watch Later"))
+                            },
+                            modifier = Modifier.weight(1f)
+                        )
+                        BigNavButton(
+                            title = stringResource(R.string.liked_videos),
+                            subtitle = null,
+                            icon = Icons.Rounded.ThumbUp,
+                            tileColor = MaterialTheme.colorScheme.tertiaryContainer,
+                            onTileColor = MaterialTheme.colorScheme.onTertiaryContainer,
+                            onClick = {
+                                onOpenPlaylist(VideoPlaylist("LL", "Liked Videos"))
+                            },
+                            modifier = Modifier.weight(1f)
+                        )
+                    }
+                }
+            }
+
+            item {
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = 16.dp),
+                    horizontalArrangement = Arrangement.spacedBy(12.dp)
+                ) {
+                    BigNavButton(
+                        title = stringResource(R.string.history),
+                        subtitle = null,
+                        icon = Icons.Rounded.History,
+                        tileColor = MaterialTheme.colorScheme.secondaryContainer,
+                        onTileColor = MaterialTheme.colorScheme.onSecondaryContainer,
+                        onClick = onOpenHistory,
+                        modifier = Modifier.weight(1f)
+                    )
+                    BigNavButton(
+                        title = stringResource(R.string.dv_on_this_device),
+                        subtitle = null,
+                        icon = Icons.Rounded.PhoneAndroid,
+                        tileColor = MaterialTheme.colorScheme.tertiaryContainer,
+                        onTileColor = MaterialTheme.colorScheme.onTertiaryContainer,
+                        onClick = onOpenDeviceVideos,
+                        modifier = Modifier.weight(1f)
+                    )
+                }
+            }
+
+            item {
+                Column {
+                    SlimDoorRow(
+                        icon = Icons.Rounded.DownloadDone,
+                        title = stringResource(R.string.vl_downloaded_content),
+                        subtitle = stringResource(R.string.vl_downloaded_content_sub),
+                        onClick = onOpenDownloads,
+                        modifier = Modifier.padding(horizontal = 16.dp)
+                    )
+                    PlaylistRowDivider()
+                }
+            }
+
+            // History preview
+            if (historyVideos.isNotEmpty()) {
+                item {
+                    ChapterHeader(
+                        number = "01",
+                        title = stringResource(R.string.history),
+                        actionLabel = stringResource(R.string.view_all),
+                        onAction = onOpenHistory
+                    )
+                }
+                item {
+                    LazyRow(
+                        contentPadding = PaddingValues(horizontal = 16.dp),
+                        horizontalArrangement = Arrangement.spacedBy(12.dp)
+                    ) {
+                        items(historyVideos.take(12)) { video ->
+                            HistoryPreviewCard(
+                                video = video,
+                                onClick = { onVideoClick(video) },
+                                onLongClick = { onVideoLongPress(video) }
+                            )
+                        }
+                    }
+                }
+            } else {
+                item {
+                    ChapterHeader(number = "01", title = stringResource(R.string.history), actionLabel = stringResource(R.string.view_all), onAction = onOpenHistory)
+                }
+            }
+
+            // Playlists. Creating one no longer needs a session: signed out it
+            // goes on the device, which is the whole point of the local store.
+            item {
+                ChapterHeader(
+                    number = "02",
+                    title = stringResource(R.string.your_playlists),
+                    actionLabel = stringResource(R.string.action_new),
+                    actionIcon = Icons.Rounded.Add,
+                    onAction = { showCreateDialog = true }
+                )
+            }
+            // m3u/m3u8 and NewPipe or PipePipe backups in, as local video
+            // playlists; the same button music's Library has.
+            item(key = "playlist_import") {
+                Row(
+                    modifier = Modifier.fillMaxWidth().padding(horizontal = 12.dp),
+                    horizontalArrangement = Arrangement.End
+                ) { importAction() }
+            }
+            // Saved ones lead, the way they do in the music Library grid: not
+            // the user's own, but deliberately kept, so they belong above the
+            // account's list rather than lost at the end of it. They are also
+            // the half that survives being signed out.
+            items(savedPlaylists, key = { "saved_${it.playlistId}" }) { playlist ->
+                Column {
+                    PlaylistRow(
+                        playlist = playlist,
+                        onClick = { onOpenPlaylist(playlist) },
+                        isSaved = true,
+                        onRemoveSaved = { onRemoveSavedPlaylist(playlist) },
+                        modifier = Modifier.padding(horizontal = 16.dp)
+                    )
+                    PlaylistRowDivider()
+                }
+            }
+
+            when {
+                // The skeleton stands in for the account fetch only. Signed out
+                // there is nothing in flight, so an empty list is the answer
+                // rather than a wait.
+                isLoggedIn && isPlaylistsLoading && playlists.isEmpty() -> item {
+                    SkeletonList(
+                        count = 4,
+                        modifier = Modifier.padding(horizontal = 16.dp),
+                        spacing = 8.dp
+                    ) { alpha -> PlaylistRowSkeleton(alpha = alpha) }
+                }
+
+                playlists.isEmpty() && savedPlaylists.isEmpty() -> item {
+                    Box(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(32.dp),
+                        contentAlignment = Alignment.Center
+                    ) {
+                        Text(
+                            text = stringResource(R.string.vl_no_playlists_hint),
+                            color = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
+                }
+
+                else -> items(playlists, key = { it.playlistId }) { playlist ->
+                    val isLocal = LocalVideoPlaylistsRepository.isLocal(playlist.playlistId)
+                    Column {
+                        PlaylistRow(
+                            playlist = playlist,
+                            onClick = { onOpenPlaylist(playlist) },
+                            onDelete = { onDeletePlaylist(playlist) },
+                            isLocal = isLocal,
+                            onRename = if (isLocal) {
+                                { name -> onRenamePlaylist(playlist, name) }
+                            } else null,
+                            modifier = Modifier.padding(horizontal = 16.dp)
+                        )
+                        PlaylistRowDivider()
+                    }
+                }
+            }
+
+            // Music mode's device playlists, playable here as videos. Read-only
+            // in this mode (no delete or rename): they are edited where they
+            // live. See HomeViewModel.musicPlaylistsForVideo.
+            if (fromMusicMode.isNotEmpty()) {
+                item(key = "from_music_header") {
+                    Text(
+                        text = stringResource(R.string.vl_from_music_mode),
+                        style = MaterialTheme.typography.titleMedium,
+                        fontWeight = FontWeight.Bold,
+                        color = MaterialTheme.colorScheme.onBackground,
+                        modifier = Modifier.padding(start = 20.dp, end = 20.dp, top = 20.dp, bottom = 8.dp)
+                    )
+                }
+                items(fromMusicMode, key = { "from_music_${it.playlistId}" }) { playlist ->
+                    Column {
+                        PlaylistRow(
+                            playlist = playlist,
+                            onClick = { onOpenPlaylist(playlist) },
+                            modifier = Modifier.padding(horizontal = 16.dp)
+                        )
+                        PlaylistRowDivider()
+                    }
+                }
+            }
+
+            // Signed out only the account half is unreachable. Device playlists
+            // and saved rows are above, so the invitation goes underneath what
+            // the user already has instead of replacing it.
+            if (!isLoggedIn) {
+                item { LibraryLoginCard(onLoginClick = onLoginClick) }
+            }
+
+            item { Spacer(modifier = Modifier.height(32.dp)) }
+        }
+    }
+}
+
+/**
+ * Confirmation for emptying the watch history.
+ *
+ * The body names the limit rather than leaving it to be discovered: this clears
+ * Sentüp's own history, and someone signed in would otherwise reasonably read the
+ * control as deleting their YouTube history too.
+ */
+@Composable
+private fun ClearHistoryDialog(
+    onDismiss: () -> Unit,
+    onConfirm: () -> Unit
+) {
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        containerColor = MaterialTheme.colorScheme.surfaceContainerHigh,
+        shape = RoundedCornerShape(32.dp),
+        icon = {
+            Box(
+                modifier = Modifier
+                    .size(64.dp)
+                    .clip(RoundedCornerShape(20.dp))
+                    .background(MaterialTheme.colorScheme.errorContainer),
+                contentAlignment = Alignment.Center
+            ) {
+                Icon(
+                    Icons.Rounded.DeleteSweep,
+                    contentDescription = null,
+                    tint = MaterialTheme.colorScheme.onErrorContainer
+                )
+            }
+        },
+        title = { Text(stringResource(R.string.vh_clear_history)) },
+        text = { Text(stringResource(R.string.vh_clear_history_body)) },
+        confirmButton = {
+            TextButton(
+                onClick = onConfirm,
+                colors = ButtonDefaults.textButtonColors(
+                    contentColor = MaterialTheme.colorScheme.error
+                )
+            ) {
+                Text(stringResource(R.string.vh_clear_history_confirm))
+            }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) { Text(stringResource(R.string.action_cancel)) }
+        }
+    )
+}
+
+@Composable
+private fun ChapterHeader(
+    number: String,
+    title: String,
+    actionLabel: String? = null,
+    actionIcon: ImageVector = Icons.Rounded.ChevronRight,
+    onAction: (() -> Unit)? = null
+) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(horizontal = 20.dp),
+        verticalAlignment = Alignment.Bottom
+    ) {
+        Text(
+            text = number,
+            style = MaterialTheme.typography.titleMedium,
+            fontWeight = FontWeight.Bold,
+            color = MaterialTheme.colorScheme.primary
+        )
+        Spacer(modifier = Modifier.width(10.dp))
+        Text(
+            text = title,
+            style = MaterialTheme.typography.titleLarge,
+            fontWeight = FontWeight.Bold,
+            color = MaterialTheme.colorScheme.onBackground,
+            modifier = Modifier.weight(1f)
+        )
+        if (actionLabel != null && onAction != null) {
+            TextButton(onClick = onAction) {
+                Text(actionLabel)
+                Icon(
+                    imageVector = actionIcon,
+                    contentDescription = null,
+                    modifier = Modifier.size(18.dp)
+                )
+            }
+        }
+    }
+}
+
+/**
+ * Name a new playlist and choose where it lives.
+ *
+ * The selector only appears when there is an account to choose, because with
+ * one option a segmented control is a label pretending to be a control. Signed
+ * in the default stays YouTube, which is what this button has always made and
+ * what syncs everywhere; signed out the device is the only answer and the
+ * dialog says so in a line of helper text rather than a disabled toggle.
+ */
+@OptIn(ExperimentalMaterial3Api::class, ExperimentalMaterial3ExpressiveApi::class)
+@Composable
+private fun CreateVideoPlaylistDialog(
+    canUseAccount: Boolean,
+    onDismiss: () -> Unit,
+    onCreate: (name: String, onDevice: Boolean) -> Unit
+) {
+    var name by remember { mutableStateOf("") }
+    var onDevice by remember { mutableStateOf(!canUseAccount) }
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        containerColor = MaterialTheme.colorScheme.surfaceContainerHigh,
+        shape = RoundedCornerShape(32.dp),
+        title = { Text(stringResource(R.string.action_new_playlist)) },
+        text = {
+            Column {
+                OutlinedTextField(
+                    value = name,
+                    onValueChange = { name = it },
+                    label = { Text(stringResource(R.string.name_label)) },
+                    singleLine = true,
+                    shape = RoundedCornerShape(16.dp),
+                    modifier = Modifier.fillMaxWidth()
+                )
+                Spacer(modifier = Modifier.height(16.dp))
+                if (canUseAccount) {
+                    val targetHaptics = com.sentup.android.util.rememberSentupHaptics()
+                    Row(
+                        modifier = Modifier.fillMaxWidth(),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        listOf(false, true).forEach { deviceOnly ->
+                            val selected = onDevice == deviceOnly
+                            VideoSegmentPill(
+                                label = if (deviceOnly) {
+                                    stringResource(R.string.vl_target_device)
+                                } else {
+                                    stringResource(R.string.vl_target_youtube)
+                                },
+                                selected = selected,
+                                modifier = Modifier.weight(1f),
+                                onClick = {
+                                    if (!selected) {
+                                        targetHaptics.subtle()
+                                        onDevice = deviceOnly
+                                    }
+                                }
+                            )
+                        }
+                    }
+                    Spacer(modifier = Modifier.height(8.dp))
+                }
+                Text(
+                    text = if (onDevice) {
+                        stringResource(R.string.vl_local_playlist_note)
+                    } else {
+                        stringResource(R.string.vl_account_playlist_note)
+                    },
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            }
+        },
+        confirmButton = {
+            Button(
+                onClick = { onCreate(name, onDevice) },
+                enabled = name.isNotBlank()
+            ) {
+                Text(stringResource(R.string.action_create))
+            }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) {
+                Text(stringResource(R.string.action_cancel))
+            }
+        }
+    )
+}
+
+/** Rename a device playlist. Pre-filled and selected, so it is one keystroke. */
+@Composable
+private fun RenamePlaylistDialog(
+    currentName: String,
+    onDismiss: () -> Unit,
+    onRename: (String) -> Unit
+) {
+    var name by remember { mutableStateOf(currentName) }
+
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        containerColor = MaterialTheme.colorScheme.surfaceContainerHigh,
+        shape = RoundedCornerShape(32.dp),
+        title = { Text(stringResource(R.string.rename_playlist)) },
+        text = {
+            OutlinedTextField(
+                value = name,
+                onValueChange = { name = it },
+                label = { Text(stringResource(R.string.name_label)) },
+                singleLine = true,
+                shape = RoundedCornerShape(16.dp),
+                modifier = Modifier.fillMaxWidth()
+            )
+        },
+        confirmButton = {
+            Button(
+                onClick = { onRename(name) },
+                enabled = name.isNotBlank() && name.trim() != currentName
+            ) {
+                Text(stringResource(R.string.action_rename))
+            }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) { Text(stringResource(R.string.action_cancel)) }
+        }
+    )
+}
+
+/**
+ * One of the four big doors: Watch Later, Liked, History, the device.
+ * Colored container, icon and label with an optional count line - safe
+ * rounded corners throughout, nothing to clip, no entrance animation.
+ */
+@Composable
+private fun BigNavButton(
+    title: String,
+    subtitle: String?,
+    icon: ImageVector,
+    tileColor: Color,
+    onTileColor: Color,
+    onClick: () -> Unit,
+    modifier: Modifier = Modifier
+) {
+    Surface(
+        onClick = onClick,
+        shape = RoundedCornerShape(20.dp),
+        color = tileColor,
+        contentColor = onTileColor,
+        modifier = modifier.height(120.dp)
+    ) {
+        Column(
+            modifier = Modifier
+                .fillMaxSize()
+                .padding(16.dp),
+            verticalArrangement = Arrangement.SpaceBetween
+        ) {
+            Icon(
+                imageVector = icon,
+                contentDescription = null,
+                modifier = Modifier.size(28.dp)
+            )
+            Column {
+                Text(
+                    text = title,
+                    style = MaterialTheme.typography.titleMedium,
+                    fontWeight = FontWeight.SemiBold,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis
+                )
+                if (subtitle != null) {
+                    Text(
+                        text = subtitle,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = onTileColor.copy(alpha = 0.8f),
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
+                    )
+                }
+            }
+        }
+    }
+}
+
+/**
+ * A destination that stays a destination: liked videos, the device,
+ * downloads. Divider-separated slim row with a tonal icon box - deliberately
+ * quieter than the inbox above it.
+ */
+@Composable
+private fun SlimDoorRow(
+    icon: ImageVector,
+    title: String,
+    subtitle: String?,
+    onClick: () -> Unit,
+    modifier: Modifier = Modifier
+) {
+    Row(
+        modifier = modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(16.dp))
+            .clickable(onClick = onClick)
+            .padding(horizontal = 4.dp, vertical = 10.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Box(
+            modifier = Modifier
+                .size(40.dp)
+                .clip(RoundedCornerShape(12.dp))
+                .background(MaterialTheme.colorScheme.secondaryContainer),
+            contentAlignment = Alignment.Center
+        ) {
+            Icon(
+                imageVector = icon,
+                contentDescription = null,
+                tint = MaterialTheme.colorScheme.onSecondaryContainer,
+                modifier = Modifier.size(20.dp)
+            )
+        }
+        Spacer(modifier = Modifier.width(14.dp))
+        Column(modifier = Modifier.weight(1f)) {
+            Text(
+                text = title,
+                style = MaterialTheme.typography.titleSmall,
+                fontWeight = FontWeight.SemiBold,
+                color = MaterialTheme.colorScheme.onSurface,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis
+            )
+            if (subtitle != null) {
+                Text(
+                    text = subtitle,
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis
+                )
+            }
+        }
+        Icon(
+            Icons.Rounded.ChevronRight,
+            contentDescription = null,
+            tint = MaterialTheme.colorScheme.onSurfaceVariant
+        )
+    }
+}
+
+/**
+ * Inset rule under a container-less playlist row. Editorial rows carry no
+ * surface, so the divider does the separating - inset to where the text
+ * starts, like every rule in the app.
+ */
+@Composable
+private fun PlaylistRowDivider() {
+    SentupDivider(modifier = Modifier.padding(horizontal = 16.dp))
+}
+
+@Composable
+private fun HistoryPreviewCard(
+    video: VideoItem,
+    onClick: () -> Unit,
+    onLongClick: (() -> Unit)? = null
+) {
+    Column(
+        modifier = Modifier
+            .width(160.dp)
+            .combinedClickable(onClick = onClick, onLongClick = onLongClick)
+    ) {
+        Box(
+            modifier = Modifier
+                .fillMaxWidth()
+                .aspectRatio(16f / 9f)
+                .clip(RoundedCornerShape(12.dp))
+                .background(MaterialTheme.colorScheme.surfaceContainerHighest)
+        ) {
+            // The item overload rather than the URL one: a device video
+            // carries no thumbnail URL and has its frame read off the file
+            // instead, which only this form knows how to do.
+            VideoThumbnail(
+                video = video,
+                modifier = Modifier.fillMaxSize(),
+                indicatorSize = 26.dp
+            )
+            VideoThumbnailBadge(
+                video = video,
+                modifier = Modifier
+                    .align(Alignment.BottomEnd)
+                    .padding(6.dp)
+            )
+        }
+        Spacer(modifier = Modifier.height(6.dp))
+        Text(
+            text = video.title,
+            style = MaterialTheme.typography.labelLarge,
+            color = MaterialTheme.colorScheme.onBackground,
+            maxLines = 2,
+            overflow = TextOverflow.Ellipsis
+        )
+        Text(
+            text = video.channelName,
+            style = MaterialTheme.typography.labelSmall,
+            color = MaterialTheme.colorScheme.onSurfaceVariant,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis
+        )
+    }
+}
+
+@Composable
+private fun PlaylistRow(
+    playlist: VideoPlaylist,
+    onClick: () -> Unit,
+    modifier: Modifier = Modifier,
+    onDelete: (() -> Unit)? = null,
+    /**
+     * Kept, not owned. The row looks the same either way, and the actions
+     * behind it are not: deleting somebody else's playlist is a write the
+     * account has no rights to, so a saved row offers removing the reference
+     * instead.
+     */
+    isSaved: Boolean = false,
+    onRemoveSaved: (() -> Unit)? = null,
+    /**
+     * Held on this device. Changes what the delete confirmation claims, and
+     * adds Rename: the account's own playlists are renamed through YouTube and
+     * this app has never offered that, but a device playlist has nowhere else
+     * to be renamed from.
+     */
+    isLocal: Boolean = false,
+    onRename: ((String) -> Unit)? = null
+) {
+    var showMenu by remember { mutableStateOf(false) }
+    var showDeleteConfirm by remember { mutableStateOf(false) }
+    var showRenameDialog by remember { mutableStateOf(false) }
+
+    if (showRenameDialog && onRename != null) {
+        RenamePlaylistDialog(
+            currentName = playlist.title,
+            onDismiss = { showRenameDialog = false },
+            onRename = {
+                showRenameDialog = false
+                onRename(it)
+            }
+        )
+    }
+
+    if (showDeleteConfirm) {
+        AlertDialog(
+            onDismissRequest = { showDeleteConfirm = false },
+            title = { Text(stringResource(R.string.delete_playlist_q)) },
+            text = {
+                Text(
+                    if (isLocal) {
+                        "This will permanently delete \"${playlist.title}\" from this device."
+                    } else {
+                        "This will permanently remove \"${playlist.title}\" from your YouTube account."
+                    }
+                )
+            },
+            confirmButton = {
+                TextButton(onClick = {
+                    showDeleteConfirm = false
+                    onDelete?.invoke()
+                }) {
+                    Text(stringResource(R.string.action_delete))
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { showDeleteConfirm = false }) { Text(stringResource(R.string.action_cancel)) }
+            }
+        )
+    }
+
+    Surface(
+        // Clip before the click handler so the ripple follows the row's corners.
+        // Editorial rows carry no surface of their own - the divider below
+        // does the separating - so this stays transparent.
+        modifier = modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(16.dp))
+            .clickable(onClick = onClick),
+        shape = RoundedCornerShape(16.dp),
+        color = Color.Transparent
+    ) {
+        Row(
+            modifier = Modifier.padding(12.dp),
+            verticalAlignment = Alignment.CenterVertically,
+            horizontalArrangement = Arrangement.spacedBy(12.dp)
+        ) {
+            Box(
+                modifier = Modifier
+                    .width(120.dp)
+                    .aspectRatio(16f / 9f)
+                    .clip(RoundedCornerShape(12.dp))
+                    .background(MaterialTheme.colorScheme.surfaceContainerHighest),
+                contentAlignment = Alignment.Center
+            ) {
+                if (!playlist.thumbnailUrl.isNullOrBlank()) {
+                    AsyncImage(
+                        model = playlist.thumbnailUrl,
+                        contentDescription = playlist.title,
+                        modifier = Modifier.fillMaxSize(),
+                        contentScale = ContentScale.Crop
+                    )
+                } else {
+                    Icon(
+                        imageVector = Icons.AutoMirrored.Rounded.PlaylistPlay,
+                        contentDescription = null,
+                        tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier.size(32.dp)
+                    )
+                }
+            }
+            Column(modifier = Modifier.weight(1f)) {
+                Text(
+                    text = playlist.title,
+                    style = MaterialTheme.typography.titleSmall,
+                    fontWeight = FontWeight.SemiBold,
+                    color = MaterialTheme.colorScheme.onBackground,
+                    maxLines = 2,
+                    overflow = TextOverflow.Ellipsis
+                )
+                // Saved is marked in the subtitle's own tone rather than with a
+                // badge on the artwork: it is a fact about the row, not a
+                // status worth shouting, and the author beside it is what
+                // actually tells a kept playlist from one of your own.
+                if (isSaved) {
+                    Spacer(modifier = Modifier.height(3.dp))
+                    Row(
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(4.dp)
+                    ) {
+                        Icon(
+                            imageVector = Icons.Rounded.Bookmark,
+                            contentDescription = null,
+                            tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                            modifier = Modifier.size(13.dp)
+                        )
+                        Text(
+                            text = listOfNotNull(
+                                stringResource(R.string.cd_saved),
+                                playlist.subtitle?.takeIf { it.isNotBlank() }
+                            ).joinToString(" • "),
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis
+                        )
+                    }
+                } else if (playlist.subtitle != null) {
+                    Spacer(modifier = Modifier.height(2.dp))
+                    Text(
+                        text = playlist.subtitle,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
+                    )
+                }
+            }
+            if (isSaved && onRemoveSaved != null) {
+                Box {
+                    IconButton(onClick = { showMenu = true }) {
+                        Icon(
+                            imageVector = Icons.Rounded.MoreVert,
+                            contentDescription = stringResource(R.string.cd_playlist_options),
+                            tint = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
+                    DropdownMenu(
+                        expanded = showMenu,
+                        onDismissRequest = { showMenu = false }
+                    ) {
+                        // Removing the reference, not the playlist: no
+                        // confirmation, because nothing is destroyed and saving
+                        // it again is one tap on its page.
+                        DropdownMenuItem(
+                            text = { Text(stringResource(R.string.cd_remove_from_library)) },
+                            onClick = {
+                                showMenu = false
+                                onRemoveSaved()
+                            },
+                            leadingIcon = {
+                                Icon(Icons.Rounded.BookmarkRemove, contentDescription = null)
+                            }
+                        )
+                    }
+                }
+            } else if (onDelete != null) {
+                Box {
+                    IconButton(onClick = { showMenu = true }) {
+                        Icon(
+                            imageVector = Icons.Rounded.MoreVert,
+                            contentDescription = stringResource(R.string.cd_playlist_options),
+                            tint = MaterialTheme.colorScheme.onSurfaceVariant
+                        )
+                    }
+                    DropdownMenu(
+                        expanded = showMenu,
+                        onDismissRequest = { showMenu = false }
+                    ) {
+                        if (onRename != null) {
+                            DropdownMenuItem(
+                                text = { Text(stringResource(R.string.action_rename)) },
+                                onClick = {
+                                    showMenu = false
+                                    showRenameDialog = true
+                                },
+                                leadingIcon = {
+                                    Icon(Icons.Rounded.Edit, contentDescription = null)
+                                }
+                            )
+                        }
+                        DropdownMenuItem(
+                            text = { Text(stringResource(R.string.delete_playlist)) },
+                            onClick = {
+                                showMenu = false
+                                showDeleteConfirm = true
+                            },
+                            leadingIcon = { Icon(Icons.Rounded.Delete, contentDescription = null) }
+                        )
+                    }
+                }
+            } else {
+                Icon(
+                    imageVector = Icons.Rounded.ChevronRight,
+                    contentDescription = null,
+                    tint = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun LibraryLoginCard(onLoginClick: () -> Unit) {
+    Surface(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(horizontal = 16.dp),
+        shape = RoundedCornerShape(20.dp),
+        color = MaterialTheme.colorScheme.surfaceContainer,
+        tonalElevation = 1.dp
+    ) {
+        Column(
+            modifier = Modifier.padding(24.dp),
+            horizontalAlignment = Alignment.CenterHorizontally
+        ) {
+            Icon(
+                imageVector = Icons.Rounded.VideoLibrary,
+                contentDescription = null,
+                modifier = Modifier.size(48.dp),
+                tint = MaterialTheme.colorScheme.primary.copy(alpha = 0.6f)
+            )
+            Spacer(modifier = Modifier.height(16.dp))
+            Text(
+                text = stringResource(R.string.vl_login_wall),
+                style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                textAlign = TextAlign.Center
+            )
+            Spacer(modifier = Modifier.height(16.dp))
+            Button(
+                onClick = onLoginClick,
+                colors = ButtonDefaults.buttonColors(
+                    containerColor = MaterialTheme.colorScheme.primary,
+                    contentColor = MaterialTheme.colorScheme.onPrimary
+                )
+            ) {
+                Icon(Icons.Rounded.Login, null, modifier = Modifier.size(18.dp))
+                Spacer(Modifier.width(8.dp))
+                Text(stringResource(R.string.log_in_youtube))
+            }
+        }
+    }
+}
+
+@Composable
+private fun SubPageTopBar(
+    title: String,
+    onBack: () -> Unit,
+    actions: @Composable androidx.compose.foundation.layout.RowScope.() -> Unit = {}
+) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .windowInsetsPadding(WindowInsets.statusBars)
+            .padding(horizontal = 8.dp, vertical = 4.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        IconButton(
+            onClick = onBack,
+            colors = IconButtonDefaults.iconButtonColors(
+                containerColor = MaterialTheme.colorScheme.surfaceContainerHigh,
+                contentColor = MaterialTheme.colorScheme.onBackground
+            )
+        ) {
+            Icon(Icons.AutoMirrored.Rounded.ArrowBack, contentDescription = "Back")
+        }
+        Spacer(modifier = Modifier.width(12.dp))
+        Text(
+            text = title,
+            style = MaterialTheme.typography.titleLarge,
+            fontWeight = FontWeight.Bold,
+            color = MaterialTheme.colorScheme.onBackground,
+            maxLines = 1,
+            overflow = TextOverflow.Ellipsis,
+            modifier = Modifier.weight(1f)
+        )
+        actions()
+    }
+}

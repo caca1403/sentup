@@ -1,0 +1,19 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- Home feed appearance group (Settings > Home feed). Own file: strings.xml
+         was being appended to by parallel work when this group landed. -->
+    <string name="hf_section_appearance">Home appearance</string>
+    <string name="hf_hero_card">Hero card</string>
+    <string name="hf_hero_card_sub">The large card at the top of Home.</string>
+    <string name="hf_resume_shelf">Resume row</string>
+    <string name="hf_resume_shelf_sub">Pick up where you left off, inside the hero.</string>
+    <string name="hf_mix_shelf">Mixes shelf</string>
+    <string name="hf_mix_shelf_sub">Daily and automatic mixes for you.</string>
+    <string name="hf_artist_shelf">Artists shelf</string>
+    <string name="hf_artist_shelf_sub">Artists you listen to most.</string>
+    <string name="hf_artist_density">Artist tile size</string>
+    <string name="hf_density_large">Large</string>
+    <string name="hf_density_compact">Compact</string>
+    <string name="hf_listening_strip">Listening summary</string>
+    <string name="hf_listening_strip_sub">This week\'s minutes and top artist.</string>
+</resources>

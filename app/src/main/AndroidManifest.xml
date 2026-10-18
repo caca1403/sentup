@@ -1,0 +1,508 @@
+<?xml version="1.0" encoding="utf-8"?>
+<manifest xmlns:android="http://schemas.android.com/apk/res/android"
+    xmlns:tools="http://schemas.android.com/tools">
+
+    <uses-permission android:name="android.permission.READ_MEDIA_AUDIO" />
+    <uses-permission android:name="android.permission.READ_MEDIA_VIDEO" />
+    <!--
+        Android 14 lets someone grant access to a chosen subset of their media
+        rather than all of it. Without this the picker offers no such choice and
+        the only answers are "all videos" or "none"; with it, a partial grant
+        denies READ_MEDIA_VIDEO while still returning the selected files, which
+        LocalVideoAccess.PARTIAL is what surfaces.
+    -->
+    <uses-permission android:name="android.permission.READ_MEDIA_VISUAL_USER_SELECTED" />
+    <uses-permission android:name="android.permission.READ_EXTERNAL_STORAGE" android:maxSdkVersion="32" />
+    <uses-permission android:name="android.permission.MANAGE_EXTERNAL_STORAGE" tools:ignore="ScopedStorage" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_MEDIA_PLAYBACK" />
+    <uses-permission android:name="android.permission.FOREGROUND_SERVICE_DATA_SYNC" />
+    <uses-permission android:name="android.permission.INTERNET" />
+    <!-- Metered-network detection for the per-network stream quality settings -->
+    <uses-permission android:name="android.permission.ACCESS_NETWORK_STATE" />
+    <uses-permission android:name="android.permission.WAKE_LOCK" />
+    <uses-permission android:name="android.permission.POST_NOTIFICATIONS" />
+    <!-- Android 16+ Live Updates (Live Activities) -->
+    <uses-permission android:name="android.permission.POST_PROMOTED_NOTIFICATIONS" />
+    <uses-permission android:name="android.permission.REQUEST_IGNORE_BATTERY_OPTIMIZATIONS" />
+
+    <!-- Discord Rich Presence: package visibility for the Discord app's RPC service. -->
+    <queries>
+        <intent>
+            <action android:name="com.discord.socialsdk.rpc.IDiscordRpcService" />
+        </intent>
+        <package android:name="com.discord" />
+    </queries>
+
+    <application
+        android:name=".SentupApplication"
+        android:allowBackup="true"
+        android:dataExtractionRules="@xml/data_extraction_rules"
+        android:fullBackupContent="@xml/backup_rules"
+        android:icon="@mipmap/ic_launcher"
+        android:label="${appLabel}"
+        android:localeConfig="@xml/locales_config"
+        android:roundIcon="@mipmap/ic_launcher_round"
+        android:supportsRtl="true"
+        android:requestLegacyExternalStorage="true"
+        android:enableOnBackInvokedCallback="true"
+        android:theme="@style/Theme.App.Starting">
+        <!--
+            singleTask so a link or a video file handed to Sentüp is delivered to
+            the running instance through onNewIntent, instead of stacking a
+            second MainActivity on top of the live players.
+
+            singleTop was not enough, and picture-in-picture is why: PiP moves
+            the activity into a task of its own, so an "open with" arriving from
+            a file manager - which launches into a new task - matched nothing
+            and started a second MainActivity. Two instances meant two
+            VideoPlayerViewModels and two ExoPlayers: the PiP window carried on
+            playing while the new copy opened the file and lost the audio focus
+            fight, which is the "it opens but does not play" case. singleTask
+            routes that launch to the existing instance and expands it out of
+            PiP. Sentüp is a single-activity app, so being the root of its task
+            costs nothing.
+        -->
+        <activity
+            android:name=".MainActivity"
+            android:exported="true"
+            android:label="${appLabel}"
+            android:launchMode="singleTask"
+            android:configChanges="orientation|screenSize|screenLayout|keyboardHidden|keyboard|navigation|smallestScreenSize"
+            android:windowSoftInputMode="adjustResize"
+            android:supportsPictureInPicture="true"
+            android:theme="@style/Theme.App.Starting">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <!--
+                    Without this category the app is installable and startable
+                    by explicit intent, and invisible: no home-screen icon, and
+                    a launcher has no activity to start. MAIN alone is not a
+                    launcher entry.
+                -->
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+
+            <!--
+                Android's share sheet. A mime type is the only filter the
+                manifest can express, so Sentüp is offered for any shared text and
+                sorts out whether it holds a YouTube link at handling time.
+            -->
+            <intent-filter>
+                <action android:name="android.intent.action.SEND" />
+
+                <category android:name="android.intent.category.DEFAULT" />
+
+                <data android:mimeType="text/plain" />
+            </intent-filter>
+
+            <!--
+                "Open with" for YouTube links. Paths are constrained to what
+                YouTubeLinkParser can act on - videos, playlists and the four
+                channel shapes (/@handle, /channel/, /c/, /user/) - so Sentüp is
+                not offered for account, search or post URLs it would only fail
+                on. Channel paths were missing until September 2026: the parser
+                and the channel screen handled them, but Android never offered
+                Sentüp for a channel link. music.youtube.com links open in the
+                music player, the rest in the video player.
+            -->
+            <intent-filter android:autoVerify="false">
+                <action android:name="android.intent.action.VIEW" />
+
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+
+                <data android:scheme="https" />
+                <data android:scheme="http" />
+                <data android:host="youtu.be" />
+                <data android:pathPattern="/.*" />
+            </intent-filter>
+            <intent-filter android:autoVerify="false">
+                <action android:name="android.intent.action.VIEW" />
+
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+
+                <data android:scheme="https" />
+                <data android:scheme="http" />
+                <data android:host="youtube.com" />
+                <data android:host="www.youtube.com" />
+                <data android:host="m.youtube.com" />
+                <data android:host="music.youtube.com" />
+                <data android:pathPrefix="/watch" />
+                <data android:pathPrefix="/playlist" />
+                <data android:pathPrefix="/shorts/" />
+                <data android:pathPrefix="/live/" />
+                <data android:pathPrefix="/embed/" />
+                <data android:pathPrefix="/v/" />
+                <data android:pathPrefix="/@" />
+                <data android:pathPrefix="/channel/" />
+                <data android:pathPrefix="/c/" />
+                <data android:pathPrefix="/user/" />
+            </intent-filter>
+
+            <!--
+                "Open with" for video files, so Sentüp is offered alongside the
+                gallery and other players. Both halves are needed: a file
+                manager sends ACTION_VIEW with the file in the data URI, while a
+                gallery's share sheet sends ACTION_SEND with it in EXTRA_STREAM.
+
+                The filters match by mime type only. Matching by extension as
+                well would need a pathPattern per container and would still miss
+                the many providers that serve a content URI with no name at all,
+                so the intent is checked again at handling time
+                (Intent.externalVideoUri) rather than trusted from the filter.
+            -->
+            <intent-filter android:label="@string/app_name">
+                <action android:name="android.intent.action.VIEW" />
+
+                <category android:name="android.intent.category.DEFAULT" />
+                <category android:name="android.intent.category.BROWSABLE" />
+
+                <data android:scheme="content" />
+                <data android:scheme="file" />
+                <data android:mimeType="video/*" />
+            </intent-filter>
+            <intent-filter android:label="@string/app_name">
+                <action android:name="android.intent.action.SEND" />
+
+                <category android:name="android.intent.category.DEFAULT" />
+
+                <data android:mimeType="video/*" />
+            </intent-filter>
+        </activity>
+
+        <!-- Launcher activity aliases for dynamic app icon switching -->
+        <activity-alias
+            android:name=".MainActivityDefault"
+            android:targetActivity=".MainActivity"
+            android:enabled="true"
+            android:exported="true"
+            android:icon="@mipmap/ic_launcher"
+            android:roundIcon="@mipmap/ic_launcher_round"
+            android:label="${appLabel}">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity-alias>
+
+        <activity-alias
+            android:name=".MainActivityCrimson"
+            android:targetActivity=".MainActivity"
+            android:enabled="false"
+            android:exported="true"
+            android:icon="@mipmap/ic_launcher_crimson"
+            android:roundIcon="@mipmap/ic_launcher_crimson_round"
+            android:label="${appLabel}">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity-alias>
+
+        <activity-alias
+            android:name=".MainActivityMidnight"
+            android:targetActivity=".MainActivity"
+            android:enabled="false"
+            android:exported="true"
+            android:icon="@mipmap/ic_launcher_midnight"
+            android:roundIcon="@mipmap/ic_launcher_midnight_round"
+            android:label="${appLabel}">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity-alias>
+
+        <activity-alias
+            android:name=".MainActivityEmerald"
+            android:targetActivity=".MainActivity"
+            android:enabled="false"
+            android:exported="true"
+            android:icon="@mipmap/ic_launcher_emerald"
+            android:roundIcon="@mipmap/ic_launcher_emerald_round"
+            android:label="${appLabel}">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity-alias>
+
+        <activity-alias
+            android:name=".MainActivitySunset"
+            android:targetActivity=".MainActivity"
+            android:enabled="false"
+            android:exported="true"
+            android:icon="@mipmap/ic_launcher_sunset"
+            android:roundIcon="@mipmap/ic_launcher_sunset_round"
+            android:label="${appLabel}">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity-alias>
+
+        <activity-alias
+            android:name=".MainActivityOcean"
+            android:targetActivity=".MainActivity"
+            android:enabled="false"
+            android:exported="true"
+            android:icon="@mipmap/ic_launcher_ocean"
+            android:roundIcon="@mipmap/ic_launcher_ocean_round"
+            android:label="${appLabel}">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity-alias>
+
+        <activity-alias
+            android:name=".MainActivityBlossom"
+            android:targetActivity=".MainActivity"
+            android:enabled="false"
+            android:exported="true"
+            android:icon="@mipmap/ic_launcher_blossom"
+            android:roundIcon="@mipmap/ic_launcher_blossom_round"
+            android:label="${appLabel}">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity-alias>
+
+        <activity-alias
+            android:name=".MainActivityMonochrome"
+            android:targetActivity=".MainActivity"
+            android:enabled="false"
+            android:exported="true"
+            android:icon="@mipmap/ic_launcher_monochrome"
+            android:roundIcon="@mipmap/ic_launcher_monochrome_round"
+            android:label="${appLabel}">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity-alias>
+
+        <activity-alias
+            android:name=".MainActivitySolar"
+            android:targetActivity=".MainActivity"
+            android:enabled="false"
+            android:exported="true"
+            android:icon="@mipmap/ic_launcher_solar"
+            android:roundIcon="@mipmap/ic_launcher_solar_round"
+            android:label="${appLabel}">
+            <intent-filter>
+                <action android:name="android.intent.action.MAIN" />
+                <category android:name="android.intent.category.LAUNCHER" />
+            </intent-filter>
+        </activity-alias>
+        
+        <meta-data android:name="com.google.android.gms.car.application" android:resource="@xml/automotive_app_desc"/>
+
+        <!--
+            BIND_MEDIA_BROWSER_SERVICE is a signature-level permission, so only
+            the platform can hold it - which is exactly the set of clients this
+            service is for: Android Auto, the system UI's media control, and
+            this app's own notification and widget controls, all of which
+            connect as the system rather than as a third-party app.
+
+            Exported with no permission at all, it was not "available to
+            well-behaved apps": any app on the device could bind a
+            MediaController, walk the library, read what has been played, and
+            push its own media items into the queue. Nothing about it is a
+            secret, and nothing about it needs to be reachable by anything the
+            platform does not itself vouch for.
+        -->
+        <service
+            android:name=".service.MusicService"
+            android:foregroundServiceType="mediaPlayback"
+            android:exported="true"
+            android:permission="android.permission.BIND_MEDIA_BROWSER_SERVICE">
+            <intent-filter>
+                <action android:name="androidx.media3.session.MediaLibraryService"/>
+                <action android:name="android.media.browse.MediaBrowserService"/>
+            </intent-filter>
+        </service>
+
+        <!--
+            Puts video playback on the lock screen, in the shade's media area
+            and on Bluetooth/headset transport buttons. The ExoPlayer itself
+            stays owned by VideoPlayerViewModel; this service only wraps it in
+            a MediaSession, which is also what makes background video audio a
+            legitimate foreground service rather than an unannounced one.
+        -->
+        <service
+            android:name=".service.VideoPlaybackService"
+            android:foregroundServiceType="mediaPlayback"
+            android:exported="true"
+            android:permission="android.permission.BIND_MEDIA_SESSION_SERVICE">
+            <intent-filter>
+                <action android:name="androidx.media3.session.MediaSessionService"/>
+            </intent-filter>
+        </service>
+
+        <!--
+            Keeps the process alive while downloads run. dataSync is the correct
+            type for user-initiated file transfers; the matching
+            FOREGROUND_SERVICE_DATA_SYNC permission is declared above.
+        -->
+        <service
+            android:name=".service.DownloadService"
+            android:foregroundServiceType="dataSync"
+            android:exported="false" />
+
+        <!--
+            Category artwork for the Android Auto browse tree
+            (service/AutoArtworkProvider.kt): deterministic tonal tiles served
+            as plain PNGs. Exported with no read permission on purpose - the
+            car-side image loader cannot decode vector XML, so resource URIs
+            fail exactly where this art has to work, while a content URI loads
+            everywhere. Static art only, no user data behind it, so there is
+            nothing to protect. The authority rides ${applicationId} because
+            the debug build carries an applicationIdSuffix.
+        -->
+        <provider
+            android:name=".service.AutoArtworkProvider"
+            android:authorities="${applicationId}.autoartwork"
+            android:exported="true"
+            android:grantUriPermissions="false" />
+
+        <!--
+            Quick Settings playback tile. A pure session client: it binds a
+            MediaController to MusicService, so the tile's play/pause and its
+            state are the same playback the app shows. The BIND_QUICK_SETTINGS
+            _TILE permission is the system's own requirement for talking to it;
+            exported is mandatory for the same reason.
+        -->
+        <service
+            android:name=".service.PlaybackTileService"
+            android:exported="true"
+            android:permission="android.permission.BIND_QUICK_SETTINGS_TILE">
+            <intent-filter>
+                <action android:name="android.service.quicksettings.action.QS_TILE" />
+            </intent-filter>
+        </service>
+
+        <!--
+            The home screen widget family. Six providers over one observable
+            snapshot (widget/PlayerWidgetHost.kt), all pure session clients like
+            the QS tile: none holds a MediaController, and every tap binds a
+            throwaway one on the main thread.
+
+            MusicService pushes a redraw on each playback event; a 30-minute
+            updatePeriodMillis heartbeat (the platform floor) exists only so a
+            widget frozen by an OEM force-kill eventually corrects itself.
+
+            exported="true" is deliberate on every receiver: on stock Android
+            the APPWIDGET_UPDATE broadcasts come from system_server, which
+            bypasses the export check, so exported="false" worked on Pixels -
+            but OEM launchers (HyperOS/MIUI Home notably) talk to provider
+            receivers directly, and a non-exported receiver silently drops
+            those, which read as "widgets do not work on this phone". The
+            intent filter only accepts APPWIDGET_UPDATE and AppWidgetProvider
+            ignores non-widget actions, so exporting is safe.
+
+            Listed in picker order - the everyday one first, the two decorative
+            ones last.
+        -->
+        <receiver
+            android:name=".widget.PulseWidgetReceiver"
+            android:exported="true"
+            android:label="@string/widget_pulse_label">
+            <intent-filter>
+                <action android:name="android.appwidget.action.APPWIDGET_UPDATE" />
+            </intent-filter>
+            <meta-data
+                android:name="android.appwidget.provider"
+                android:resource="@xml/pulse_widget_info" />
+        </receiver>
+
+        <receiver
+            android:name=".widget.ConsoleWidgetReceiver"
+            android:exported="true"
+            android:label="@string/widget_console_label">
+            <intent-filter>
+                <action android:name="android.appwidget.action.APPWIDGET_UPDATE" />
+            </intent-filter>
+            <meta-data
+                android:name="android.appwidget.provider"
+                android:resource="@xml/console_widget_info" />
+        </receiver>
+
+        <receiver
+            android:name=".widget.DeckWidgetReceiver"
+            android:exported="true"
+            android:label="@string/widget_deck_label">
+            <intent-filter>
+                <action android:name="android.appwidget.action.APPWIDGET_UPDATE" />
+            </intent-filter>
+            <meta-data
+                android:name="android.appwidget.provider"
+                android:resource="@xml/deck_widget_info" />
+        </receiver>
+
+        <receiver
+            android:name=".widget.LineupWidgetReceiver"
+            android:exported="true"
+            android:label="@string/widget_lineup_label">
+            <intent-filter>
+                <action android:name="android.appwidget.action.APPWIDGET_UPDATE" />
+            </intent-filter>
+            <meta-data
+                android:name="android.appwidget.provider"
+                android:resource="@xml/lineup_widget_info" />
+        </receiver>
+
+        <receiver
+            android:name=".widget.BloomWidgetReceiver"
+            android:exported="true"
+            android:label="@string/widget_bloom_label">
+            <intent-filter>
+                <action android:name="android.appwidget.action.APPWIDGET_UPDATE" />
+            </intent-filter>
+            <meta-data
+                android:name="android.appwidget.provider"
+                android:resource="@xml/bloom_widget_info" />
+        </receiver>
+
+        <receiver
+            android:name=".widget.VinylWidgetReceiver"
+            android:exported="true"
+            android:label="@string/widget_vinyl_label">
+            <intent-filter>
+                <action android:name="android.appwidget.action.APPWIDGET_UPDATE" />
+            </intent-filter>
+            <meta-data
+                android:name="android.appwidget.provider"
+                android:resource="@xml/vinyl_widget_info" />
+        </receiver>
+
+        <receiver
+            android:name=".widget.PixelWidgetReceiver"
+            android:exported="true"
+            android:label="@string/widget_pixel_label">
+            <intent-filter>
+                <action android:name="android.appwidget.action.APPWIDGET_UPDATE" />
+            </intent-filter>
+            <meta-data
+                android:name="android.appwidget.provider"
+                android:resource="@xml/pixel_widget_info" />
+        </receiver>
+
+        <receiver
+            android:name=".widget.OrbitWidgetReceiver"
+            android:exported="true"
+            android:label="@string/widget_orbit_label">
+            <intent-filter>
+                <action android:name="android.appwidget.action.APPWIDGET_UPDATE" />
+            </intent-filter>
+            <meta-data
+                android:name="android.appwidget.provider"
+                android:resource="@xml/orbit_widget_info" />
+        </receiver>
+
+    </application>
+
+</manifest>

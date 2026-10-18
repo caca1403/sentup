@@ -1,0 +1,4646 @@
+package com.sentup.android.ui.video
+
+import com.sentup.android.util.KLog
+
+import android.content.Context
+import android.net.Uri
+import android.os.SystemClock
+import androidx.lifecycle.AndroidViewModel
+import androidx.lifecycle.viewModelScope
+import androidx.media3.common.AudioAttributes
+import androidx.media3.common.C
+import androidx.media3.common.MediaItem
+import androidx.media3.common.MimeTypes
+import androidx.media3.common.PlaybackException
+import androidx.media3.common.Player
+import androidx.media3.common.Timeline
+import androidx.media3.common.TrackSelectionOverride
+import androidx.media3.common.Tracks
+import androidx.media3.common.text.CueGroup
+import androidx.media3.common.util.UnstableApi
+import androidx.media3.datasource.HttpDataSource
+import androidx.media3.exoplayer.DefaultLoadControl
+import androidx.media3.exoplayer.ExoPlaybackException
+import androidx.media3.exoplayer.ExoPlayer
+import androidx.media3.exoplayer.SeekParameters
+import androidx.media3.exoplayer.source.DefaultMediaSourceFactory
+import androidx.media3.exoplayer.source.MergingMediaSource
+import androidx.media3.exoplayer.source.ProgressiveMediaSource
+import com.sentup.android.data.CaptionBackground
+import com.sentup.android.data.CaptionTextColor
+import com.sentup.android.data.CaptionTrack
+import com.sentup.android.data.CacheManager
+import com.sentup.android.data.CommentItem
+import com.sentup.android.data.DownloadedVideo
+import com.sentup.android.data.LikeStatus
+import com.sentup.android.data.LocalVideo
+import com.sentup.android.data.PlayerTrackOption
+import com.sentup.android.data.VideoDynamicRange
+import com.sentup.android.data.audioTrackDetail
+import com.sentup.android.data.audioTrackLabel
+import com.sentup.android.data.localVideoQualityLabel
+import com.sentup.android.data.textTrackLabel
+import com.sentup.android.data.SegmentAction
+import com.sentup.android.data.SponsorBlockRepository
+import com.sentup.android.data.SponsorSegment
+import com.sentup.android.data.activeCategories
+import com.sentup.android.data.segmentAt
+import com.sentup.android.data.LocalSubscription
+import com.sentup.android.data.BellLevel
+import com.sentup.android.data.ChannelBellActions
+import com.sentup.android.data.SubscriptionActions
+import com.sentup.android.data.SubscriptionStore
+import com.sentup.android.data.LiveChatBanner
+import com.sentup.android.data.LiveChatMessage
+import com.sentup.android.data.VideoStreamResult
+import com.sentup.android.data.bestSdrFallback
+import com.sentup.android.data.cappedAtHeight
+import com.sentup.android.data.deviceVideoHeightCap
+import com.sentup.android.data.LiveChatPage
+import com.sentup.android.data.TimedComment
+import com.sentup.android.data.VideoEngagement
+import com.sentup.android.data.VideoItem
+import com.sentup.android.data.VideoQuality
+import com.sentup.android.data.VideoPlaybackCacheStream
+import com.sentup.android.data.VideoSeekPreview
+import com.sentup.android.data.YouTubeAudioTrack
+import com.sentup.android.data.YouTubeAudioTrackKind
+import com.sentup.android.R
+import com.sentup.android.data.VttCue
+import com.sentup.android.data.YouTubeRepository
+import com.sentup.android.data.ThemePreferences
+import com.sentup.android.data.videoPlaybackCacheKey
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.drop
+import kotlinx.coroutines.flow.SharingStarted
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.flow.stateIn
+import kotlinx.coroutines.flow.update
+import kotlinx.coroutines.async
+import kotlinx.coroutines.coroutineScope
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.launch
+
+internal enum class VideoEndAction {
+    STOP,
+    NEXT_IN_QUEUE,
+    NEXT_RELATED
+}
+
+/**
+ * Resolves one completed video into exactly one outcome. Keeping this decision
+ * free of ExoPlayer makes the precedence explicit and unit-testable: autoplay
+ * is the master gate, a user-chosen playlist beats recommendations, and PiP
+ * may continue that playlist but never wanders into related videos.
+ */
+internal fun resolveVideoEndAction(
+    autoplayEnabled: Boolean,
+    queueHasNext: Boolean,
+    isInPipMode: Boolean,
+    hasRelatedVideo: Boolean
+): VideoEndAction = when {
+    !autoplayEnabled -> VideoEndAction.STOP
+    queueHasNext -> VideoEndAction.NEXT_IN_QUEUE
+    !isInPipMode && hasRelatedVideo -> VideoEndAction.NEXT_RELATED
+    else -> VideoEndAction.STOP
+}
+
+@UnstableApi
+class VideoPlayerViewModel(application: android.app.Application) : AndroidViewModel(application) {
+
+    private val context: Context get() = getApplication()
+    private val youtubeRepository = YouTubeRepository(context)
+    private val themePreferences = ThemePreferences(context)
+    private val videoHistoryRepository = com.sentup.android.data.VideoHistoryRepository(context)
+
+    /**
+     * Tallest rendition this panel can show. Read once: it describes the
+     * hardware, not a setting, so it cannot change while the app runs. Every
+     * quality list and every default pick below runs through it, which is what
+     * keeps a 4K rung off the menu and out of Auto on a 720p phone.
+     */
+    private val deviceQualityCap: Int = context.deviceVideoHeightCap()
+
+    // Device-held video playlists. Its state is process-wide, so a save taken
+    // here shows up in the Library tab's own HomeViewModel without either of
+    // them knowing about the other.
+    private val localVideoPlaylistsRepository =
+        com.sentup.android.data.LocalVideoPlaylistsRepository(context)
+
+    // Playback session snapshots for resume-on-reopen, the video-mode
+    // counterpart of PlayerViewModel's playbackSessionRepository. See
+    // restoreVideoSession() / saveVideoPlaybackSession() below.
+    private val videoPlaybackSessionRepository =
+        com.sentup.android.data.VideoPlaybackSessionRepository(context)
+    private var lastSessionSaveAt = 0L
+    private var sessionPersistenceJob: kotlinx.coroutines.Job? = null
+
+    // Player Instance
+    private var _exoPlayer: ExoPlayer? = null
+    val exoPlayer: ExoPlayer? get() = _exoPlayer
+
+    /**
+     * Smooth motion. Whether the current player was built with the effect
+     * graph is fixed for its lifetime (see [FrameInterpolationEffect]), so it
+     * is remembered here and compared with the setting when the player closes.
+     */
+    private val frameInterpolation =
+        com.sentup.android.service.FrameInterpolationGovernor(context)
+
+    /** Whether this GPU runs Smooth motion at all (GLES 3.2); fixed for the device. */
+    private val frameInterpolationSupported by lazy {
+        com.sentup.android.service.FrameInterpolationSupport.isSupported(context)
+    }
+
+    /**
+     * Smooth motion as set and as this phone can run it: a setting carried
+     * over from another phone (a restored backup) must not install the graph
+     * where the engine cannot run.
+     */
+    private fun frameInterpolationWanted(): Boolean =
+        frameInterpolationSupported && themePreferences.isFrameInterpolationEnabled()
+    private var playerHasInterpolation = false
+    private var graphRedrawJob: Job? = null
+
+    /** Available and switched on in the player's settings panel: whether frames are drawn. */
+    private fun frameInterpolationOn(): Boolean =
+        frameInterpolationWanted() && themePreferences.isFrameInterpolationPlayerOn()
+
+    /** Whether the player's settings panel offers the Smooth motion switch. */
+    val smoothMotionAvailable: StateFlow<Boolean> = themePreferences.frameInterpolation
+        .map { it && frameInterpolationSupported }
+        .stateIn(viewModelScope, SharingStarted.Eagerly, frameInterpolationWanted())
+
+    /** The player's Smooth motion switch, remembered across videos and launches. */
+    val smoothMotionOn: StateFlow<Boolean> = themePreferences.frameInterpolationPlayerOn
+
+    fun setSmoothMotionOn(on: Boolean) {
+        themePreferences.setFrameInterpolationPlayerOn(on)
+    }
+
+    /** What Smooth motion is doing for the video on screen, for the player's settings panel. */
+    val frameInterpolationStatus: StateFlow<com.sentup.android.service.FrameInterpolationStatus> =
+        frameInterpolation.status
+
+    /**
+     * Video shaders. Like Smooth motion, the stage joins the effect graph when
+     * the player is built and cannot be added to or taken from a running one,
+     * so whether this player has it is remembered and compared with the
+     * setting when the player closes. What it draws is [videoShaderControl],
+     * read per frame.
+     */
+    private val videoShaderControl = com.sentup.android.service.VideoShaderControl()
+
+    private fun videoShadersWanted(): Boolean = themePreferences.readVideoShaders().masterEnabled
+
+    private val _playerHasVideoShaders = MutableStateFlow(false)
+
+    /**
+     * Whether the player on screen was built with the shader stage. False
+     * while the setting is on means it was turned on under an open video, and
+     * the panel says so rather than offering presets that would draw nothing.
+     */
+    val videoShadersInstalled: StateFlow<Boolean> = _playerHasVideoShaders.asStateFlow()
+
+    private val _videoShaders = MutableStateFlow(themePreferences.readVideoShaders())
+    val videoShaders: StateFlow<com.sentup.android.data.VideoShaderCustomization> =
+        _videoShaders.asStateFlow()
+
+    /**
+     * Put [settings] on the picture without storing them: a slider mid-drag,
+     * which is judged by watching and stored once, when the finger lifts.
+     */
+    fun previewVideoShaders(settings: com.sentup.android.data.VideoShaderCustomization) {
+        if (settings == _videoShaders.value) return
+        _videoShaders.value = settings
+        videoShaderControl.settings = settings
+        // A paused video draws nothing new, so the change would wait for Play.
+        if (_playerHasVideoShaders.value) redrawPausedFrameThroughGraph()
+    }
+
+    fun setVideoShaders(settings: com.sentup.android.data.VideoShaderCustomization) {
+        previewVideoShaders(settings)
+        themePreferences.setVideoShaders(settings)
+    }
+
+    /** The player renders through Media3's effect graph, for either feature. */
+    private fun playerHasEffectGraph(): Boolean =
+        playerHasInterpolation || _playerHasVideoShaders.value
+
+    // State
+    private val _currentVideo = MutableStateFlow<VideoItem?>(null)
+    val currentVideo: StateFlow<VideoItem?> = _currentVideo
+
+    /**
+     * True when ExoPlayer is reading a file on the device rather than YouTube -
+     * a completed download, or a video from the device's own gallery.
+     *
+     * Both sources take exactly the same path from here on, which is the point:
+     * everything that must not happen for a local file (a /next call, a history
+     * write, a caption fetch, an HDR downgrade aimed at saving bandwidth that
+     * is not being spent) is already gated on this one flag.
+     */
+    private val _isLocalPlayback = MutableStateFlow(false)
+    val isLocalPlayback: StateFlow<Boolean> = _isLocalPlayback.asStateFlow()
+
+    /**
+     * A file this player can open directly, keyed by the id its [VideoItem]
+     * carries.
+     *
+     * [label] is what the quality row shows before the container has been read.
+     * A device file replaces it with the real resolution and dynamic range as
+     * soon as the tracks arrive, since MediaStore's own dimensions can be
+     * missing and say nothing about HDR either way.
+     */
+    private data class LocalPlaybackSource(
+        val uri: Uri,
+        val label: String,
+        /** Device gallery files can report their own tracks; downloads cannot. */
+        val allowsTrackSelection: Boolean = false,
+        /**
+         * Width over height, when MediaStore recorded both. Supplied for the
+         * same reason the YouTube path derives it at parse time: the player
+         * also learns it from onVideoSizeChanged, but only after the first
+         * frame decodes, and the watch page would visibly snap out of 16:9 a
+         * moment into a portrait recording.
+         */
+        val aspectRatio: Float? = null,
+    )
+
+    private var localSourcesById: Map<String, LocalPlaybackSource> = emptyMap()
+
+    /**
+     * Audio tracks the viewer can switch between, when there is more than one.
+     *
+     * Two sources feed it. A device file's tracks come from the container and
+     * switch by track-selection override. A YouTube video's come from the
+     * resolver ([youtubeAudioTracks]): each dub is a separate file, so
+     * switching rebuilds the split source with that file as its audio half.
+     * Empty for most YouTube videos, which have one soundtrack.
+     */
+    private val _audioTracks = MutableStateFlow<List<PlayerTrackOption>>(emptyList())
+    val audioTracks: StateFlow<List<PlayerTrackOption>> = _audioTracks.asStateFlow()
+
+    /** The current YouTube video's soundtracks, from the same resolution as its ladder. */
+    private var youtubeAudioTracks: List<YouTubeAudioTrack> = emptyList()
+
+    /**
+     * The viewer's soundtrack for the current video, by YouTube's track id, or
+     * null for the original. An id rather than a URL so it survives a
+     * re-resolution that re-signs every URL, and a quality or HDR switch, all of
+     * which rebuild the source through [loadQuality]. Every video opens on the
+     * original: a dub is a per-video choice.
+     */
+    private var selectedAudioTrackId: String? = null
+
+    /**
+     * Subtitle tracks carried inside the media itself.
+     *
+     * Separate from [captionTracks], which are YouTube's timedtext files
+     * fetched and drawn by Sentüp's own overlay. These are decoded by the player,
+     * so they are selected through track selection and arrive as cues rather
+     * than as a document that can be parsed up front.
+     */
+    private val _embeddedTextTracks = MutableStateFlow<List<PlayerTrackOption>>(emptyList())
+    val embeddedTextTracks: StateFlow<List<PlayerTrackOption>> =
+        _embeddedTextTracks.asStateFlow()
+
+    /**
+     * The cue currently on screen from an embedded subtitle track.
+     *
+     * The overlay renders this instead of stepping through [captionCues],
+     * because an embedded track has no document to step through: the extractor
+     * emits each cue when it is due and withdraws it when it is not.
+     */
+    private val _embeddedCueText = MutableStateFlow<String?>(null)
+    val embeddedCueText: StateFlow<String?> = _embeddedCueText.asStateFlow()
+
+    private val _isExpanded = MutableStateFlow(false)
+    val isExpanded: StateFlow<Boolean> = _isExpanded
+
+    private val _isPlaying = MutableStateFlow(false)
+    val isPlaying: StateFlow<Boolean> = _isPlaying
+
+    private val _isLoading = MutableStateFlow(false)
+    val isLoading: StateFlow<Boolean> = _isLoading
+
+    private val _isBuffering = MutableStateFlow(false)
+    val isBuffering: StateFlow<Boolean> = _isBuffering
+
+    // Playback progress. Polled rather than pushed, because ExoPlayer has no
+    // position callback - something has to tick - but it belongs here with the
+    // rest of the player state rather than in a composable. The seek bar, the
+    // chapter chip, the timed-comments overlay and the chapter list all read
+    // it, and a loop living in one composable meant every other reader either
+    // duplicated the poll or did without.
+    private val _positionMs = MutableStateFlow(0L)
+    val positionMs: StateFlow<Long> = _positionMs
+
+    private val _durationMs = MutableStateFlow(0L)
+    val durationMs: StateFlow<Long> = _durationMs
+
+    private val _progress = MutableStateFlow(0f)
+    val progress: StateFlow<Float> = _progress
+
+    private val _bufferedProgress = MutableStateFlow(0f)
+    val bufferedProgress: StateFlow<Float> = _bufferedProgress
+
+    /**
+     * The checkpoint a reopened video was resumed to, for the notice over the
+     * player. Null whenever playback started where it was asked to.
+     *
+     * A resume happens without being asked for, so - like a SponsorBlock skip -
+     * it needs a visible way back. Without one the only route to the start of a
+     * video the viewer meant to rewatch is dragging the seek bar to zero, and
+     * they have no way of knowing the jump was Sentüp's doing rather than a bug.
+     */
+    private val _resumedFromMs = MutableStateFlow<Long?>(null)
+    val resumedFromMs: StateFlow<Long?> = _resumedFromMs.asStateFlow()
+
+    private var progressJob: Job? = null
+
+    /* ---------------- SponsorBlock ---------------- */
+
+    private val sponsorBlockRepository = SponsorBlockRepository()
+    private var sponsorBlockJob: Job? = null
+
+    private val _sponsorSegments = MutableStateFlow<List<SponsorSegment>>(emptyList())
+    val sponsorSegments: StateFlow<List<SponsorSegment>> = _sponsorSegments.asStateFlow()
+
+    /**
+     * The segment currently under the playhead whose category is set to
+     * Manual, so the chrome can offer a button. Null whenever the playhead is
+     * outside every such segment.
+     */
+    private val _manualSegment = MutableStateFlow<SponsorSegment?>(null)
+    val manualSegment: StateFlow<SponsorSegment?> = _manualSegment.asStateFlow()
+
+    /** Whether segments are drawn on the seek bar, straight off preferences. */
+    val sponsorShowOnSeekBar: StateFlow<Boolean> = themePreferences.sponsorBlockShowOnSeekBar
+
+    /** The most recent automatic skip, for the undo chip. Cleared on a timer. */
+    private val _skipNotice = MutableStateFlow<SponsorSkipNotice?>(null)
+    val skipNotice: StateFlow<SponsorSkipNotice?> = _skipNotice.asStateFlow()
+
+    /**
+     * Segments the viewer has undone, or skipped manually, for this video.
+     *
+     * Keyed by the submission UUID rather than an index or a start time,
+     * because a viewer who undoes a skip is left sitting inside the segment
+     * and the very next poll would otherwise skip it again - and because they
+     * can seek back into it later from anywhere.
+     */
+    private val ignoredSegmentIds = mutableSetOf<String>()
+    private var skipNoticeJob: Job? = null
+
+    // Initial stream resolution and watch-next metadata belong to one specific
+    // startVideo invocation. Cancellation handles the normal case; the
+    // generation check is still required because NewPipe's blocking fetch can
+    // finish after cancellation and because a forced retry can reuse the same
+    // video id.
+    private var streamLoadJob: Job? = null
+    private var watchNextJob: Job? = null
+    private var videoLoadGeneration = 0L
+
+    // A cold-process restore initially rebuilds only the visible player state.
+    // Keeping the resume point here avoids preparing an ExoPlayer source (and
+    // therefore buffering a video) before the user has asked playback to
+    // resume. Nullable distinguishes a pending restore at 0 from no restore.
+    private var deferredRestorePositionMs: Long? = null
+
+    // Qualities and Related
+    private val _availableQualities = MutableStateFlow<List<VideoQuality>>(emptyList())
+    val availableQualities: StateFlow<List<VideoQuality>> = _availableQualities
+
+    /** What the quality menu may offer right now: one entry per visible label. */
+    val selectableQualities: StateFlow<List<VideoQuality>> =
+        _availableQualities
+            .map { localVideoQualityOptions(it).cappedAtHeight(deviceQualityCap) }
+            .stateIn(viewModelScope, SharingStarted.Eagerly, emptyList())
+
+    private val _currentQuality = MutableStateFlow<VideoQuality?>(null)
+    val currentQuality: StateFlow<VideoQuality?> = _currentQuality
+
+    private val notInterestedRepository =
+        com.sentup.android.data.NotInterestedRepository(context)
+
+    /**
+     * The playlist being watched through, or null when this is a one-off video.
+     *
+     * See [com.sentup.android.data.VideoQueue]. Set only by [playQueue]; every
+     * other entry point into playback clears it, because leaving the playlist
+     * is exactly what tapping a related video or a search result means.
+     */
+    private val _queue = MutableStateFlow<com.sentup.android.data.VideoQueue?>(null)
+    val queue: StateFlow<com.sentup.android.data.VideoQueue?> = _queue.asStateFlow()
+
+    private val _relatedVideos = MutableStateFlow<List<VideoItem>>(emptyList())
+
+    /**
+     * Up Next, minus what the user asked not to see. Derived rather than
+     * written through, so a "not interested" tap removes the row on the next
+     * frame and Undo restores it in place - see HomeViewModel.trendingVideos.
+     */
+    val relatedVideos: StateFlow<List<VideoItem>> =
+        combine(
+            _relatedVideos,
+            notInterestedRepository.hiddenVideos,
+            notInterestedRepository.blockedChannels
+        ) { videos, _, _ -> notInterestedRepository.filter(videos) }
+            .stateIn(viewModelScope, SharingStarted.Eagerly, emptyList())
+
+    /** Local hide plus best-effort account propagation - see NotInterestedActions. */
+    private val notInterestedActions =
+        com.sentup.android.data.NotInterestedActions(notInterestedRepository, youtubeRepository)
+
+    /**
+     * Re-read the playing video's account state when the profile changes.
+     *
+     * Like, dislike, subscribe and the comment list are all the *account's*
+     * view of this video, so after a switch they describe somebody else.
+     * Playback itself is left running - the stream is already resolved, and
+     * stopping it because the user checked another account would be a bad
+     * trade - but everything account-shaped around it is refetched.
+     *
+     * Related videos come back with the engagement refetch, since both are
+     * parsed from the same watch-next response.
+     */
+    private fun observeProfileSwitches() {
+        viewModelScope.launch {
+            com.sentup.android.data.ProfileManager(context)
+                .activeProfileId
+                .drop(1)
+                .distinctUntilChanged()
+                .collect {
+                    youtubeRepository.clearSessionScopedInstanceCaches()
+                    _engagement.value = null
+                    _comments.value = emptyList()
+                    val playing = _currentVideo.value ?: return@collect
+                    val refreshed = runCatching {
+                        youtubeRepository.getWatchNextData(playing.videoId, playing)
+                    }.getOrNull() ?: return@collect
+                    // The user can have moved on while this was in flight.
+                    if (_currentVideo.value?.videoId != playing.videoId) return@collect
+                    _engagement.value = refreshed.engagement
+                    if (refreshed.relatedVideos.isNotEmpty()) {
+                        _relatedVideos.value = refreshed.relatedVideos
+                    }
+                }
+        }
+    }
+
+    /** Hide one video from every recommendation feed. */
+    fun markNotInterested(video: VideoItem) =
+        notInterestedActions.hideVideo(video, viewModelScope)
+
+    /** Stop recommending anything from this video's channel. */
+    fun blockChannelFor(video: VideoItem) =
+        notInterestedActions.blockChannel(video, viewModelScope)
+
+    // Chapter markers for the current video (empty when the video has none)
+    private val _chapters = MutableStateFlow<List<com.sentup.android.data.VideoChapter>>(emptyList())
+    val chapters: StateFlow<List<com.sentup.android.data.VideoChapter>> = _chapters.asStateFlow()
+
+    // YouTube storyboard sprite harvested during stream extraction, or a local
+    // URI whose frames can be decoded directly for downloaded playback. Null
+    // for live streams and videos that do not expose either source.
+    private val _seekPreview = MutableStateFlow<VideoSeekPreview?>(null)
+    val seekPreview: StateFlow<VideoSeekPreview?> = _seekPreview.asStateFlow()
+
+    // Caption/subtitle tracks (loaded lazily when the user opens the CC menu)
+    private val _captionTracks = MutableStateFlow<List<CaptionTrack>>(emptyList())
+    val captionTracks: StateFlow<List<CaptionTrack>> = _captionTracks.asStateFlow()
+
+    // Currently displayed caption track, or null when captions are off
+    private val _selectedCaption = MutableStateFlow<CaptionTrack?>(null)
+    val selectedCaption: StateFlow<CaptionTrack?> = _selectedCaption.asStateFlow()
+
+    private val _isCaptionsLoading = MutableStateFlow(false)
+    val isCaptionsLoading: StateFlow<Boolean> = _isCaptionsLoading.asStateFlow()
+
+    private var captionsLoadedForVideoId: String? = null
+
+    private val downloadedCaptions = com.sentup.android.data.DownloadedCaptionStore(context)
+
+    /**
+     * Whether a locally played id is one of Sentüp's own downloads rather than a
+     * device file or a file opened from outside: those carry a prefix, a
+     * download keeps the YouTube id it was saved under.
+     */
+    private fun isDownloadedVideoId(videoId: String): Boolean =
+        !videoId.startsWith(LocalVideo.ID_PREFIX) && !videoId.startsWith("external:")
+
+    // Cues of the selected track, rendered by the player overlay. Captions are
+    // deliberately kept out of the media source - see [setCaptionTrack].
+    private val _captionCues = MutableStateFlow<List<VttCue>>(emptyList())
+    val captionCues: StateFlow<List<VttCue>> = _captionCues.asStateFlow()
+
+    val captionTextSize: StateFlow<Float> = themePreferences.captionTextSize
+    val captionTextColor: StateFlow<CaptionTextColor> = themePreferences.captionTextColor
+    val captionBackground: StateFlow<CaptionBackground> = themePreferences.captionBackground
+    val captionsEnabled: StateFlow<Boolean> = themePreferences.captionsEnabled
+
+    private var captionCuesJob: Job? = null
+
+    fun setCaptionTextSize(size: Float) = themePreferences.setCaptionTextSize(size)
+
+    fun setCaptionTextColor(color: CaptionTextColor) = themePreferences.setCaptionTextColor(color)
+
+    fun setCaptionBackground(background: CaptionBackground) =
+        themePreferences.setCaptionBackground(background)
+
+    // ---------------- Picture-in-Picture ----------------
+
+    // Width/height of the video being played, so the PiP window and the watch
+    // page's video box both take the shape of the video instead of a hardcoded
+    // 16:9 that letterboxes everything else.
+    //
+    // Seeded from the stream dimensions when the quality list arrives and
+    // refined by onVideoSizeChanged once a frame has decoded, so it is usually
+    // known before the box is laid out. Null only for a source that declared no
+    // dimensions, where consumers fall back to 16:9.
+    private val _videoAspectRatio = MutableStateFlow<Float?>(null)
+    val videoAspectRatio: StateFlow<Float?> = _videoAspectRatio.asStateFlow()
+
+    // Where the video surface sits on screen, in window coordinates. Handed to
+    // PictureInPictureParams as the source rect hint so the system animates the
+    // PiP window out of the video itself; without it the transition scales down
+    // the entire activity window, app chrome and all.
+    private val _videoSurfaceBounds = MutableStateFlow<android.graphics.Rect?>(null)
+    val videoSurfaceBounds: StateFlow<android.graphics.Rect?> = _videoSurfaceBounds.asStateFlow()
+
+    // Kept separate from the expanded/fullscreen surface bounds. Reusing one
+    // rectangle across both layouts briefly leaves the expanded window bounds
+    // attached to a collapsed player, which lets Android snapshot the whole UI
+    // when Home is pressed during that hand-off.
+    private val _miniVideoSurfaceBounds = MutableStateFlow<android.graphics.Rect?>(null)
+    val miniVideoSurfaceBounds: StateFlow<android.graphics.Rect?> =
+        _miniVideoSurfaceBounds.asStateFlow()
+
+    fun setVideoSurfaceBounds(bounds: android.graphics.Rect?) {
+        _videoSurfaceBounds.value = bounds
+    }
+
+    fun setMiniVideoSurfaceBounds(bounds: android.graphics.Rect?) {
+        _miniVideoSurfaceBounds.value = bounds
+    }
+
+    // True while the app is in system Picture-in-Picture. Set by the
+    // composition so the STATE_ENDED auto-play can stand down: advancing
+    // to the next video while in PiP means the user returns to a video
+    // they did not put there.
+    private var _isInPipMode = false
+
+    fun setInPipMode(inPip: Boolean) {
+        _isInPipMode = inPip
+    }
+
+    // End-of-video behavior sticks across videos and app restarts. Autoplay is
+    // the master gate: when it is off, a stored repeat flag is ignored and
+    // normalized away during init so the UI and ExoPlayer cannot disagree.
+    private val _isAutoplayEnabled =
+        MutableStateFlow(themePreferences.isVideoAutoplayEnabled())
+    val isAutoplayEnabled: StateFlow<Boolean> = _isAutoplayEnabled.asStateFlow()
+
+    private val _isLooping = MutableStateFlow(
+        _isAutoplayEnabled.value && themePreferences.isVideoRepeatEnabled()
+    )
+    val isLooping: StateFlow<Boolean> = _isLooping.asStateFlow()
+
+    // Sleep timer: a wall-clock deadline, or stop at the end of this video.
+    // In-memory like the rest of this ViewModel's playback state (unlike
+    // music's, which survives process death inside MusicService): closing the
+    // player cancels it, and an explicit close means done with the video.
+    private val _sleepTimerEndsAt = MutableStateFlow<Long?>(null)
+    val sleepTimerEndsAt: StateFlow<Long?> = _sleepTimerEndsAt.asStateFlow()
+
+    private val _sleepTimerEndOfVideo = MutableStateFlow(false)
+    val sleepTimerEndOfVideo: StateFlow<Boolean> = _sleepTimerEndOfVideo.asStateFlow()
+
+    private var sleepTimerJob: kotlinx.coroutines.Job? = null
+
+    /** Arm a duration timer; expiry pauses playback and leaves the player open. */
+    fun startSleepTimer(minutes: Int) {
+        if (minutes <= 0) {
+            startSleepTimerEndOfVideo()
+            return
+        }
+        sleepTimerJob?.cancel()
+        _sleepTimerEndOfVideo.value = false
+        val endsAt = System.currentTimeMillis() + minutes * 60_000L
+        _sleepTimerEndsAt.value = endsAt
+        sleepTimerJob = viewModelScope.launch {
+            val remaining = endsAt - System.currentTimeMillis()
+            if (remaining > 0) kotlinx.coroutines.delay(remaining)
+            _sleepTimerEndsAt.value = null
+            _exoPlayer?.pause()
+        }
+    }
+
+    /** Stop when the playing video finishes instead of autoplaying on. */
+    fun startSleepTimerEndOfVideo() {
+        sleepTimerJob?.cancel()
+        sleepTimerJob = null
+        _sleepTimerEndsAt.value = null
+        _sleepTimerEndOfVideo.value = true
+    }
+
+    fun cancelSleepTimer() {
+        sleepTimerJob?.cancel()
+        sleepTimerJob = null
+        _sleepTimerEndsAt.value = null
+        _sleepTimerEndOfVideo.value = false
+    }
+
+    private val _playbackSpeed = MutableStateFlow(themePreferences.getVideoPlaybackSpeed())
+    val playbackSpeed: StateFlow<Float> = _playbackSpeed.asStateFlow()
+
+    private val watchTracker = com.sentup.android.data.VideoWatchTracker(context, viewModelScope, youtubeRepository)
+    private var watchProfileId = com.sentup.android.data.ProfileManager.activeProfileId(context)
+
+    // Track quality change listener to prevent leaks
+    private var qualityChangeListener: Player.Listener? = null
+
+    // Error state
+    private val _playbackError = MutableStateFlow<Throwable?>(null)
+    val playbackError: StateFlow<Throwable?> = _playbackError.asStateFlow()
+
+    /**
+     * Network advice for the current error when YouTube refused the connection
+     * rather than the video; see [com.sentup.android.data.connectionAdviceFor].
+     * While it stands, a network change retries on its own.
+     */
+    private val _connectionAdvice = MutableStateFlow<com.sentup.android.data.ConnectionAdvice?>(null)
+    val connectionAdvice: StateFlow<com.sentup.android.data.ConnectionAdvice?> =
+        _connectionAdvice.asStateFlow()
+
+    private val connectionWatcher = com.sentup.android.data.NetworkChangeWatcher(context) {
+        viewModelScope.launch { retryAfterNetworkChange() }
+    }
+
+    init {
+        // The Video shaders page writes through its own ThemePreferences, with
+        // a video possibly still open in the mini player. Only what is drawn
+        // follows it here: the stage itself waits for the next player, since
+        // releasing this one would pull it out from under the media session
+        // and the views that hold it.
+        videoShaderControl.settings = _videoShaders.value
+        viewModelScope.launch {
+            themePreferences.videoShaders.collect { previewVideoShaders(it) }
+        }
+        viewModelScope.launch {
+            _playbackError.collect { error ->
+                // A device video never asked YouTube for anything.
+                val advice = error
+                    ?.takeUnless { _isLocalPlayback.value }
+                    ?.let { com.sentup.android.data.connectionAdviceFor(context, it) }
+                _connectionAdvice.value = advice
+                if (advice != null) connectionWatcher.start() else connectionWatcher.stop()
+            }
+        }
+        // The system's previous/next buttons appear and disappear with the
+        // queue, which the ExoPlayer never sees.
+        viewModelScope.launch {
+            combine(_queue, relatedVideos) { _, _ -> Unit }.collect {
+                com.sentup.android.service.VideoPlaybackService.publishQueueCommands()
+            }
+        }
+    }
+
+    private suspend fun retryAfterNetworkChange() {
+        if (_connectionAdvice.value == null) return
+        KLog.i("VideoPlayerVM", "Network changed while YouTube was refusing the connection; retrying")
+        YouTubeRepository.forgetConnectionVerdicts()
+        youtubeRepository.refreshVisitorDataAfterPlaybackFailure()
+        // The user may have moved on or retried while the remint ran.
+        if (_connectionAdvice.value != null) retryPlayback()
+    }
+
+    // Video rendering is suspended while the app is not visible - see onEnterBackground()
+    private var isVideoSuspended = false
+
+    // Renderer/decoder failures are usually transient (surface torn down, codec
+    // reclaimed by another app). Retry in place a couple of times before the
+    // error reaches the UI; reset on every successful playback start.
+    private var rendererRetryCount = 0
+    private var hdrFallbackUsed = false
+    private var hdrQualityToRestoreAfterMini: VideoQuality? = null
+
+    // Source failures (googlevideo 403 on a flagged token, an expired URL, a
+    // network blip) are recovered by re-resolving the stream rather than by
+    // replaying the dead URL. Bounded so a genuinely unplayable video still
+    // reaches the error overlay; reset on every successful playback start.
+    private var sourceRetryCount = 0
+    private var sourceRecoveryJob: kotlinx.coroutines.Job? = null
+
+    // Videos skipped in a row because they would not play at all. Playlists
+    // collect deleted, private and region-blocked entries over time, and one of
+    // those must not end the run - but a network that has gone away fails every
+    // video too, and racing to the end of the playlist on that is worse than
+    // stopping. Bounded, and reset the moment anything actually plays.
+    private var queueErrorSkipCount = 0
+
+    // ---------------- Engagement (likes / subscribe / comments) ----------------
+
+    private val returnDislikeRepository = com.sentup.android.data.ReturnDislikeRepository()
+    private val _dislikeCount = MutableStateFlow<String?>(null)
+    val dislikeCount: StateFlow<String?> = _dislikeCount.asStateFlow()
+
+    private val _engagement = MutableStateFlow<VideoEngagement?>(null)
+    val engagement: StateFlow<VideoEngagement?> = _engagement.asStateFlow()
+
+    private val _isLoggedIn = MutableStateFlow(youtubeRepository.isLoggedIn())
+    val isLoggedIn: StateFlow<Boolean> = _isLoggedIn.asStateFlow()
+
+    private val subscriptionActions =
+        SubscriptionActions(context, youtubeRepository)
+
+    /**
+     * Whether the current video's channel is followed at all - by the signed-in
+     * account or on this device. The subscribe button binds to this rather than
+     * to `engagement.isSubscribed`, which only ever knows about the account and
+     * so read "Subscribe" for a channel the user had followed locally.
+     */
+    val isSubscribedToChannel: StateFlow<Boolean> =
+        combine(_engagement, subscriptionActions.subscriptions) { engagement, localSubs ->
+            val channelId = engagement?.channelId
+            engagement?.isSubscribed == true ||
+                (channelId != null && localSubs.any { it.channelId == channelId })
+        }.stateIn(viewModelScope, SharingStarted.Eagerly, false)
+
+    /** True when the subscribe button has to send the user to sign in first. */
+    fun subscribeNeedsLogin(): Boolean = subscriptionActions.subscribeNeedsLogin()
+
+    private val bellActions = ChannelBellActions(context, youtubeRepository)
+
+    private val _bellWrites = MutableStateFlow<Set<String>>(emptySet())
+
+    /** Channels whose bell write is in flight; their bell is disabled until it lands. */
+    val bellWrites: StateFlow<Set<String>> = _bellWrites.asStateFlow()
+
+    /**
+     * Move [channelId]'s account bell to [level] (see [ChannelBellActions]).
+     * Optimistic, with the old level put back when the write does not land.
+     */
+    fun setChannelBell(channelId: String, level: BellLevel, channelName: String) {
+        val current = _engagement.value ?: return
+        val bell = current.bells[channelId] ?: return
+        if (channelId in _bellWrites.value) return
+        _bellWrites.value = _bellWrites.value + channelId
+        _engagement.value = current.copy(bells = current.bells + (channelId to bell.withLevel(level)))
+        viewModelScope.launch {
+            try {
+                val landed = bellActions.change(bell, level, channelName)
+                val now = _engagement.value
+                if (now?.videoId == current.videoId) {
+                    _engagement.value = now.copy(bells = now.bells + (channelId to (landed ?: bell)))
+                }
+            } finally {
+                _bellWrites.value = _bellWrites.value - channelId
+            }
+        }
+    }
+
+    // ---------------- Live broadcast ----------------
+
+    /**
+     * Whether the current video is a live broadcast. Resolved in Phase 1 from
+     * the quality list: a live stream only ever produces a single adaptive HLS
+     * entry (see parseDirectVideoQualities), so the
+     * flag rides along with the streams instead of costing a separate call.
+     */
+    private val _isLive = MutableStateFlow(false)
+    val isLive: StateFlow<Boolean> = _isLive.asStateFlow()
+
+    /**
+     * How far behind the newest media in the window the player deliberately
+     * sits, straight off the timeline the source published.
+     *
+     * A live HLS player is never *at* the end of its playlist. With no
+     * `EXT-X-START` and no `HOLD-BACK` in the manifest - which is what YouTube
+     * sends - Media3 targets `3 x targetDuration` back from the end [verified
+     * September 2026 against 1.11's HlsMediaSource.getTargetLiveOffsetUs], so
+     * with YouTube's ~5s segments the live edge is 15-16s short of the window
+     * end. [scar] The behind-live readout measured from the window end and
+     * called anything past a flat 10s "behind", so a stream sitting exactly
+     * where the manifest asks it to sit reported a permanent -0:15 and the
+     * chip never said LIVE. Measuring against this instead makes the number
+     * mean what a viewer reads it as: how far *they* have scrubbed back.
+     *
+     * Zero when the timeline is not live or has not arrived, which reduces the
+     * arithmetic to the old window-end measurement rather than inventing one.
+     */
+    private val _liveTargetOffsetMs = MutableStateFlow(0L)
+    val liveTargetOffsetMs: StateFlow<Long> = _liveTargetOffsetMs.asStateFlow()
+
+    /** Reused across timeline callbacks; only ever touched on the app thread. */
+    private val liveTimelineWindow = Timeline.Window()
+
+    /**
+     * Whether the source frame is portrait. Set in Phase 1 off the stream
+     * dimensions so the vertical live layout can be composed before the first
+     * frame exists, then confirmed by the player's own video size once it does
+     * (the NewPipe fallback path can resolve a live manifest without ever
+     * listing a dimensioned format).
+     *
+     * Together with [isLive] this is what selects the full-bleed vertical
+     * player: a vertical live stream is an ordinary broadcast with a 9:16
+     * encode, so orientation is the only thing distinguishing it.
+     */
+    private val _isPortraitVideo = MutableStateFlow(false)
+    val isPortraitVideo: StateFlow<Boolean> = _isPortraitVideo.asStateFlow()
+
+    /** Concurrent viewers, e.g. "14,618 watching now". Live videos only. */
+    private val _liveViewerCount = MutableStateFlow<String?>(null)
+    val liveViewerCount: StateFlow<String?> = _liveViewerCount.asStateFlow()
+
+    /** Null until the first chat poll answers; false when chat is unavailable. */
+    private val _isLiveChatAvailable = MutableStateFlow<Boolean?>(null)
+    val isLiveChatAvailable: StateFlow<Boolean?> = _isLiveChatAvailable.asStateFlow()
+
+    private val _liveChatMessages = MutableStateFlow<List<LiveChatMessage>>(emptyList())
+    val liveChatMessages: StateFlow<List<LiveChatMessage>> = _liveChatMessages.asStateFlow()
+
+    private val _liveChatBanner = MutableStateFlow<LiveChatBanner?>(null)
+    val liveChatBanner: StateFlow<LiveChatBanner?> = _liveChatBanner.asStateFlow()
+
+    private val _isLiveChatLoading = MutableStateFlow(false)
+    val isLiveChatLoading: StateFlow<Boolean> = _isLiveChatLoading.asStateFlow()
+
+    private val _isSendingLiveChat = MutableStateFlow(false)
+    val isSendingLiveChat: StateFlow<Boolean> = _isSendingLiveChat.asStateFlow()
+
+    private val _liveChatSendParams = MutableStateFlow<String?>(null)
+
+    /**
+     * Posting needs both an account and a chat that accepts messages. The send
+     * token is present in the poll response even when signed out, so it is not
+     * on its own permission to post.
+     */
+    val canSendLiveChat: StateFlow<Boolean> = kotlinx.coroutines.flow.combine(
+        _isLoggedIn, _liveChatSendParams
+    ) { loggedIn, params -> loggedIn && params != null }
+        .stateIn(viewModelScope, SharingStarted.Eagerly, false)
+
+    private val _liveChatMaxLength = MutableStateFlow(200)
+    val liveChatMaxLength: StateFlow<Int> = _liveChatMaxLength.asStateFlow()
+
+    /**
+     * Why the composer is closed - subscribers-only, members-only, slow mode, a
+     * ban. Null when the viewer may post. Distinct from [canSendLiveChat], which
+     * is about having an account at all.
+     */
+    private val _liveChatRestriction = MutableStateFlow<String?>(null)
+    val liveChatRestriction: StateFlow<String?> = _liveChatRestriction.asStateFlow()
+
+    private var liveChatJob: Job? = null
+    private var liveMetadataJob: Job? = null
+    private var liveChatStartedForVideoId: String? = null
+
+    /**
+     * Chat start token lifted from Phase 2's watch-next response, so opening the
+     * panel does not re-fetch and re-parse that multi-megabyte tree.
+     */
+    private var liveChatContinuation: String? = null
+
+    /**
+     * Messages that have arrived from the server but are not on screen yet.
+     *
+     * A poll returns ten seconds of chat in one lump; releasing it in one frame
+     * is what made the panel feel like a stuttering wall rather than a live
+     * conversation. Both the poll loop and the drain loop run on viewModelScope's
+     * main dispatcher, so this needs no synchronization.
+     */
+    private val pendingLiveChat = ArrayDeque<LiveChatMessage>()
+
+    /** Ids already queued or displayed, so a re-delivered message is dropped. */
+    private val seenLiveChatIds = LinkedHashSet<String>()
+
+    /** Elapsed-realtime mark when the next batch is expected, for pacing. */
+    private var liveChatBatchDueAt = 0L
+
+    private val _comments = MutableStateFlow<List<CommentItem>>(emptyList())
+    val comments: StateFlow<List<CommentItem>> = _comments.asStateFlow()
+
+    // Comments that mention a playback timestamp, sorted by that time.
+    // Drives the timed comments overlay in the video player.
+    val timedComments: StateFlow<List<TimedComment>> = _comments
+        .map { list ->
+            list.mapNotNull { comment ->
+                parseFirstTimestampMs(comment.text)?.let { TimedComment(comment, it) }
+            }.sortedBy { it.timeMs }
+        }
+        .stateIn(viewModelScope, SharingStarted.Eagerly, emptyList())
+
+    private val _isCommentsLoading = MutableStateFlow(false)
+    val isCommentsLoading: StateFlow<Boolean> = _isCommentsLoading.asStateFlow()
+
+    private val _isLoadingMoreComments = MutableStateFlow(false)
+    val isLoadingMoreComments: StateFlow<Boolean> = _isLoadingMoreComments.asStateFlow()
+
+    // Replies keyed by parent commentId; presence of key = replies loaded (or loading)
+    private val _replies = MutableStateFlow<Map<String, List<CommentItem>>>(emptyMap())
+    val replies: StateFlow<Map<String, List<CommentItem>>> = _replies.asStateFlow()
+
+    private val _loadingReplyIds = MutableStateFlow<Set<String>>(emptySet())
+    val loadingReplyIds: StateFlow<Set<String>> = _loadingReplyIds.asStateFlow()
+
+    private var commentsNextToken: String? = null
+    private var commentsLoadedForVideoId: String? = null
+
+    // Params for posting a new top-level comment; arrives with the first comments page
+    private val _createCommentParams = MutableStateFlow<String?>(null)
+
+    /** Whether posting a comment is possible (logged in + params available). */
+    val canComment: StateFlow<Boolean> = kotlinx.coroutines.flow.combine(
+        _isLoggedIn, _createCommentParams
+    ) { loggedIn, params -> loggedIn && params != null }
+        .stateIn(viewModelScope, SharingStarted.Eagerly, false)
+
+    private val _isPostingComment = MutableStateFlow(false)
+    val isPostingComment: StateFlow<Boolean> = _isPostingComment.asStateFlow()
+
+    // ---------------- Save to playlist (Watch Later) ----------------
+
+    // The account's own; the device's are merged in by [videoPlaylists] below.
+    private val _videoPlaylists = MutableStateFlow<List<com.sentup.android.data.VideoPlaylist>>(emptyList())
+
+    /**
+     * Everything the save sheet can save into, device playlists first. Mirrors
+     * `HomeViewModel.videoPlaylists`, because the sheet is opened from both and
+     * must offer the same targets either way.
+     */
+    val videoPlaylists: StateFlow<List<com.sentup.android.data.VideoPlaylist>> = combine(
+        localVideoPlaylistsRepository.playlists,
+        _videoPlaylists
+    ) { local, account ->
+        local.map { it.toVideoPlaylist() } + account
+    }.stateIn(viewModelScope, SharingStarted.WhileSubscribed(5000), emptyList())
+
+    private val _isVideoPlaylistsLoading = MutableStateFlow(false)
+    val isVideoPlaylistsLoading: StateFlow<Boolean> = _isVideoPlaylistsLoading.asStateFlow()
+
+    /**
+     * The device's playlists with their videos attached, for marking the ones a
+     * video is already in. Mirrors `HomeViewModel.localVideoPlaylists`; see
+     * there for why the account's are not covered.
+     */
+    val localVideoPlaylists: StateFlow<List<com.sentup.android.data.LocalVideoPlaylist>> =
+        localVideoPlaylistsRepository.playlists
+
+    /**
+     * Stream data source factory: CacheDataSource keeps bytes already fetched
+     * for VOD seeking/replay, while ChunkedStreamDataSource supplies cache
+     * misses as bounded googlevideo ranges (open-ended requests are paced to
+     * the media bitrate) with the User-Agent matching the URL's issuing client.
+     *
+     * Declared before [init] on purpose: the ExoPlayer built there installs it
+     * as the player-wide MediaSource factory, so a lazy declared further down
+     * the class would still be an uninitialised delegate at that point.
+     */
+    private val streamDataSourceFactory = run {
+        // MusicService used to be the cache's only initializer. Video owns a
+        // separate player and can run without that service, so it must make the
+        // shared process cache available before constructing its data source.
+        CacheManager.createVideoPlaybackDataSourceFactory(context)
+    }
+
+    init {
+        observeProfileSwitches()
+
+        viewModelScope.launch {
+            themePreferences.preferHdr.drop(1).distinctUntilChanged().collect { enabled ->
+                val current = _currentQuality.value ?: return@collect
+                val video = _currentVideo.value ?: return@collect
+                if (_isLocalPlayback.value || _isLive.value) return@collect
+                if (!enabled && current.isHdr) {
+                    val fallback = bestSdrFallback(localVideoQualityOptions(_availableQualities.value), current)
+                    if (fallback != null) reloadPreservingPosition(fallback)
+                } else if (enabled && !current.isHdr) {
+                    val streamResult = resolvePlayableStreamResult(video.videoId)
+                    if (_currentVideo.value?.videoId != video.videoId) return@collect
+                    _availableQualities.value = streamResult.qualities
+                    applyYouTubeAudioTracks(streamResult.audioTracks)
+                }
+            }
+        }
+
+        if (!_isAutoplayEnabled.value && themePreferences.isVideoRepeatEnabled()) {
+            themePreferences.setVideoRepeatEnabled(false)
+        }
+
+        // The codec/player stack is built lazily by ensureLocalPlayer, only
+        // when a video is restored or explicitly opened.
+        restoreVideoSession()
+    }
+
+    private fun ensureLocalPlayer(): ExoPlayer {
+        // Restarted here rather than only at construction. [scar] closePlayer()
+        // cancels the poll and deliberately keeps the player, so the reuse path
+        // below handed back a live player with a dead poll: every video after
+        // the first played with a frozen seek bar, no 15s session checkpoint
+        // and no SponsorBlock skips, while the video itself ran normally.
+        // startProgressUpdates() replaces any run already going, and its loop
+        // reads _exoPlayer per tick, so calling it before the build below is
+        // safe.
+        startProgressUpdates()
+        _exoPlayer?.let { return it }
+
+        // The sample queue this sizes IS the app's RAM cache for video: the
+        // seek bar's pale segment is exactly `player.bufferedPosition`, so what
+        // a scrub lands in - and whether it stalls - is decided here rather
+        // than by the disk cache, which only backs the misses.
+        //
+        // [scar] The previous values made seeking stall by construction. A seek
+        // that leaves the buffer counts as a rebuffer, so the 2.5s resume
+        // threshold held the first frame back for 2.5s of queued media even
+        // when every byte was already in RAM; and a 15s back buffer discarded
+        // history well inside the range people scrub back into. Decoded
+        // surfaces and codecs still consume memory outside this allocator, so
+        // the ceiling stays bounded rather than unbounded.
+        val loadControl = DefaultLoadControl.Builder()
+            .setBufferDurationsMs(
+                30_000,   // resume loading once the queue drops below this
+                120_000,  // forward runway; the byte ceiling below usually binds first
+                1_000,    // buffer before first frame
+                800       // buffer before resuming after a seek or a rebuffer
+            )
+            // Shared by the split video and audio sources of an adaptive pair,
+            // and by the back buffer below, so it is the real ceiling on how
+            // much of a scrub can be served without touching storage.
+            .setTargetBufferBytes(96 * 1024 * 1024)
+            // Backwards is the common scrub direction; 15s was inside the
+            // distance a single drag routinely covers.
+            .setBackBuffer(45_000, true)
+            .setPrioritizeTimeOverSizeThresholds(false)
+            .build()
+
+        // Initialize ExoPlayer.
+        // WAKE_MODE_NETWORK holds CPU + WiFi locks while playing: without it,
+        // locking the screen lets the device sleep, the network stalls, the
+        // buffer drains and playback dies in a stuck-buffering state.
+        // Audio focus + becoming-noisy mirror MusicService, so video playback
+        // pauses the music player (and vice versa) instead of playing over it.
+        // Every media source this player builds must fetch through
+        // ChunkedStreamDataSource. loadQuality() passes it explicitly for the
+        // progressive/merged paths, but the DASH branch hands the player a bare
+        // MediaItem, which would otherwise be served by Media3's stock
+        // DefaultDataSource - no per-URL User-Agent, so googlevideo answers 403
+        // and the video dead-ends on "Source error". Setting it here covers the
+        // manifest, its segments, and any future setMediaItem call.
+        return ExoPlayer.Builder(context)
+            .setMediaSourceFactory(DefaultMediaSourceFactory(streamDataSourceFactory))
+            .setLoadControl(loadControl)
+            .setWakeMode(C.WAKE_MODE_NETWORK)
+            .setAudioAttributes(AudioAttributes.DEFAULT, true)
+            .setHandleAudioBecomingNoisy(true)
+            // 10s each way, matching the player's own double-tap seek. These
+            // are what the media notification's and PiP window's skip buttons
+            // move by, so they must agree with the in-app gesture rather than
+            // with Media3's 5s/15s defaults.
+            .setSeekBackIncrementMs(SEEK_STEP_MS)
+            .setSeekForwardIncrementMs(SEEK_STEP_MS)
+            .build().apply {
+            playWhenReady = true
+            // Repeat is persisted, so a fresh player must adopt the stored
+            // mode: otherwise the toolbar shows the repeat icon while the
+            // player silently auto-plays the next video instead of looping.
+            repeatMode = if (_isLooping.value) Player.REPEAT_MODE_ONE else Player.REPEAT_MODE_OFF
+            attachPlaybackListener(this)
+        }.also { player ->
+            _exoPlayer = player
+            // Speed is persisted the same way as repeat: without this a
+            // process restart rebuilds the player at 1x while the sheet
+            // still shows the remembered rate.
+            player.setPlaybackSpeed(_playbackSpeed.value)
+            installVideoEffects(player)
+        }
+    }
+
+    /**
+     * Before the first prepare or never: the video renderer decides on its
+     * first enable whether it renders through the effect graph, and does not
+     * revisit it. Everything after this is the per-frame gate the progress
+     * poll sets.
+     */
+    private fun installVideoEffects(player: ExoPlayer) {
+        playerHasInterpolation = frameInterpolationWanted()
+        val shaders = themePreferences.readVideoShaders()
+        _playerHasVideoShaders.value = shaders.masterEnabled
+        // The look first, on decoded frames: Smooth motion then draws its
+        // in-between frames from pictures that already wear it.
+        val effects = buildList {
+            if (shaders.masterEnabled) {
+                add(com.sentup.android.service.VideoShaderEffect(videoShaderControl))
+            }
+            if (playerHasInterpolation) {
+                add(com.sentup.android.service.FrameInterpolationEffect(frameInterpolation.control))
+            }
+        }
+        if (effects.isNotEmpty()) {
+            player.setVideoEffects(effects)
+        }
+    }
+
+    /**
+     * HDR stays out of the ladder while Smooth motion or video shaders are on,
+     * and while the player still carries the effect graph after they were
+     * turned off: an HDR rendition through that graph is tone-mapped or not,
+     * depending on the device's GL extensions, which is a worse answer than
+     * SDR on purpose.
+     */
+    private fun effectGraphBlocksHdr(): Boolean =
+        playerHasEffectGraph() || frameInterpolationWanted() || videoShadersWanted()
+
+    /**
+     * The playback listener the local ExoPlayer carries: buffering spinner,
+     * progress poll, retry budgets and end-of-video autoplay.
+     */
+    private fun attachPlaybackListener(player: Player) {
+        player.addListener(object : Player.Listener {
+            override fun onIsPlayingChanged(isPlaying: Boolean) {
+                _isPlaying.value = isPlaying
+            }
+
+            override fun onTracksChanged(tracks: Tracks) {
+                publishSelectableTracks(tracks)
+            }
+
+            /**
+             * The live target offset is a property of the loaded playlist, so
+             * it is re-read whenever the source republishes its timeline - an
+             * HLS media playlist reload does exactly that as the window slides.
+             */
+            override fun onTimelineChanged(timeline: Timeline, reason: Int) {
+                updateLiveTargetOffset(timeline)
+            }
+
+            /**
+             * Cues from an embedded subtitle track. Media3 parses subtitles
+             * during extraction, so this fires for a device file's own tracks
+             * with nothing fetched and nothing merged into the source.
+             *
+             * Empty groups arrive constantly - between every pair of cues - and
+             * are what clears the overlay, so they must not be filtered out.
+             */
+            override fun onCues(cueGroup: CueGroup) {
+                // Local files only. A YouTube stream draws its captions from
+                // the fetched-cue overlay instead, and a DASH manifest that
+                // happened to carry a text track the selector picked up would
+                // otherwise render a second line over the first.
+                if (!_isLocalPlayback.value) {
+                    _embeddedCueText.value = null
+                    return
+                }
+                _embeddedCueText.value = cueGroup.cues
+                    .mapNotNull { it.text?.toString()?.trim()?.takeIf(String::isNotEmpty) }
+                    .takeIf { it.isNotEmpty() }
+                    ?.joinToString("\n")
+            }
+
+            override fun onVideoSizeChanged(videoSize: androidx.media3.common.VideoSize) {
+                // Drives the PiP window's shape. Ignore the 0x0 the player
+                // reports between media items, which would otherwise
+                // collapse the aspect ratio mid-switch.
+                if (videoSize.width > 0 && videoSize.height > 0) {
+                    val ratio = videoSize.width * videoSize.pixelWidthHeightRatio / videoSize.height
+                    _videoAspectRatio.value = ratio
+                    // Backstop for the parse-time read: authoritative, but
+                    // only available once a frame has decoded.
+                    _isPortraitVideo.value = ratio < 1f
+                }
+            }
+
+            override fun onSurfaceSizeChanged(width: Int, height: Int) {
+                if (width > 0 && height > 0) redrawPausedFrameThroughGraph()
+            }
+
+            override fun onPlaybackStateChanged(playbackState: Int) {
+                _isBuffering.value = playbackState == Player.STATE_BUFFERING
+                if (playbackState == Player.STATE_READY) {
+                    // Playback recovered (or started cleanly): allow the
+                    // retry budget to be spent again on a later failure.
+                    rendererRetryCount = 0
+                    sourceRetryCount = 0
+                    queueErrorSkipCount = 0
+                }
+                if (playbackState == Player.STATE_ENDED) {
+                    if (watchProfileId == com.sentup.android.data.ProfileManager.activeProfileId(context) &&
+                        themePreferences.isSaveVideoHistoryEnabled() &&
+                        !com.sentup.android.data.IncognitoMode.isEnabled(context)) {
+                        _currentVideo.value?.videoId?.let(videoHistoryRepository::clearResumePosition)
+                    }
+                    // Repeat-one normally prevents STATE_ENDED entirely.
+                    // The guard keeps a transient player/state mismatch
+                    // from advancing away from a video meant to loop.
+                    if (_isLooping.value) return
+                    viewModelScope.launch { handlePlaybackEnded() }
+                }
+            }
+
+            override fun onPlayerError(error: PlaybackException) {
+                if (fallbackFromHdr(error)) return
+
+                // A renderer/decoder failure is not a broken stream: the
+                // codec lost its surface or was reclaimed. Re-prepare in
+                // place (position is kept) instead of dead-ending the
+                // player on an error overlay the user cannot dismiss.
+                if (isTransientRendererError(error) && rendererRetryCount < MAX_RENDERER_RETRIES) {
+                    rendererRetryCount++
+                    KLog.w(
+                        "VideoPlayerVM",
+                        "Transient renderer error (attempt $rendererRetryCount/$MAX_RENDERER_RETRIES); re-preparing",
+                        error
+                    )
+                    _exoPlayer?.prepare()
+                    return
+                }
+
+                // CacheDataSource serves every contiguous byte it has before
+                // asking upstream. If that upstream is unavailable, keep the
+                // current item, surface and controls intact: the cached part
+                // was valid playback, and throwing it away turns a temporary
+                // connection loss into a blank player. Retry later re-resolves
+                // and continues from this exact position.
+                if (isRecoverableSourceError(error) && !networkPlaybackAllowed()) {
+                    val hadPlayableBytes = (_exoPlayer?.currentPosition ?: 0L) > 0L ||
+                        (_exoPlayer?.bufferedPosition ?: 0L) > 0L
+                    _exoPlayer?.pause()
+                    _playbackError.value = Exception(
+                        context.getString(
+                            if (hadPlayableBytes) {
+                                com.sentup.android.R.string.video_cached_portion_ended
+                            } else {
+                                com.sentup.android.R.string.video_not_cached_offline
+                            }
+                        )
+                    )
+                    _isBuffering.value = false
+                    _isLoading.value = false
+                    return
+                }
+
+                // A source failure means the URL is dead, not the video:
+                // re-resolving is the only thing that can help, and
+                // re-preparing the same URL never will.
+                if (!_isLocalPlayback.value &&
+                    isRecoverableSourceError(error) &&
+                    sourceRetryCount < MAX_SOURCE_RETRIES
+                ) {
+                    sourceRetryCount++
+                    KLog.w(
+                        "VideoPlayerVM",
+                        "Source error (attempt $sourceRetryCount/$MAX_SOURCE_RETRIES); re-resolving stream",
+                        error
+                    )
+                    recoverFromSourceError(error)
+                    return
+                }
+
+                // Both retry budgets are spent, so this video is genuinely
+                // unplayable. Inside a playlist that is almost always one
+                // deleted or private entry among many, and stopping the run
+                // on it is not what the user asked for by opening the
+                // playlist - so step over it, up to the bounded number of
+                // times above.
+                val activeQueue = _queue.value
+                if (activeQueue != null &&
+                    activeQueue.hasNext &&
+                    queueErrorSkipCount < MAX_QUEUE_ERROR_SKIPS
+                ) {
+                    queueErrorSkipCount++
+                    KLog.w(
+                        "VideoPlayerVM",
+                        "Unplayable video in the queue at ${activeQueue.index} " +
+                            "(skip $queueErrorSkipCount/$MAX_QUEUE_ERROR_SKIPS); moving on",
+                        error
+                    )
+                    viewModelScope.launch { playQueueIndex(activeQueue.index + 1) }
+                    return
+                }
+
+                _playbackError.value = error
+                _isBuffering.value = false
+            }
+        })
+    }
+
+    /**
+     * One decision for "the video finished": autoplay is the master gate, a
+     * user-chosen playlist beats recommendations, and PiP may continue that
+     * playlist but never wanders into related videos.
+     */
+    private suspend fun handlePlaybackEnded() {
+        // An armed end-of-video timer beats autoplay, the queue and related:
+        // this video finishes, playback stops, the flag is consumed.
+        if (_sleepTimerEndOfVideo.value) {
+            _sleepTimerEndOfVideo.value = false
+            _exoPlayer?.pause()
+            CacheManager.setVideoPlaybackActive(VIDEO_CACHE_OWNER, false)
+            return
+        }
+        val activeQueue = _queue.value
+        val nextRelated = relatedVideos.value.firstOrNull()
+        when (
+            resolveVideoEndAction(
+                autoplayEnabled = _isAutoplayEnabled.value,
+                queueHasNext = activeQueue?.hasNext == true,
+                isInPipMode = _isInPipMode,
+                hasRelatedVideo = nextRelated != null
+            )
+        ) {
+            VideoEndAction.STOP -> {
+                // STATE_ENDED is not always exposed as paused by media
+                // controls. Clear playWhenReady so the UI, PiP and
+                // notification all agree it stopped.
+                _exoPlayer?.pause()
+                CacheManager.setVideoPlaybackActive(VIDEO_CACHE_OWNER, false)
+            }
+
+            VideoEndAction.NEXT_IN_QUEUE -> {
+                if (activeQueue != null && _exoPlayer != null) {
+                    playQueueIndex(activeQueue.index + 1)
+                }
+            }
+
+            VideoEndAction.NEXT_RELATED -> {
+                // Use the filtered list: autoplaying something the viewer
+                // marked not interested is worse than stopping.
+                if (nextRelated != null && _exoPlayer != null) {
+                    playVideo(nextRelated)
+                }
+            }
+        }
+    }
+
+    /**
+     * Restore the video (or playlist) that was open when the process died,
+     * paused at the position it was left at - the user decides when to jump
+     * back in, same as PlayerViewModel.restoreLastSession() does for music.
+     *
+     * Never fires on a genuinely fresh app open: this only runs from init(),
+     * and a ViewModel this early already has nothing playing, so the sole
+     * purpose of the guard is protecting against playback starting while the
+     * file read below is in flight.
+     */
+    private fun restoreVideoSession() {
+        if (_currentVideo.value != null) return
+        viewModelScope.launch {
+            val session = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+                videoPlaybackSessionRepository.load()
+            }
+            if (session == null) return@launch
+            if (_currentVideo.value != null) return@launch
+
+            val videos = session.videos.map { it.toVideoItem() }
+            val target = videos.getOrNull(session.currentIndex) ?: return@launch
+
+            if (videos.size > 1) {
+                _queue.value = com.sentup.android.data.VideoQueue(
+                    videos = videos,
+                    index = session.currentIndex,
+                    title = session.queueTitle
+                        ?: com.sentup.android.data.VideoQueue.AD_HOC_TITLE,
+                    playlistId = session.queuePlaylistId
+                )
+            }
+
+            KLog.d(
+                "VideoPlayerVM",
+                "Restoring video session: ${videos.size} videos, " +
+                    "index=${session.currentIndex}, pos=${session.positionMs}"
+            )
+
+            // Collapsed rather than expanded: the user is arriving fresh at
+            // whatever screen they left, and popping straight into a
+            // fullscreen player would be a jump-scare, not a convenience. The
+            // mini player is enough of a "you left this running" cue. Rebuild
+            // only its metadata and progress here; the stream is resolved on
+            // the first Play action, so a bad prior session cannot create a
+            // repeated launch-time memory/network failure.
+            startVideo(
+                target,
+                resumePositionMs = session.positionMs,
+                resumePaused = true,
+                expand = false,
+                deferStreamLoad = true
+            )
+        }
+    }
+
+    private fun VideoItem.toSnapshot() = com.sentup.android.data.PersistedVideoSnapshot(
+        videoId = videoId,
+        title = title,
+        channelName = channelName,
+        channelId = channelId,
+        channelIconUrl = channelIconUrl,
+        thumbnailUrl = thumbnailUrl,
+        duration = duration,
+        viewCount = viewCount
+    )
+
+    private fun com.sentup.android.data.PersistedVideoSnapshot.toVideoItem() = VideoItem(
+        videoId = videoId,
+        title = title,
+        channelName = channelName,
+        channelId = channelId,
+        channelIconUrl = channelIconUrl,
+        thumbnailUrl = thumbnailUrl,
+        duration = duration,
+        viewCount = viewCount
+    )
+
+    /**
+     * Snapshot the current video (or queue), and position, for resume-on-
+     * reopen. Skipped for a live broadcast: there is no "position" to return
+     * to, and the manifest a resume would reopen has likely rolled off its
+     * DVR window by the time the app is next opened.
+     */
+    private fun saveVideoPlaybackSession() {
+        val video = _currentVideo.value ?: return
+        // The persisted snapshot does not carry a durable local URI. Restoring
+        // it as an online item would silently turn an offline session into a
+        // network request, so downloaded playback deliberately has no resume-
+        // after-process-death entry.
+        if (_isLocalPlayback.value) return
+        // Feed/search items often already know they are live before Phase 1
+        // resolves the stream qualities. Checking both signals prevents the
+        // progress poll from briefly persisting a broadcast as a resumable
+        // VOD. startVideo() clears the prior snapshot once per broadcast.
+        if (_isLive.value || video.isLive) return
+        val position = deferredRestorePositionMs
+            ?: _exoPlayer?.currentPosition?.coerceAtLeast(0L)
+            ?: return
+        val activeQueue = _queue.value
+
+        val videos: List<com.sentup.android.data.PersistedVideoSnapshot>
+        val index: Int
+        val title: String?
+        val playlistId: String?
+        if (activeQueue != null) {
+            videos = activeQueue.videos.map { it.toSnapshot() }
+            index = activeQueue.index
+            title = activeQueue.title
+            playlistId = activeQueue.playlistId
+        } else {
+            videos = listOf(video.toSnapshot())
+            index = 0
+            title = null
+            playlistId = null
+        }
+
+        enqueueSessionPersistence {
+            videoPlaybackSessionRepository.save(videos, index, title, playlistId, position)
+        }
+    }
+
+    /** Save a reusable per-video checkpoint, separate from the one active-session snapshot. */
+    private fun saveCurrentVideoResumePosition() {
+        if (watchProfileId != com.sentup.android.data.ProfileManager.activeProfileId(context)) return
+        val video = _currentVideo.value ?: return
+        if (_isLive.value || video.isLive) return
+        if (video.videoId.startsWith("external:")) return
+        if (!themePreferences.isSaveVideoHistoryEnabled()) return
+        val player = _exoPlayer
+        val duration = player?.duration?.takeIf { it > 0L } ?: _durationMs.value
+        val position = deferredRestorePositionMs
+            ?: player?.currentPosition?.coerceAtLeast(0L)
+            ?: _positionMs.value
+        videoHistoryRepository.saveResumePosition(video.videoId, position, duration)
+    }
+
+    /**
+     * Keep snapshot writes and clears ordered. A progress checkpoint can still
+     * be writing when the user closes the player or opens a live broadcast;
+     * independent IO launches let that older save finish after the clear and
+     * bring the supposedly removed session back.
+     */
+    private fun enqueueSessionPersistence(action: () -> Unit) {
+        val previous = sessionPersistenceJob
+        sessionPersistenceJob = viewModelScope.launch(kotlinx.coroutines.Dispatchers.IO) {
+            previous?.join()
+            action()
+        }
+    }
+
+    private fun clearVideoPlaybackSession() {
+        enqueueSessionPersistence { videoPlaybackSessionRepository.clear() }
+    }
+
+    /**
+     * The app is no longer visible (home, recents, screen off, another app on
+     * top) and is not in Picture-in-Picture.
+     *
+     * The window - and with it the PlayerView's Surface - is destroyed shortly
+     * after this point, while the player keeps decoding: WAKE_MODE_NETWORK
+     * deliberately keeps playback alive so screen-off listening works. A video
+     * decoder writing into a surface that is being torn down throws inside
+     * MediaCodecVideoRenderer, which used to surface as a permanent error
+     * overlay on return even though the format was fully supported.
+     *
+     * Disabling the video track releases the codec cleanly and leaves audio
+     * playing. [onEnterForeground] re-enables it and rendering resumes at the
+     * live position once the new surface is attached.
+     */
+    fun onEnterBackground() {
+        val player = _exoPlayer ?: return
+        // Backgrounding is the natural checkpoint for a resume snapshot: it is
+        // exactly the moment process death becomes possible, and it fires
+        // whether or not the track was already suspended, so it belongs above
+        // that guard rather than inside it.
+        saveVideoPlaybackSession()
+        saveCurrentVideoResumePosition()
+        if (isVideoSuspended || _currentVideo.value == null) return
+        isVideoSuspended = true
+        player.trackSelectionParameters = player.trackSelectionParameters.buildUpon()
+            .setTrackTypeDisabled(C.TRACK_TYPE_VIDEO, true)
+            .build()
+    }
+
+    /** The app is visible again: restore the video track suspended above. */
+    fun onEnterForeground() {
+        val player = _exoPlayer ?: return
+        if (!isVideoSuspended) return
+        isVideoSuspended = false
+        player.trackSelectionParameters = player.trackSelectionParameters.buildUpon()
+            .setTrackTypeDisabled(C.TRACK_TYPE_VIDEO, false)
+            .build()
+    }
+
+    /**
+     * Starts the position poll, replacing any run already going.
+     *
+     * Idempotent, so it is safe to call from wherever the player is (re)built.
+     * The tick is cheap even while paused: an unchanged position writes the same
+     * value to a [MutableStateFlow], which conflates it and emits nothing.
+     */
+    private fun startProgressUpdates() {
+        progressJob?.cancel()
+        progressJob = viewModelScope.launch {
+            while (isActive) {
+                _exoPlayer?.let { player ->
+                    // Fresh reads: turning the setting off or changing its rate
+                    // takes effect within a tick, without rebuilding the
+                    // player. The renderer's drop counter is how the governor
+                    // learns whether this phone keeps up; it only means
+                    // anything with the effect graph installed.
+                    val counters = if (playerHasInterpolation) {
+                        player.videoDecoderCounters?.also { it.ensureUpdated() }
+                    } else null
+                    val quality = _currentQuality.value
+                    frameInterpolation.update(
+                        enabledByUser = frameInterpolationOn(),
+                        userMaxFps = themePreferences.getFrameInterpolationMaxFps(),
+                        pipelineInstalled = playerHasInterpolation,
+                        currentVideoId = _currentVideo.value?.videoId,
+                        qualityKey = quality?.let {
+                            "${it.resolution}|${it.width}x${it.height}@${it.frameRate}|${it.dynamicRange}"
+                        },
+                        isLive = _isLive.value,
+                        isHdr = quality?.isHdr == true,
+                        speed = player.playbackParameters.speed,
+                        isPlaying = player.isPlaying,
+                        positionMs = player.currentPosition,
+                        droppedFrames = counters?.droppedBufferCount,
+                    )
+                    // A non-positive duration means "not known yet" (and is the
+                    // normal case for a live stream), so leave the last good
+                    // values alone rather than dividing by it.
+                    val duration = player.duration
+                    if (duration > 0) {
+                        val position = player.currentPosition.coerceAtLeast(0L)
+                        _durationMs.value = duration
+                        _positionMs.value = position
+                        _progress.value = (position.toFloat() / duration).coerceIn(0f, 1f)
+                        _bufferedProgress.value =
+                            (player.bufferedPosition.toFloat() / duration).coerceIn(0f, 1f)
+
+                        // Backstop for the case that never backgrounds: a
+                        // process kill while the app is in the foreground
+                        // (OOM, a crash elsewhere in the system) still gets a
+                        // recent checkpoint rather than relying solely on
+                        // onEnterBackground(). Throttled well below the poll
+                        // rate - this is a disk write, the seek bar tick is not.
+                        val now = SystemClock.elapsedRealtime()
+                        if (now - lastSessionSaveAt >= SESSION_SAVE_INTERVAL_MS) {
+                            lastSessionSaveAt = now
+                            saveVideoPlaybackSession()
+                            saveCurrentVideoResumePosition()
+                        }
+
+                        // Rides the poll that already exists rather than adding
+                        // a second timer. The cost is that a skip can land up
+                        // to one tick late; a dedicated listener would be
+                        // frame-accurate and is not worth a second loop, since
+                        // submitted segments carry padding of their own.
+                        applySponsorBlock(player, position)
+                    }
+                }
+                delay(PROGRESS_POLL_MS)
+            }
+        }
+    }
+
+    /** Zeroes the progress state, so a new video does not inherit the old position. */
+    private fun resetProgress() {
+        _positionMs.value = 0L
+        _durationMs.value = 0L
+        _progress.value = 0f
+        _bufferedProgress.value = 0f
+    }
+
+    /**
+     * Drops every trace of the previous video's segments.
+     *
+     * The ignore set has to go with them: it is keyed by submission UUID,
+     * which is unique per video, but leaving it to grow across a long queue
+     * run would hold a set nothing will ever read again.
+     */
+    private fun resetSponsorBlock() {
+        sponsorBlockJob?.cancel()
+        skipNoticeJob?.cancel()
+        _sponsorSegments.value = emptyList()
+        _manualSegment.value = null
+        _skipNotice.value = null
+        ignoredSegmentIds.clear()
+    }
+
+    /**
+     * Decides what to do about the segment under the playhead, if any.
+     *
+     * Runs on every poll tick, so it must stay cheap and must not act while
+     * the viewer is dragging the seek bar - skipping out from under a scrub
+     * fights the gesture and loses the position they were aiming for.
+     */
+    private fun applySponsorBlock(player: Player, positionMs: Long) {
+        // No scrubbing guard is needed: PlayerSeekBar commits on release, so
+        // the player's own position does not move during a drag and this can
+        // never fire mid-gesture. Seeking *into* a segment and then being
+        // skipped past it is the intended behaviour.
+        val segments = _sponsorSegments.value
+        if (segments.isEmpty()) {
+            if (_manualSegment.value != null) _manualSegment.value = null
+            return
+        }
+
+        val segment = segmentAt(segments, positionMs, ignoredSegmentIds)
+        if (segment == null) {
+            if (_manualSegment.value != null) _manualSegment.value = null
+            return
+        }
+
+        val action = themePreferences.sponsorBlockActions.value[segment.category]
+        val minDuration = themePreferences.sponsorBlockMinDurationMs.value
+        if (segment.durationMs < minDuration) {
+            if (_manualSegment.value != null) _manualSegment.value = null
+            return
+        }
+
+        when (action) {
+            SegmentAction.SKIP -> {
+                if (_manualSegment.value != null) _manualSegment.value = null
+                performSkip(player, segment, automatic = true)
+            }
+
+            SegmentAction.MANUAL -> {
+                if (_manualSegment.value?.uuid != segment.uuid) {
+                    _manualSegment.value = segment
+                }
+            }
+
+            // IGNORE, or a category this build does not know: leave it alone.
+            else -> if (_manualSegment.value != null) _manualSegment.value = null
+        }
+    }
+
+    /**
+     * Seeks past [segment] and, when the skip was automatic, offers an undo.
+     *
+     * The segment is added to the ignore set either way. Without that, a
+     * manual skip that lands the viewer a moment before the end - or an undo
+     * they then scrub back through - re-triggers on the next tick.
+     */
+    private fun performSkip(player: Player, segment: SponsorSegment, automatic: Boolean) {
+        val returnTo = player.currentPosition.coerceAtLeast(0L)
+        ignoredSegmentIds.add(segment.uuid)
+        // Exact: a keyframe-snapped skip can land back inside the segment it
+        // just left, which re-triggers on the next tick.
+        seekPlayerTo(player, segment.endMs, precise = true)
+        _positionMs.value = segment.endMs
+        _manualSegment.value = null
+
+        if (!automatic || !themePreferences.sponsorBlockNotice.value) return
+
+        skipNoticeJob?.cancel()
+        _skipNotice.value = SponsorSkipNotice(
+            segment = segment,
+            returnToMs = returnTo,
+            id = SystemClock.elapsedRealtime()
+        )
+        skipNoticeJob = viewModelScope.launch {
+            kotlinx.coroutines.delay(SKIP_NOTICE_DURATION_MS)
+            _skipNotice.value = null
+        }
+    }
+
+    /** The Manual-category button in the chrome. */
+    fun skipCurrentSegment() {
+        val segment = _manualSegment.value ?: return
+        val player = _exoPlayer ?: return
+        performSkip(player, segment, automatic = false)
+    }
+
+    /**
+     * Puts the playhead back where the skip took it from.
+     *
+     * The segment stays in the ignore set, so playing on through it does not
+     * immediately skip again - undoing a skip means the viewer wants to watch
+     * that segment, not to be asked about it twice.
+     */
+    fun undoSponsorSkip() {
+        val notice = _skipNotice.value ?: return
+        skipNoticeJob?.cancel()
+        _skipNotice.value = null
+        // Exact: an undo returns to the moment the skip took them from.
+        _exoPlayer?.let { seekPlayerTo(it, notice.returnToMs, precise = true) }
+        _positionMs.value = notice.returnToMs
+    }
+
+    fun dismissSkipNotice() {
+        skipNoticeJob?.cancel()
+        _skipNotice.value = null
+    }
+
+    /**
+     * Retry after playback failed, from the error overlay. Re-resolves the
+     * stream and rebuilds the media source at the current position; falls back
+     * to re-running the whole load when there is no player to reload into.
+     */
+    fun retryPlayback() {
+        rendererRetryCount = 0
+        sourceRetryCount = 0
+        _playbackError.value = null
+        val video = _currentVideo.value ?: return
+        if (_isLocalPlayback.value) {
+            startVideo(video, forceRestart = true)
+            return
+        }
+        if (_exoPlayer == null) {
+            // startVideo, not playVideo: retrying the video that failed is not
+            // leaving the playlist it belongs to.
+            startVideo(video, forceRestart = true)
+            return
+        }
+        // Always re-resolve rather than replaying _currentQuality: its URL is
+        // what just failed, and googlevideo URLs are short-lived, so handing
+        // the same one back to the player fails identically every time.
+        _isLoading.value = true
+        sourceRecoveryJob?.cancel()
+        sourceRecoveryJob = viewModelScope.launch {
+            if (!reresolveAndReload(video)) {
+                _playbackError.value = Exception("Unable to load video stream")
+                _isLoading.value = false
+            }
+        }
+    }
+
+    /**
+     * Rescue a source failure without bothering the user: mint a fresh
+     * visitorData when googlevideo refused us outright (403 means the token or
+     * the request's client signature was rejected at the media layer - stream
+     * resolution itself answered 200 and never sees this), then re-resolve and
+     * reload. Falls back to surfacing [original] so the error overlay and its
+     * Retry button still appear when recovery cannot help.
+     */
+    private fun recoverFromSourceError(original: PlaybackException) {
+        val video = _currentVideo.value
+        if (video == null) {
+            _playbackError.value = original
+            _isBuffering.value = false
+            return
+        }
+        // _isLoading, not _isBuffering: a fatal error drives the player to
+        // STATE_IDLE, whose onPlaybackStateChanged sets _isBuffering back to
+        // false and would leave the re-resolve showing a frozen frame with no
+        // spinner. Nothing else writes _isLoading, and "resolving a stream" is
+        // exactly what it already means during the initial load.
+        _isLoading.value = true
+        sourceRecoveryJob?.cancel()
+        sourceRecoveryJob = viewModelScope.launch {
+            if (httpResponseCode(original) == 403) {
+                youtubeRepository.refreshVisitorDataAfterPlaybackFailure(
+                    com.sentup.android.data.httpFailureUrl(original),
+                )
+            }
+            if (!reresolveAndReload(video)) {
+                _playbackError.value = original
+                _isLoading.value = false
+            }
+        }
+    }
+
+    /**
+     * Re-resolve [video]'s stream URLs and rebuild the media source, keeping
+     * the quality the user was watching when it is still on offer.
+     *
+     * @param playWhenReady whether the rebuilt source should play.
+     * @param seekToMs explicit target position. Null means "wherever the
+     * player is now".
+     *
+     * Returns false when resolution yielded nothing usable, so the caller can
+     * surface an error; true also covers "the user moved on mid-flight", where
+     * there is nothing left to recover.
+     */
+    private suspend fun reresolveAndReload(
+        video: VideoItem,
+        playWhenReady: Boolean = true,
+        seekToMs: Long? = null
+    ): Boolean {
+        if (_exoPlayer == null) return false
+        youtubeRepository.invalidateVideoStreamResult(video.videoId)
+        val streamResult = try {
+            resolvePlayableStreamResult(video.videoId)
+        } catch (e: kotlinx.coroutines.CancellationException) {
+            // playVideo() cancels this job when the user moves on. Swallowing
+            // that would let a dead recovery keep writing loading/error state
+            // over the video that replaced it.
+            throw e
+        } catch (e: Exception) {
+            KLog.w("VideoPlayerVM", "Re-resolve failed for ${video.videoId}", e)
+            VideoStreamResult(emptyList())
+        }
+        val qualities = streamResult.qualities
+        if (_currentVideo.value?.videoId != video.videoId) {
+            _isLoading.value = false
+            return true
+        }
+        if (qualities.isEmpty()) return false
+
+        _availableQualities.value = qualities
+        // The re-signed URLs replace the old ones; a chosen dub is kept by id,
+        // so a recovery from an expired URL does not drop the viewer back to
+        // the original language.
+        applyYouTubeAudioTracks(streamResult.audioTracks)
+        val previousLabel = _currentQuality.value?.resolution
+        val chosen = localVideoQualityOptions(qualities)
+            .firstOrNull { it.resolution == previousLabel }
+            ?: pickDefaultQuality(qualities)
+
+        val player = _exoPlayer ?: return false
+        val position = seekToMs ?: player.currentPosition
+
+        // Remove any existing quality change listener to prevent leaks
+        qualityChangeListener?.let { player.removeListener(it) }
+
+        loadQuality(chosen)
+
+        // Wait for player to be ready before seeking to preserved position
+        val listener = object : Player.Listener {
+            override fun onPlaybackStateChanged(playbackState: Int) {
+                if (playbackState == Player.STATE_READY) {
+                    seekPlayerTo(player, position.coerceAtLeast(0L), precise = true)
+                    if (playWhenReady) player.play()
+                    player.removeListener(this)
+                    qualityChangeListener = null
+                }
+            }
+        }
+        qualityChangeListener = listener
+        player.addListener(listener)
+
+        _playbackError.value = null
+        _isLoading.value = false
+        return true
+    }
+
+    /**
+     * Source-level failures - dead URL, 403, malformed container - are worth
+     * re-resolving for. Renderer failures are not: [isTransientRendererError]
+     * already re-prepares those in place, and this runs after it.
+     */
+    private fun isRecoverableSourceError(error: PlaybackException): Boolean {
+        if (error is ExoPlaybackException && error.type == ExoPlaybackException.TYPE_SOURCE) {
+            return true
+        }
+        return error.errorCode == PlaybackException.ERROR_CODE_IO_BAD_HTTP_STATUS
+    }
+
+    private fun networkPlaybackAllowed(): Boolean {
+        if (ThemePreferences.isLocalOnly(context)) return false
+        val connectivity = context.getSystemService(Context.CONNECTIVITY_SERVICE)
+            as? android.net.ConnectivityManager ?: return false
+        val capabilities = connectivity.getNetworkCapabilities(connectivity.activeNetwork)
+            ?: return false
+        return capabilities.hasCapability(android.net.NetworkCapabilities.NET_CAPABILITY_INTERNET) &&
+            capabilities.hasCapability(android.net.NetworkCapabilities.NET_CAPABILITY_VALIDATED)
+    }
+
+    /** HTTP status behind a source error, or null when it was not an HTTP failure. */
+    private fun httpResponseCode(error: PlaybackException): Int? {
+        var cause: Throwable? = error.cause
+        while (cause != null) {
+            if (cause is HttpDataSource.InvalidResponseCodeException) return cause.responseCode
+            cause = cause.cause
+        }
+        return null
+    }
+
+    /**
+     * Renderer-level failures (surface torn down, codec reclaimed by another
+     * app, transient decode error) are worth re-preparing for. Source-level
+     * failures - dead URL, unsupported format - are not, and must reach the UI.
+     */
+    private fun isTransientRendererError(error: PlaybackException): Boolean {
+        if (error is ExoPlaybackException && error.type == ExoPlaybackException.TYPE_RENDERER) {
+            return true
+        }
+        return when (error.errorCode) {
+            PlaybackException.ERROR_CODE_DECODER_INIT_FAILED,
+            PlaybackException.ERROR_CODE_DECODER_QUERY_FAILED,
+            PlaybackException.ERROR_CODE_DECODING_FAILED -> true
+            else -> false
+        }
+    }
+
+    fun setAutoplayEnabled(enabled: Boolean) {
+        _isAutoplayEnabled.value = enabled
+        themePreferences.setVideoAutoplayEnabled(enabled)
+        if (!enabled) setLooping(false)
+    }
+
+    fun toggleLooping() {
+        val enableLoop = !_isLooping.value
+        // A direct tap on Loop should work, not bounce against a disabled
+        // master setting. It opts back into end-of-video behavior explicitly.
+        if (enableLoop && !_isAutoplayEnabled.value) {
+            setAutoplayEnabled(true)
+        }
+        setLooping(enableLoop)
+    }
+
+    private fun setLooping(enabled: Boolean) {
+        _isLooping.value = enabled
+        _exoPlayer?.repeatMode = if (enabled) Player.REPEAT_MODE_ONE else Player.REPEAT_MODE_OFF
+        themePreferences.setVideoRepeatEnabled(enabled)
+    }
+
+    /**
+     * Set the playback speed for the current video and remember it for the next one.
+     *
+     * [persist] is false for one frame of a slider drag: the rate still applies,
+     * because it is judged by watching, but only the value the finger lifts on
+     * is written.
+     */
+    fun setPlaybackSpeed(speed: Float, persist: Boolean = true) {
+        val bounded = speed.coerceIn(0.25f, ThemePreferences.MAX_PLAYBACK_SPEED)
+        _playbackSpeed.value = bounded
+        _exoPlayer?.setPlaybackSpeed(bounded)
+        if (!persist) return
+        // A live broadcast always plays at 1x: a manual change there is a
+        // momentary adjustment, not the rate the next VOD should reopen at.
+        if (_isLive.value || _currentVideo.value?.isLive == true) return
+        themePreferences.setVideoPlaybackSpeed(bounded)
+    }
+
+    /** Jump to a chapter's start position. */
+    fun seekToChapter(chapter: com.sentup.android.data.VideoChapter) {
+        _exoPlayer?.let { seekPlayerTo(it, chapter.startMs, precise = true) }
+    }
+
+    /**
+     * Play a video on its own, leaving whatever playlist was being watched.
+     *
+     * Every entry point that is not the queue itself comes through here - a
+     * related video, a channel row, a search result, a shared link - and each
+     * of them means "I am done with that playlist", so the queue is dropped.
+     * Keeping it would leave the "Playing from" card and the next/previous
+     * buttons pointing at a list the user has walked away from.
+     *
+     * @param forceRestart reload even when this video is already current, for
+     * the retry path - tapping the same video otherwise only re-expands.
+     */
+    /**
+     * Play [video] from [startPositionMs] - the entry point for taking
+     * playback over from the music pipeline ("Watch as video"), rather than
+     * opening a video from a feed.
+     *
+     * `forceRestart` is set because the handover is the point: without it, a
+     * video id that happens to be current already would be expanded at
+     * whatever position it held instead of at the one being handed over.
+     * An explicit position also beats the history checkpoint inside
+     * [startVideo] and raises no "resumed from" notice, which is right here -
+     * the listener did not come back to this video, they were already inside
+     * it.
+     */
+    /**
+     * [playVideoAt] for a handover that brings its list along: the music
+     * queue moving to video mode. [queue]'s current video starts at
+     * [startPositionMs] and the rest play after it as an ordinary queue.
+     */
+    fun playQueueAt(queue: com.sentup.android.data.VideoQueue, startPositionMs: Long) {
+        val target = queue.current ?: return
+        if (queue.videos.size < 2) {
+            playVideoAt(target, startPositionMs)
+            return
+        }
+        leaveLocalPlayback()
+        _queue.value = queue.at(queue.index)
+        lastQueueRemoval = null
+        queueErrorSkipCount = 0
+        startVideo(
+            target,
+            forceRestart = true,
+            resumePositionMs = startPositionMs.coerceAtLeast(0L),
+        )
+    }
+
+    fun playVideoAt(video: VideoItem, startPositionMs: Long) {
+        if (LocalVideo.isDeviceVideoId(video.videoId)) {
+            playDeviceVideoItem(video)
+            return
+        }
+        leaveLocalPlayback()
+        _queue.value = null
+        lastQueueRemoval = null
+        startVideo(
+            video,
+            forceRestart = true,
+            resumePositionMs = startPositionMs.coerceAtLeast(0L),
+        )
+    }
+
+    /**
+     * @param expand false keeps a collapsed player collapsed - the mini bar's
+     * sideways skip, which changes the video inside the bar and must not
+     * throw the viewer into the watch page.
+     */
+    fun playVideo(video: VideoItem, forceRestart: Boolean = false, expand: Boolean = true) {
+        // A device video reaching the ordinary entry point is a watch-history
+        // row being replayed: history stores VideoItems and nothing else, so a
+        // file on this phone comes back through the same door a YouTube video
+        // does. Routed here rather than at the surfaces that open a video,
+        // because there are several of them and every one would have to
+        // remember - the same reason addVideoToPlaylist owns its own routing.
+        if (LocalVideo.isDeviceVideoId(video.videoId)) {
+            playDeviceVideoItem(video)
+            return
+        }
+        leaveLocalPlayback()
+        _queue.value = null
+        // The queue this belonged to is gone, so restoring into the next one
+        // would drop a video into a list it was never part of.
+        lastQueueRemoval = null
+        startVideo(video, forceRestart, expand = expand)
+    }
+
+    /**
+     * Start watching [queue] at the position it carries.
+     *
+     * The one way a queue is established. Opening the video that is already
+     * playing does not restart it - coming to a playlist that contains what is
+     * on screen should attach the playlist, not throw away the position.
+     */
+    fun playQueue(queue: com.sentup.android.data.VideoQueue) {
+        if (queue.videos.isEmpty()) return
+        leaveLocalPlayback()
+        val normalized = queue.at(queue.index)
+        _queue.value = normalized
+        lastQueueRemoval = null
+        // A new playlist gets the full skip budget: whatever was wrong with the
+        // last one has nothing to say about this one.
+        queueErrorSkipCount = 0
+        val target = normalized.current ?: return
+        if (_currentVideo.value?.videoId == target.videoId) {
+            _isExpanded.value = true
+            playFromExternal()
+            return
+        }
+        startVideo(target)
+    }
+
+    /**
+     * Play completed downloads through Sentüp's normal video surface. The queue
+     * is a snapshot, matching online playlist playback, and every source stays
+     * a content/file URI so advancing never performs network resolution.
+     */
+    fun playDownloadedVideos(videos: List<DownloadedVideo>, selected: DownloadedVideo) {
+        val index = videos.indexOfFirst { it.id == selected.id }
+        if (index < 0) return
+        startLocalQueue(
+            items = videos.map { it.toVideoItem() },
+            sources = videos.associate { download ->
+                download.id to LocalPlaybackSource(
+                    uri = download.uri,
+                    label = download.quality?.let { "$it • Offline" } ?: "Offline",
+                )
+            },
+            index = index,
+            title = "Downloads",
+        )
+    }
+
+    /**
+     * Play the device's own video files through Sentüp's video player.
+     *
+     * The whole list becomes the queue, matching how a playlist behaves and how
+     * downloads already behave: opening the third clip in a folder and having
+     * playback stop at the end of it is not what tapping into a folder means.
+     *
+     * Track selection is allowed here and not for downloads, because a
+     * downloaded file is one video and one audio rendition that Sentüp muxed
+     * itself - there is nothing to choose between - while a file from the
+     * gallery can carry any number of audio and subtitle tracks.
+     */
+    fun playDeviceVideos(videos: List<LocalVideo>, selected: LocalVideo) {
+        val index = videos.indexOfFirst { it.id == selected.id }
+        if (index < 0) return
+        startLocalQueue(
+            items = videos.map { it.toVideoItem() },
+            sources = videos.associate { video ->
+                video.playbackId to LocalPlaybackSource(
+                    uri = video.uri,
+                    // Stands in only until the container has been read; the
+                    // real label, HDR included, replaces it on the first
+                    // onTracksChanged.
+                    label = video.resolutionLabel ?: "On this device",
+                    allowsTrackSelection = true,
+                    aspectRatio = video.aspectRatio,
+                )
+            },
+            index = index,
+            title = selected.folderName,
+        )
+    }
+
+    /**
+     * Replay one device file addressed only by its playback id.
+     *
+     * The URI is rebuilt from the id rather than carried on the item, because
+     * the item may have come out of watch history, where nothing but a
+     * [VideoItem] was ever stored. A row whose file has since been deleted or
+     * moved fails at prepare and lands on the player's ordinary error overlay,
+     * which is the honest answer - there is no way to know it is gone without
+     * asking the provider, and asking costs a query on every tap.
+     */
+    private fun playDeviceVideoItem(video: VideoItem) {
+        val uri = LocalVideo.uriFor(video.videoId) ?: return
+        startLocalQueue(
+            items = listOf(video),
+            sources = mapOf(
+                video.videoId to LocalPlaybackSource(
+                    uri = uri,
+                    // Replaced by the real label, HDR included, on the first
+                    // onTracksChanged - the same placeholder the folder path uses.
+                    label = "On this device",
+                    allowsTrackSelection = true,
+                )
+            ),
+            index = 0,
+            title = video.channelName,
+        )
+    }
+
+    /**
+     * Play a video file handed to Sentüp from outside - an "open with", or a
+     * video shared into the app.
+     *
+     * A URI that resolves back to a MediaStore row is treated as an ordinary
+     * device video, id and all, so it lands in history and can be replayed
+     * later. Anything else plays under a one-off id: the read grant came with
+     * the intent and dies with the task, so remembering it would leave a row
+     * that can never be opened again.
+     */
+    fun playExternalVideo(uri: android.net.Uri, displayTitle: String?) {
+        val externalSourceLabel = context.getString(com.sentup.android.R.string.dv_opened_externally)
+        // A URI with no MediaStore row gets an id that is deliberately NOT a
+        // device id, so nothing downstream tries to rebuild a file address from
+        // it and history leaves it out (see recordLocalWatch).
+        val id = LocalVideo.playbackIdFor(uri) ?: "external:${uri.hashCode()}"
+        val title = displayTitle?.takeIf { it.isNotBlank() }
+            ?: uri.lastPathSegment?.substringAfterLast('/')?.takeIf { it.isNotBlank() }
+            ?: "Video"
+        startLocalQueue(
+            items = listOf(
+                VideoItem(
+                    videoId = id,
+                    title = title,
+                    channelName = externalSourceLabel,
+                    thumbnailUrl = null,
+                    duration = 0L,
+                    viewCount = "",
+                )
+            ),
+            sources = mapOf(
+                id to LocalPlaybackSource(
+                    uri = uri,
+                    label = "On this device",
+                    allowsTrackSelection = true,
+                )
+            ),
+            index = 0,
+            title = externalSourceLabel,
+        )
+    }
+
+    private fun startLocalQueue(
+        items: List<VideoItem>,
+        sources: Map<String, LocalPlaybackSource>,
+        index: Int,
+        title: String,
+    ) {
+        val target = items.getOrNull(index) ?: return
+        localSourcesById = sources
+        _isLocalPlayback.value = true
+        _queue.value = com.sentup.android.data.VideoQueue(
+            videos = items,
+            index = index,
+            title = title,
+        )
+        lastQueueRemoval = null
+        queueErrorSkipCount = 0
+        startVideo(target, forceRestart = true)
+    }
+
+    private fun leaveLocalPlayback() {
+        _isLocalPlayback.value = false
+        localSourcesById = emptyMap()
+        clearSelectableTracks()
+    }
+
+    private fun DownloadedVideo.toVideoItem() = VideoItem(
+        videoId = id,
+        title = title,
+        channelName = channelName,
+        thumbnailUrl = thumbnailUrl,
+        duration = durationMs / 1000L,
+        viewCount = ""
+    )
+
+    // ---------------- Tracks the media itself carries ----------------
+
+    /**
+     * Rebuild the audio and subtitle menus from what the player can actually
+     * see, and - for a device file - correct the quality row to the real
+     * resolution and dynamic range.
+     *
+     * Driven by onTracksChanged rather than read on demand because the track
+     * list is not known until the extractor has read the container, which is
+     * after playback has been asked for. Reading it when the menu opens would
+     * be a race with however fast the user was.
+     */
+    private fun publishSelectableTracks(tracks: Tracks) {
+        if (_isLive.value) publishLiveQualityLadder(tracks)
+        val local = localSourcesById[_currentVideo.value?.videoId]
+        if (local?.allowsTrackSelection != true) {
+            // A YouTube source is one audio file chosen by the resolver, so its
+            // Tracks never hold a choice; its menu comes from the resolver's
+            // list instead. Leaving a previous file's menus standing would
+            // offer overrides against a Tracks snapshot that no longer exists.
+            _embeddedTextTracks.value = emptyList()
+            _embeddedCueText.value = null
+            publishYouTubeAudioTracks()
+            return
+        }
+
+        val audio = mutableListOf<PlayerTrackOption>()
+        val text = mutableListOf<PlayerTrackOption>()
+        tracks.groups.forEachIndexed { groupIndex, group ->
+            for (trackIndex in 0 until group.length) {
+                // A track the device cannot decode is not an option: offering
+                // a DTS row on a phone with no DTS decoder produces silence and
+                // no explanation.
+                if (!group.isTrackSupported(trackIndex)) continue
+                val format = group.getTrackFormat(trackIndex)
+                val id = "$groupIndex:$trackIndex"
+                val selected = group.isTrackSelected(trackIndex)
+                when (group.type) {
+                    C.TRACK_TYPE_AUDIO -> audio += PlayerTrackOption(
+                        id = id,
+                        label = audioTrackLabel(
+                            trackTitle = format.label,
+                            language = format.language,
+                            index = audio.size,
+                            isDefault = format.selectionFlags and C.SELECTION_FLAG_DEFAULT != 0,
+                        ),
+                        detail = audioTrackDetail(
+                            codec = format.sampleMimeType,
+                            channelCount = format.channelCount,
+                            bitrate = format.bitrate,
+                        ),
+                        language = format.language,
+                        isSelected = selected,
+                    )
+
+                    C.TRACK_TYPE_TEXT -> text += PlayerTrackOption(
+                        id = id,
+                        label = textTrackLabel(
+                            trackTitle = format.label,
+                            language = format.language,
+                            index = text.size,
+                            isForced = format.selectionFlags and C.SELECTION_FLAG_FORCED != 0,
+                            isHearingImpaired =
+                                format.roleFlags and C.ROLE_FLAG_DESCRIBES_MUSIC_AND_SOUND != 0,
+                        ),
+                        language = format.language,
+                        isSelected = selected,
+                    )
+
+                    C.TRACK_TYPE_VIDEO -> if (selected) applyLocalVideoFormat(format)
+                }
+            }
+        }
+
+        // One audio track is not a choice, and a row offering it would only
+        // ever be tapped to discover that.
+        _audioTracks.value = if (audio.size > 1) audio else emptyList()
+        _embeddedTextTracks.value = text
+        if (text.none { it.isSelected }) _embeddedCueText.value = null
+    }
+
+    /**
+     * Replace a live stream's quality menu with the rungs its master playlist
+     * actually declares. See [liveVideoQualityLadder] for why the resolver's
+     * list cannot be trusted to carry them.
+     *
+     * The first time a real ladder appears over a bare "Auto" entry, the
+     * default-quality setting gets the say it could not have at load time;
+     * after that the viewer's pick is carried across by label, because a
+     * playlist reload can republish tracks mid-broadcast.
+     */
+    private fun publishLiveQualityLadder(tracks: Tracks) {
+        val current = _currentQuality.value?.takeIf { it.isLive } ?: return
+        val renditions = tracks.groups
+            .filter { it.type == C.TRACK_TYPE_VIDEO }
+            .flatMap { group ->
+                (0 until group.length)
+                    .filter(group::isTrackSupported)
+                    .map { group.getTrackFormat(it) }
+                    .map { LiveRendition(it.width, it.height, it.frameRate) }
+            }
+        val ladder = liveVideoQualityLadder(current, renditions).cappedAtHeight(deviceQualityCap)
+        if (ladder.size < 2) return
+        val previous = _availableQualities.value
+        if (previous.map { it.resolution to it.width } == ladder.map { it.resolution to it.width }) return
+
+        val hadLadder = previous.count { it.isLive } > 1
+        _availableQualities.value = ladder
+        val next = if (!hadLadder && current.resolution.firstOrNull()?.isDigit() != true) {
+            pickDefaultQuality(ladder)
+        } else {
+            ladder.firstOrNull { it.resolution == current.resolution } ?: ladder.first()
+        }
+        _currentQuality.value = next
+        applyLiveQualityCap(next)
+    }
+
+    private fun clearSelectableTracks() {
+        _audioTracks.value = emptyList()
+        _embeddedTextTracks.value = emptyList()
+        _embeddedCueText.value = null
+    }
+
+    /**
+     * Name a device file's quality row after what is really playing.
+     *
+     * MediaStore records dimensions inconsistently and says nothing about
+     * dynamic range, so a 4K Dolby Vision recording and a 4K SDR one are
+     * indistinguishable until the decoder reports the track's color info. This
+     * is also what makes the HDR badge honest: it reflects the transfer
+     * function in the file rather than a filename or a guess.
+     */
+    private fun applyLocalVideoFormat(format: androidx.media3.common.Format) {
+        val existing = _currentQuality.value
+        val range = when {
+            format.sampleMimeType == MimeTypes.VIDEO_DOLBY_VISION -> VideoDynamicRange.DOLBY_VISION
+            else -> when (format.colorInfo?.colorTransfer) {
+                C.COLOR_TRANSFER_ST2084 -> VideoDynamicRange.HDR10
+                C.COLOR_TRANSFER_HLG -> VideoDynamicRange.HLG
+                else -> VideoDynamicRange.SDR
+            }
+        }
+        val quality = VideoQuality(
+            resolution = localVideoQualityLabel(
+                height = format.height.takeIf { it > 0 } ?: 0,
+                frameRate = format.frameRate.takeIf { it > 0f } ?: 0f,
+            ),
+            url = existing?.url.orEmpty(),
+            format = format.containerMimeType ?: existing?.format,
+            codec = format.sampleMimeType,
+            dynamicRange = range,
+            width = format.width.coerceAtLeast(0),
+            height = format.height.coerceAtLeast(0),
+            frameRate = format.frameRate.takeIf { it > 0f }?.let(Math::round) ?: 0,
+            sourceAspectRatio = if (format.width > 0 && format.height > 0) {
+                format.width.toFloat() / format.height
+            } else null,
+        )
+        _currentQuality.value = quality
+        _availableQualities.value = listOf(quality)
+    }
+
+    /**
+     * Switch to one of [audioTracks].
+     *
+     * The override is resolved against the player's live Tracks rather than a
+     * remembered group, because a track list belongs to the media item that
+     * produced it and this menu can outlive a queue advance by a frame.
+     */
+    fun setAudioTrack(option: PlayerTrackOption) {
+        if (option.id.startsWith(YOUTUBE_AUDIO_OPTION_PREFIX)) {
+            selectYouTubeAudioTrack(option.id.removePrefix(YOUTUBE_AUDIO_OPTION_PREFIX))
+            return
+        }
+        applyTrackOverride(option, C.TRACK_TYPE_AUDIO)
+    }
+
+    // ---------------- YouTube soundtracks (dubs) ----------------
+
+    /**
+     * Take a freshly resolved soundtrack list for the current video, keeping
+     * the viewer's pick when the new list still has it, and redraw the menu.
+     */
+    private fun applyYouTubeAudioTracks(tracks: List<YouTubeAudioTrack>) {
+        youtubeAudioTracks = tracks
+        if (tracks.none { it.id == selectedAudioTrackId }) selectedAudioTrackId = null
+        publishYouTubeAudioTracks()
+    }
+
+    private fun clearYouTubeAudioTracks() {
+        youtubeAudioTracks = emptyList()
+        selectedAudioTrackId = null
+    }
+
+    /** The dub to play in place of the original, or null for the original. */
+    private fun selectedDub(): YouTubeAudioTrack? =
+        selectedAudioTrackId
+            ?.let { id -> youtubeAudioTracks.firstOrNull { it.id == id } }
+            ?.takeUnless { it.isOriginal }
+
+    /**
+     * Only a split pair has an audio half to swap, so a muxed, manifest, live
+     * or device source shows no YouTube menu even if a list is held.
+     */
+    private fun youtubeAudioSwitchable(): Boolean {
+        val quality = _currentQuality.value ?: return false
+        return youtubeAudioTracks.size > 1 && !_isLocalPlayback.value && !_isLive.value &&
+            !quality.isLive && !quality.isDASH && quality.audioUrl != null
+    }
+
+    private fun publishYouTubeAudioTracks() {
+        if (!youtubeAudioSwitchable()) {
+            _audioTracks.value = emptyList()
+            return
+        }
+        val selected = selectedDub()
+        _audioTracks.value = youtubeAudioTracks.map { track ->
+            PlayerTrackOption(
+                id = YOUTUBE_AUDIO_OPTION_PREFIX + track.id,
+                label = track.displayName,
+                detail = when (track.kind) {
+                    // YouTube's name for the original already says "original".
+                    YouTubeAudioTrackKind.ORIGINAL -> null
+                    YouTubeAudioTrackKind.DUBBED -> context.getString(R.string.vpc_audio_track_dubbed)
+                    YouTubeAudioTrackKind.AUTO_DUBBED -> context.getString(R.string.vpc_audio_track_auto_dubbed)
+                    YouTubeAudioTrackKind.DESCRIPTIVE -> context.getString(R.string.vpc_audio_track_descriptive)
+                    YouTubeAudioTrackKind.SECONDARY,
+                    YouTubeAudioTrackKind.UNKNOWN -> null
+                },
+                language = track.languageTag,
+                isSelected = if (selected == null) track.isOriginal else track.id == selected.id,
+            )
+        }.let { options ->
+            // A list whose original YouTube left untagged still needs one row
+            // marked while the original plays: the first, which is the default.
+            if (selected == null && options.none { it.isSelected }) {
+                options.mapIndexed { index, option -> option.copy(isSelected = index == 0) }
+            } else {
+                options
+            }
+        }
+    }
+
+    /**
+     * Switch the current video's soundtrack mid-playback.
+     *
+     * The same route as a quality change - rebuild the source, seek back to
+     * the position on READY, play/pause state untouched - so everything that
+     * already copes with a quality switch (the minimize transition, PiP,
+     * SponsorBlock, the watch tracker) copes with this. The video half is
+     * rebuilt too, but its bytes are in the playback cache under a key that
+     * does not change, so only the new audio is fetched.
+     */
+    private fun selectYouTubeAudioTrack(trackId: String) {
+        val track = youtubeAudioTracks.firstOrNull { it.id == trackId } ?: return
+        if (!youtubeAudioSwitchable()) return
+        val newSelection = track.id.takeUnless { track.isOriginal }
+        if (newSelection == selectedAudioTrackId) return
+        val quality = _currentQuality.value ?: return
+        selectedAudioTrackId = newSelection
+        publishYouTubeAudioTracks()
+        reloadPreservingPosition(quality)
+    }
+
+    /**
+     * Show one of [embeddedTextTracks], or pass null to turn subtitles off.
+     *
+     * Disabling the whole track type rather than clearing the override: with
+     * only an override removed, the selector is free to re-pick a track flagged
+     * default in the container, so subtitles the user just switched off would
+     * come straight back.
+     */
+    fun setEmbeddedTextTrack(option: PlayerTrackOption?) {
+        val player = _exoPlayer ?: return
+        themePreferences.setCaptionsEnabled(option != null)
+        if (option == null) {
+            player.trackSelectionParameters = player.trackSelectionParameters.buildUpon()
+                .clearOverridesOfType(C.TRACK_TYPE_TEXT)
+                .setTrackTypeDisabled(C.TRACK_TYPE_TEXT, true)
+                .build()
+            _embeddedCueText.value = null
+            _embeddedTextTracks.value = _embeddedTextTracks.value.map { it.copy(isSelected = false) }
+            return
+        }
+        themePreferences.setCaptionLanguageCode(option.language)
+        applyTrackOverride(option, C.TRACK_TYPE_TEXT)
+    }
+
+    /**
+     * The subtitle state a device file opens in.
+     *
+     * Off unless captions were left on, which is the same rule the YouTube path
+     * follows. Disabling the track type is what makes "off" stick: a container
+     * routinely flags one subtitle track as default, and the selector would
+     * honour that flag and put subtitles on screen for a file the user opened
+     * with captions switched off.
+     */
+    private fun applyEmbeddedTextDefault() {
+        val player = _exoPlayer ?: return
+        val wantCaptions = themePreferences.isCaptionsEnabled()
+        player.trackSelectionParameters = player.trackSelectionParameters.buildUpon()
+            .clearOverridesOfType(C.TRACK_TYPE_TEXT)
+            .setTrackTypeDisabled(C.TRACK_TYPE_TEXT, !wantCaptions)
+            .apply {
+                // Carries the language across files rather than across formats:
+                // with captions on, a folder of dual-language rips keeps
+                // landing on the same language instead of on whichever track
+                // each file happens to list first.
+                if (wantCaptions) {
+                    themePreferences.getCaptionLanguageCode()
+                        ?.takeIf { it.isNotBlank() }
+                        ?.let { setPreferredTextLanguage(it) }
+                }
+            }
+            .build()
+    }
+
+    private fun applyTrackOverride(option: PlayerTrackOption, trackType: Int) {
+        val player = _exoPlayer ?: return
+        val groupIndex = option.id.substringBefore(':').toIntOrNull() ?: return
+        val trackIndex = option.id.substringAfter(':').toIntOrNull() ?: return
+        val group = player.currentTracks.groups.getOrNull(groupIndex) ?: return
+        if (group.type != trackType || trackIndex >= group.length) return
+
+        player.trackSelectionParameters = player.trackSelectionParameters.buildUpon()
+            .setTrackTypeDisabled(trackType, false)
+            .setOverrideForType(TrackSelectionOverride(group.mediaTrackGroup, trackIndex))
+            .build()
+        // onTracksChanged republishes the menus with the new selection, but not
+        // before the sheet has already redrawn from this tap.
+        val mark = { options: List<PlayerTrackOption> ->
+            options.map { it.copy(isSelected = it.id == option.id) }
+        }
+        if (trackType == C.TRACK_TYPE_AUDIO) {
+            _audioTracks.value = mark(_audioTracks.value)
+        } else {
+            _embeddedTextTracks.value = mark(_embeddedTextTracks.value)
+        }
+    }
+
+    /**
+     * Jump to a position in the active queue.
+     *
+     * Always a forced restart: a playlist can list the same video twice, the
+     * index is what addresses the queue, and [startVideo]'s id check would
+     * otherwise swallow the jump and leave the queue pointing somewhere the
+     * player is not.
+     */
+    fun playQueueIndex(index: Int, expand: Boolean = true) {
+        val active = _queue.value ?: return
+        val target = active.videos.getOrNull(index) ?: return
+        _queue.value = active.copy(index = index)
+        startVideo(target, forceRestart = true, expand = expand)
+    }
+
+    // ---------------- Editing the queue ----------------
+
+    /**
+     * Reorder the queue.
+     *
+     * Nothing is asked of the player: unlike music, video mode holds one media
+     * item at a time and reads the next one out of the queue when the current
+     * one ends, so the order is only ever consulted at that moment. Moving the
+     * playing entry therefore cannot interrupt it.
+     */
+    /**
+     * Keep the playing queue as a local video playlist, the video side of
+     * music's "Save queue as playlist". [onSaved] gets the name and how many
+     * videos were kept (repeats are dropped; see createWithVideos).
+     */
+    fun saveQueueAsPlaylist(name: String, onSaved: (savedName: String, count: Int) -> Unit = { _, _ -> }) {
+        val videos = _queue.value?.videos.orEmpty()
+            .filterNot { com.sentup.android.data.LocalVideo.isDeviceVideoId(it.videoId) || it.videoId.startsWith("external:") }
+        if (videos.isEmpty()) return
+        viewModelScope.launch {
+            val saved = localVideoPlaylistsRepository.createWithVideos(name, videos) ?: return@launch
+            onSaved(name.trim(), saved.second)
+        }
+    }
+
+    fun moveQueueItem(from: Int, to: Int) {
+        val active = _queue.value ?: return
+        _queue.value = active.moved(from, to)
+    }
+
+    /**
+     * Drop an entry. Refused for the playing entry and for the last one left;
+     * see [com.sentup.android.data.VideoQueue.removedAt].
+     */
+    fun removeQueueItem(at: Int) {
+        val active = _queue.value ?: return
+        val video = active.videos.getOrNull(at) ?: return
+        val next = active.removedAt(at) ?: return
+        lastQueueRemoval = QueueRemoval(video, at)
+        _queue.value = next
+    }
+
+    /** A video just taken out of the queue, kept so the snackbar can put it back. */
+    data class QueueRemoval(val video: VideoItem, val at: Int)
+
+    private var lastQueueRemoval: QueueRemoval? = null
+
+    /** Put the last removed video back where it was. */
+    fun undoQueueRemoval() {
+        val removal = lastQueueRemoval ?: return
+        lastQueueRemoval = null
+        val active = _queue.value ?: return
+        _queue.value = active.withInserted(listOf(removal.video), removal.at)
+    }
+
+    /**
+     * Add [video] to the queue, either straight after what is playing or at the
+     * end.
+     *
+     * With no queue yet, one is started from the video already playing so the
+     * addition has something to be *after* - which is what makes this work from
+     * a feed or from search, where there is no playlist in sight. With nothing
+     * playing at all there is no "next", so it just plays.
+     */
+    fun enqueueVideo(video: VideoItem, playNext: Boolean) {
+        val active = _queue.value
+        if (active == null) {
+            val current = _currentVideo.value
+            if (current == null) {
+                playVideo(video)
+                return
+            }
+            _queue.value = com.sentup.android.data.VideoQueue.adHoc(current, listOf(video))
+            return
+        }
+        _queue.value = if (playNext) {
+            active.withPlayingNext(listOf(video))
+        } else {
+            active.withAppended(listOf(video))
+        }
+    }
+
+    /** Next video in the playlist. No-op at the end of it. */
+    fun playNextInQueue() {
+        val active = _queue.value ?: return
+        if (active.hasNext) playQueueIndex(active.index + 1)
+    }
+
+    /**
+     * Next for a surface with a single Next button and no room to explain it -
+     * the PiP window: the playlist's next video, or else the related video
+     * autoplay would pick (the filtered list, so nothing marked not interested).
+     * PiP never autoplays into a related video on its own; a tap is a request.
+     */
+    fun playNextOrRelated(expand: Boolean = true) {
+        val active = _queue.value
+        if (active != null) {
+            if (active.hasNext) playQueueIndex(active.index + 1, expand)
+            return
+        }
+        relatedVideos.value.firstOrNull()?.let { playVideo(it, expand = expand) }
+    }
+
+    /** Previous video in the playlist. No-op at the start of it. */
+    fun playPreviousInQueue(expand: Boolean = true) {
+        val active = _queue.value ?: return
+        if (active.hasPrevious) playQueueIndex(active.index - 1, expand)
+    }
+
+    /**
+     * Previous/next for the system's media controls - the notification, lock
+     * screen, headset and Bluetooth buttons. Next matches the PiP window's
+     * (the playlist's next, else the related video autoplay would pick);
+     * previous is the playlist's only. Neither changes whether the player is
+     * open or minimised: a press from the lock screen should not pop the player
+     * open behind it, and one from the shade should not collapse it.
+     */
+    private val sessionQueueControls = object : com.sentup.android.service.VideoPlaybackService.QueueControls {
+        override val canSkipNext: Boolean
+            get() = _queue.value?.hasNext ?: relatedVideos.value.isNotEmpty()
+        override val canSkipPrevious: Boolean
+            get() = _queue.value?.hasPrevious == true
+        override fun skipNext() = playNextOrRelated(expand = _isExpanded.value)
+        override fun skipPrevious() = playPreviousInQueue(expand = _isExpanded.value)
+    }
+
+    /**
+     * @param resumePositionMs set by [restoreVideoSession]: seek here once
+     * the stream is ready instead of starting from zero.
+     * @param resumePaused whether a [resumePositionMs] seek lands paused. True
+     * for the cold-process restore - the user decides when to jump back in.
+     * @param expand false for a cold-process restore, where popping straight
+     * into a fullscreen player would be a jump-scare rather than the "you left
+     * this running" cue a mini player gives, and for the mini bar's sideways
+     * skip, which changes the video inside the bar and nothing else.
+     * @param deferStreamLoad cold-restore-only path which reconstructs player
+     * chrome without resolving or preparing media until the user presses Play.
+     */
+    private fun startVideo(
+        video: VideoItem,
+        forceRestart: Boolean = false,
+        resumePositionMs: Long? = null,
+        resumePaused: Boolean = false,
+        expand: Boolean = true,
+        deferStreamLoad: Boolean = false
+    ) {
+        CacheManager.setVideoPlaybackActive(VIDEO_CACHE_OWNER, true)
+        ensureLocalPlayer()
+        if (!forceRestart && _currentVideo.value?.videoId == video.videoId) {
+            // A row tap is a play request, not only a navigation request. This
+            // matters for a cold-restored session (whose media is deliberately
+            // deferred), a paused video, and a video left at the end: merely
+            // expanding any of those produces a player that still does not
+            // play. playFromExternal handles all three without reloading a
+            // source that is already active.
+            _isExpanded.value = true
+            playFromExternal()
+            return
+        }
+        com.sentup.android.data.YouTubeRequestLedger.begin("video ${video.videoId}")
+
+        // Capture the outgoing item before any player state is reset. The
+        // explicit session restore position wins; ordinary opens use this
+        // profile's last meaningful checkpoint for that video.
+        saveCurrentVideoResumePosition()
+        watchTracker.close()
+        watchProfileId = com.sentup.android.data.ProfileManager.activeProfileId(context)
+        val checkpointMs = if (resumePositionMs == null &&
+            themePreferences.isSaveVideoHistoryEnabled() && !video.isLive &&
+            !video.videoId.startsWith("external:")
+        ) {
+            videoHistoryRepository.resumePosition(
+                video.videoId,
+                video.duration.coerceAtLeast(0L) * 1_000L,
+            )
+        } else {
+            null
+        }
+        val effectiveResumePositionMs = resumePositionMs ?: checkpointMs
+        // Only a checkpoint raises the notice. A cold session restore already
+        // announces itself by arriving paused in the mini player, and an
+        // explicit seek is something the viewer just did.
+        _resumedFromMs.value = checkpointMs?.takeIf { it > 0L }
+
+        val loadGeneration = ++videoLoadGeneration
+        streamLoadJob?.cancel()
+        watchNextJob?.cancel()
+        if (!deferStreamLoad) deferredRestorePositionMs = null
+
+        // Decide from the item, not merely from the queue that introduced it.
+        // This keeps ad-hoc online items added after an offline download from
+        // being mislabeled or having their network features suppressed.
+        val localSource = localSourcesById[video.videoId]
+        _isLocalPlayback.value = localSource != null
+
+        _currentVideo.value = video
+        if (video.isLive) {
+            // Live broadcasts have no stable resume position. Clear the VOD
+            // watched before this one so it is not resurrected if the process
+            // dies while the broadcast is open.
+            clearVideoPlaybackSession()
+        }
+        _isExpanded.value = expand
+        _isLoading.value = true
+        // Zero the progress for the new video rather than letting the previous
+        // one's position sit in the seek bar until the first poll lands.
+        resetProgress()
+        resetSponsorBlock()
+        _availableQualities.value = emptyList()
+        _currentQuality.value = null
+        _relatedVideos.value = emptyList() // Clear previous related
+        _chapters.value = emptyList() // Clear previous chapters
+        _seekPreview.value = null // Never show a frame from the previous video
+        _captionTracks.value = emptyList() // Clear previous caption tracks
+        // The previous file's audio and subtitle menus address a Tracks
+        // snapshot that is about to be replaced; leaving them up would let a
+        // tap apply an override against groups that no longer exist.
+        clearSelectableTracks()
+        // A dub is chosen per video; the next one opens on its original.
+        clearYouTubeAudioTracks()
+        _selectedCaption.value = null // Re-applied below when captions are persistently on
+        _isCaptionsLoading.value = false
+        captionsLoadedForVideoId = null
+        captionCuesJob?.cancel()
+        _captionCues.value = emptyList()
+        _playbackError.value = null // Clear previous error
+        rendererRetryCount = 0
+        sourceRetryCount = 0
+        hdrFallbackUsed = false
+        hdrQualityToRestoreAfterMini = null
+        // A recovery still in flight belongs to the previous video
+        sourceRecoveryJob?.cancel()
+        sourceRecoveryJob = null
+
+        // Reset engagement + comments state for the new video
+        _engagement.value = null
+        _dislikeCount.value = null
+        _comments.value = emptyList()
+        _replies.value = emptyMap()
+        _loadingReplyIds.value = emptySet()
+        commentsNextToken = null
+        commentsLoadedForVideoId = null
+        _createCommentParams.value = null
+        _isLoggedIn.value = youtubeRepository.isLoggedIn()
+
+        // Live state belongs to the previous video; the polls must stop before
+        // their next tick can write into the new video's chat.
+        stopLivePolling()
+        // Track selection outlives media items, so a height cap picked on a
+        // live stream would silently limit the next video too - and on a VOD,
+        // where quality is a source swap, that cap is invisible in the UI.
+        _exoPlayer?.let { player ->
+            player.trackSelectionParameters = player.trackSelectionParameters.buildUpon()
+                .clearVideoSizeConstraints()
+                .setMaxVideoFrameRate(Int.MAX_VALUE)
+                .setForceHighestSupportedBitrate(false)
+                .build()
+        }
+        _isLive.value = false
+        _liveTargetOffsetMs.value = 0L
+        _isPortraitVideo.value = false
+        // Carrying the previous video's shape over would size the watch page's
+        // box for the wrong video until the first frame of this one decodes -
+        // the same snap the parse-time read exists to avoid, just one video
+        // late. 16:9 is the right thing to show while the shape is unknown.
+        _videoAspectRatio.value = null
+        _liveViewerCount.value = null
+        _isLiveChatAvailable.value = null
+        _liveChatMessages.value = emptyList()
+        _liveChatBanner.value = null
+        _liveChatSendParams.value = null
+        _liveChatRestriction.value = null
+        _isLiveChatLoading.value = false
+        liveChatStartedForVideoId = null
+        liveChatContinuation = null
+        pendingLiveChat.clear()
+        seenLiveChatIds.clear()
+
+        // Speed carries over like YouTube: the rate the user last picked is
+        // re-applied to the next video. Live broadcasts always play at 1x
+        // without overwriting the stored VOD rate.
+        val rememberedSpeed = if (video.isLive) {
+            1f
+        } else {
+            themePreferences.getVideoPlaybackSpeed()
+        }
+        _playbackSpeed.value = rememberedSpeed
+        _exoPlayer?.setPlaybackSpeed(rememberedSpeed)
+
+        if (deferStreamLoad) {
+            val position = effectiveResumePositionMs?.coerceAtLeast(0L) ?: 0L
+            val duration = (video.duration.coerceAtLeast(0L) * 1_000L)
+            deferredRestorePositionMs = position
+            _positionMs.value = position
+            _durationMs.value = duration
+            _progress.value = if (duration > 0L) {
+                (position.toFloat() / duration).coerceIn(0f, 1f)
+            } else {
+                0f
+            }
+            _bufferedProgress.value = 0f
+            _isPlaying.value = false
+            _isBuffering.value = false
+            _isLoading.value = false
+            return
+        }
+
+        // Captions that were on for the last video stay on for this one: the
+        // track list is fetched up front rather than waiting for a CC tap.
+        // Downloads included; ensureCaptionsLoaded leaves device files alone.
+        if (themePreferences.isCaptionsEnabled()) {
+            ensureCaptionsLoaded()
+        }
+
+        // Publish to the system's media controls. Started here, from a user tap,
+        // because a foreground service may not be started from the background;
+        // repeat calls once it is up are no-ops.
+        _exoPlayer?.let {
+            com.sentup.android.service.VideoPlaybackService.start(context, it, sessionQueueControls)
+        }
+
+        if (localSource != null) {
+            watchTracker.close()
+            clearVideoPlaybackSession()
+            try {
+                _exoPlayer?.stop()
+                _exoPlayer?.clearMediaItems()
+                localSource.aspectRatio?.let { _videoAspectRatio.value = it }
+                val localQuality = VideoQuality(
+                    resolution = localSource.label,
+                    url = localSource.uri.toString(),
+                    format = "video/mp4",
+                    sourceAspectRatio = localSource.aspectRatio,
+                )
+                _availableQualities.value = listOf(localQuality)
+                _currentQuality.value = localQuality
+                _seekPreview.value = VideoSeekPreview.local(localSource.uri.toString())
+                // Subtitles start off unless the user had captions on, and a
+                // container's default-flagged track would otherwise switch them
+                // back on by itself the moment the file is read.
+                applyEmbeddedTextDefault()
+                _exoPlayer?.setMediaItem(nowPlayingMediaItem(localSource.uri.toString()))
+                _exoPlayer?.prepare()
+                if (effectiveResumePositionMs != null && effectiveResumePositionMs > 0) {
+                    _exoPlayer?.let { seekPlayerTo(it, effectiveResumePositionMs, precise = true) }
+                }
+                if (resumePaused) {
+                    _exoPlayer?.pause()
+                } else {
+                    _exoPlayer?.play()
+                }
+                _isLoading.value = false
+            } catch (e: Exception) {
+                _playbackError.value = e
+                _isLoading.value = false
+            }
+            recordLocalWatch(video)
+            return
+        }
+
+        // ========== PHASE 1: START PLAYBACK ASAP (fast) ==========
+        // Uses lightweight getVideoStreamQualities() which ONLY fetches stream URLs
+        streamLoadJob = viewModelScope.launch {
+            try {
+                if (!isCurrentVideoLoad(video.videoId, loadGeneration)) return@launch
+                _exoPlayer?.stop()
+                _exoPlayer?.clearMediaItems()
+                
+                // NewPipe's fetchPage() is blocking. A coroutine withTimeout
+                // cannot interrupt it; when extraction took 17-21 seconds it
+                // waited for valid qualities and then discarded them as timed
+                // out. The downloader's connect/read timeouts are the actual
+                // network bounds, while the generation checks below still
+                // prevent a cancelled load from touching a newer video.
+                run resolve@ {
+                    // FAST: Get stream URLs only (no metadata, no related, no channel avatar)
+                    val streamResult = resolvePlayableStreamResult(video.videoId)
+                    if (!isCurrentVideoLoad(video.videoId, loadGeneration)) return@resolve
+                    val qualities = streamResult.qualities
+                    _availableQualities.value = qualities
+                    _seekPreview.value = streamResult.seekPreview
+                    // Held now, published once a quality is loaded: the menu
+                    // depends on that quality being a split pair.
+                    youtubeAudioTracks = streamResult.audioTracks
+                    _isLive.value = qualities.any { it.isLive }
+                    if (_isLive.value) {
+                        // Some entry points do not know a broadcast is live
+                        // until its stream qualities arrive. Remove any prior
+                        // snapshot once that verdict is definitive.
+                        clearVideoPlaybackSession()
+                    }
+                    // Before the first frame: the stream dimensions are the only
+                    // shape signal there is, and both the vertical live layout
+                    // and the watch page's video box are sized from it.
+                    qualities.firstNotNullOfOrNull { it.sourceAspectRatio }?.let { ratio ->
+                        _videoAspectRatio.value = ratio
+                        if (ratio < 1f) _isPortraitVideo.value = true
+                    }
+                    if (_isLive.value) startLiveMetadataPolling(video.videoId)
+
+                    if (qualities.isNotEmpty()) {
+                        val chosen = pickDefaultQuality(qualities)
+                        if (chosen == null) {
+                            _playbackError.value =
+                                Exception("Unable to load video stream")
+                            _isLoading.value = false
+                            return@resolve
+                        }
+                        loadQuality(chosen)
+                        seekAndResumeAfterLoad(effectiveResumePositionMs, resumePaused)
+                    } else {
+                        // No second extraction here. The old "legacy stream URL"
+                        // fallback ran a whole NewPipe fetchPage (about seven
+                        // requests) again straight after the resolver above had
+                        // failed, so it failed the same way - and it could not
+                        // add anything when extraction succeeded, because every
+                        // muxed URL it picked from is already in that ladder.
+                        _playbackError.value = Exception("Unable to load video stream")
+                        _isLoading.value = false
+                    }
+                }
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                if (isCurrentVideoLoad(video.videoId, loadGeneration)) {
+                    KLog.e("VideoPlayerVM", "Initial stream load failed for ${video.videoId}", e)
+                    _playbackError.value = e
+                    _isLoading.value = false
+                }
+            }
+        }
+        
+        // ========== SPONSORBLOCK ==========
+        // Its own job rather than a step inside Phase 2: the lookup is keyed on
+        // the video id alone and needs nothing watch-next returns, so making it
+        // wait behind that response would delay skipping for no reason. It must
+        // never join Phase 1, which is stream URLs only - a third-party service
+        // being slow must not delay the first frame.
+        sponsorBlockJob = viewModelScope.launch {
+            // Fresh reads: the settings screen writes through its own
+            // ThemePreferences instance, and the user may have changed either
+            // of these since this ViewModel was built.
+            if (!themePreferences.isSponsorBlockEnabled()) return@launch
+            val actions = themePreferences.sponsorBlockActionsNow()
+            val categories = activeCategories(actions)
+            if (categories.isEmpty()) return@launch
+
+            val segments = sponsorBlockRepository.getSegments(video.videoId, categories)
+            if (!isCurrentVideoLoad(video.videoId, loadGeneration)) return@launch
+            // A live broadcast has no fixed timeline to key segments against,
+            // and _isLive is resolved in Phase 1, so by here it is known.
+            if (_isLive.value) return@launch
+            _sponsorSegments.value = segments
+        }
+
+        // ========== PHASE 2: ENGAGEMENT + METADATA + RELATED ==========
+        // One watch-next call answers all three (the old code paid for an
+        // engagement /next call AND a full NewPipe extraction here, competing
+        // with Phase 1's initial buffering for bandwidth).
+        watchNextJob = viewModelScope.launch {
+            try {
+                val watchNext = youtubeRepository.getWatchNextData(video.videoId, video)
+                // Guard against a video switch that happened mid-flight
+                if (!isCurrentVideoLoad(video.videoId, loadGeneration)) return@launch
+                _engagement.value = watchNext.engagement
+                if (themePreferences.isReturnDislikeEnabled() && video.videoId.length == 11) {
+                    launch {
+                        val count = returnDislikeRepository.getDislikes(video.videoId) ?: return@launch
+                        if (isCurrentVideoLoad(video.videoId, loadGeneration)) {
+                            _dislikeCount.value = android.icu.text.CompactDecimalFormat
+                                .getInstance(java.util.Locale.getDefault(), android.icu.text.CompactDecimalFormat.CompactStyle.SHORT)
+                                .format(count)
+                        }
+                    }
+                }
+                if (watchNext.updatedVideoItem != null) {
+                    val wasNameless = _currentVideo.value?.title.isNullOrBlank()
+                    _currentVideo.value = watchNext.updatedVideoItem
+                    // A video opened from a shared link starts out nameless -
+                    // give the lock screen and shade the real title now that
+                    // there is one. Deliberately only for that case: every other
+                    // entry point already carries a title, and touching the
+                    // media item is not worth it just to swap a thumbnail size.
+                    if (wasNameless) refreshNowPlayingMetadata()
+                }
+                if (watchNext.relatedVideos.isNotEmpty()) {
+                    _relatedVideos.value = watchNext.relatedVideos
+                }
+                _chapters.value = watchNext.chapters
+                // Opening the chat panel now costs one poll instead of a second
+                // watch-next round trip plus its parse.
+                liveChatContinuation = watchNext.liveChatContinuation
+            } catch (e: CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                // Phase 2 errors are non-critical - playback already started
+                if (isCurrentVideoLoad(video.videoId, loadGeneration)) {
+                    KLog.w("VideoPlayerVM", "Failed to load watch-next data", e)
+                }
+            }
+        }
+        
+        startWatchTracking()
+    }
+
+    private fun startWatchTracking() {
+        _exoPlayer?.let { player -> watchTracker.start(player, { _currentVideo.value }) }
+    }
+
+    private fun recordLocalWatch(video: VideoItem) {
+        if (!video.videoId.startsWith("external:")) startWatchTracking()
+    }
+
+    private fun isCurrentVideoLoad(videoId: String, generation: Long): Boolean =
+        videoLoadGeneration == generation && _currentVideo.value?.videoId == videoId
+
+    /**
+     * Seek-and-resume tail shared by every load path.
+     */
+    private fun seekAndResumeAfterLoad(resumePositionMs: Long?, resumePaused: Boolean) {
+        val player = _exoPlayer ?: run {
+            _isLoading.value = false
+            return
+        }
+        if (resumePositionMs != null && resumePositionMs > 0) {
+            seekPlayerTo(player, resumePositionMs, precise = true)
+        }
+        if (resumePaused) {
+            player.pause()
+        } else {
+            // Force play: override any previous paused state, matching the
+            // local path's behaviour on a fresh open.
+            player.play()
+        }
+        _isLoading.value = false
+    }
+
+    /**
+     * Pick the starting quality based on the Settings preference for the
+     * current network (Wi-Fi vs mobile data). Fresh pref read because Settings
+     * toggles through its own ThemePreferences instance.
+     * The list from getVideoStreamQualities() is sorted highest-first with
+     * 60fps variants before 30fps, so the first label at or below the target
+     * height is the best match; if the video has nothing at or below it, take
+     * the lowest available.
+     */
+    private fun pickDefaultQuality(qualities: List<VideoQuality>): VideoQuality {
+        fun height(label: String): Int = label.takeWhile { it.isDigit() }.toIntOrNull() ?: 0
+        // Capped before anything else, so Auto and an explicit 4K preference
+        // both land on the best rung this panel can show. Never empty, so the
+        // first()/last() picks below stay safe.
+        val baseOptions = localVideoQualityOptions(qualities).cappedAtHeight(deviceQualityCap)
+        val options = if (!_isExpanded.value) {
+            baseOptions.filterNot(VideoQuality::isHdr).ifEmpty { baseOptions }
+        } else {
+            baseOptions
+        }
+        val preferred = themePreferences.getDefaultVideoQuality()
+
+        // The live ladder leads with an "Auto" entry (height 0) that the VOD
+        // branches below would skip over, so it picks its own entry: Auto when
+        // the setting says auto, otherwise the best rendition at or below the
+        // target, falling back to Auto rather than to the lowest available.
+        if (options.firstOrNull()?.isLive == true) {
+            if (preferred == ThemePreferences.VIDEO_QUALITY_AUTO) return options.first()
+            val targetHeight = height(preferred)
+            return options.firstOrNull { height(it.resolution) in 1..targetHeight }
+                ?: options.first()
+        }
+
+        if (preferred == ThemePreferences.VIDEO_QUALITY_AUTO) {
+            return options.firstOrNull { height(it.resolution) > 0 } ?: options.first()
+        }
+        val targetHeight = height(preferred)
+        return options.firstOrNull { height(it.resolution) in 1..targetHeight }
+            ?: options.lastOrNull { height(it.resolution) > 0 }
+            ?: options.first()
+    }
+
+    /**
+     * Build the media source for [quality].
+     *
+     * Captions are not part of it. They used to be sideloaded here as a text
+     * track, which made every CC toggle a media-source rebuild: the video and
+     * audio were torn down and refetched from the network just to add or drop a
+     * subtitle. Sentüp renders cues itself instead - see [setCaptionTrack] - so
+     * this only ever deals with video and audio.
+     */
+    private fun loadQuality(quality: VideoQuality) {
+        _currentQuality.value = quality
+
+        if (quality.isLive) {
+            // The whole ladder is one manifest, so the cap has to be applied
+            // alongside preparing it - loadQuality is the only entry point that
+            // runs for the initial pick.
+            applyLiveQualityCap(quality)
+        }
+
+        if (quality.isDASH) {
+            // Adaptive manifest - hand it to the player and let its MediaSource
+            // factory build the DASH/HLS source, no merging needed.
+            _exoPlayer?.setMediaItem(
+                nowPlayingMediaItem(quality.url)
+                    .buildUpon()
+                    .setMimeType(adaptiveMimeType(quality))
+                    .build()
+            )
+        } else {
+            val dataSourceFactory = streamDataSourceFactory
+            // A chosen dub replaces only the audio half. Its URL carries its
+            // own xtags, so it caches under its own key beside the original.
+            val dub = if (quality.audioUrl != null && !_isLocalPlayback.value) selectedDub() else null
+            val audioUrl = dub?.url ?: quality.audioUrl
+            val primarySource = if (audioUrl != null) {
+                // Non-DASH with separate audio - use MergingMediaSource.
+                // adjustPeriodTimeOffsets aligns the two tracks' start offsets,
+                // preventing A/V desync when they don't begin at the same time.
+                // The merged source reports the *video* item's MediaItem, which
+                // is why the metadata rides on that one.
+                val videoSource = ProgressiveMediaSource.Factory(dataSourceFactory)
+                    .createMediaSource(
+                        cachedProgressiveMediaItem(
+                            uri = quality.url,
+                            stream = VideoPlaybackCacheStream.VIDEO,
+                            fallbackVariant = quality.cacheVariant,
+                        )
+                    )
+                val audioSource = ProgressiveMediaSource.Factory(dataSourceFactory)
+                    .createMediaSource(
+                        cachedProgressiveMediaItem(
+                            uri = audioUrl,
+                            stream = VideoPlaybackCacheStream.AUDIO,
+                            fallbackVariant = dub?.let { "audio-${it.id}" } ?: "original-audio",
+                            includeNowPlayingMetadata = false,
+                        )
+                    )
+                MergingMediaSource(true, videoSource, audioSource)
+            } else {
+                ProgressiveMediaSource.Factory(dataSourceFactory)
+                    .createMediaSource(
+                        cachedProgressiveMediaItem(
+                            uri = quality.url,
+                            stream = VideoPlaybackCacheStream.MUXED,
+                            fallbackVariant = quality.cacheVariant,
+                        )
+                    )
+            }
+
+            _exoPlayer?.setMediaSource(primarySource)
+        }
+        _exoPlayer?.prepare()
+    }
+
+    /**
+     * A [MediaItem] for [uri] carrying the current video's title, channel and
+     * thumbnail.
+     *
+     * Without this the player has no metadata at all, and the lock screen /
+     * shade / Bluetooth display that [com.sentup.android.service.VideoPlaybackService]
+     * publishes would be a blank card with transport buttons on it. The artwork
+     * URI is loaded by Media3's own bitmap loader, so no bitmap work happens
+     * here.
+     */
+    private fun nowPlayingMediaItem(uri: String): MediaItem {
+        val video = _currentVideo.value
+        val builder = MediaItem.Builder().setUri(uri)
+        if (video != null) {
+            builder.setMediaId(video.videoId)
+            builder.setMediaMetadata(
+                androidx.media3.common.MediaMetadata.Builder()
+                    .setTitle(video.title.takeIf { it.isNotBlank() })
+                    .setArtist(video.channelName.takeIf { it.isNotBlank() })
+                    .setArtworkUri(video.thumbnailUrl?.let { android.net.Uri.parse(it) })
+                    .setIsBrowsable(false)
+                    .setIsPlayable(true)
+                    .build()
+            )
+        }
+        return builder.build()
+    }
+
+    /**
+     * Progressive item whose cache identity survives googlevideo URL refreshes.
+     *
+     * Split video/audio sources must never share one key: their byte offsets
+     * describe different files. The rendition's itag normally distinguishes
+     * qualities; [fallbackVariant] covers the rare provider URL without one.
+     */
+    private fun cachedProgressiveMediaItem(
+        uri: String,
+        stream: VideoPlaybackCacheStream,
+        fallbackVariant: String,
+        includeNowPlayingMetadata: Boolean = true,
+    ): MediaItem {
+        val item = if (includeNowPlayingMetadata) {
+            nowPlayingMediaItem(uri)
+        } else {
+            MediaItem.fromUri(uri)
+        }
+        val videoId = _currentVideo.value?.videoId ?: return item
+        return item.buildUpon()
+            .setCustomCacheKey(
+                videoPlaybackCacheKey(
+                    videoId = videoId,
+                    stream = stream,
+                    sourceUrl = uri,
+                    fallbackVariant = fallbackVariant,
+                )
+            )
+            .build()
+    }
+
+    private val VideoQuality.cacheVariant: String
+        get() = listOfNotNull(resolution, format, codec)
+            .joinToString("-")
+
+    /**
+     * Push freshly-learned title/channel into the already-playing media item.
+     *
+     * Only matters for the shared-link path, which starts playback from a video
+     * id alone and so hands the session a nameless card until watch-next lands.
+     * [Player.replaceMediaItem] is metadata-only here - the URI is untouched, so
+     * every source type in use reports it can update in place and playback is
+     * not interrupted. Guarded anyway: a wrong guess would rebuild the source
+     * and cost a rebuffer, which is never worth a caption.
+     */
+    private fun refreshNowPlayingMetadata() {
+        val player = _exoPlayer ?: return
+        if (player.mediaItemCount != 1) return
+        val current = player.currentMediaItem ?: return
+        val uri = current.localConfiguration?.uri?.toString() ?: return
+        val metadata = nowPlayingMediaItem(uri).mediaMetadata
+        if (metadata == current.mediaMetadata) return
+        try {
+            // buildUpon rather than a fresh item: the URI, MIME type and cache
+            // key all have to stay byte-identical for the update to be seamless.
+            player.replaceMediaItem(0, current.buildUpon().setMediaMetadata(metadata).build())
+        } catch (e: Exception) {
+            KLog.w("VideoPlayerVM", "Could not refresh now-playing metadata", e)
+        }
+    }
+
+    /**
+     * MIME for an adaptive quality. Both DASH and HLS entries arrive with
+     * isDASH set and are told apart only by [VideoQuality.format], so pinning
+     * MPD unconditionally would make the factory build a DashMediaSource for an
+     * m3u8 playlist and fail the load - which is what every live stream gets.
+     */
+    private fun adaptiveMimeType(quality: VideoQuality): String =
+        if (quality.format.equals("HLS", ignoreCase = true)) MimeTypes.APPLICATION_M3U8
+        else MimeTypes.APPLICATION_MPD
+
+    fun setQuality(quality: VideoQuality) {
+        // Live renditions all live in the manifest that is already playing, so
+        // switching is a track-selector cap rather than a new media source: no
+        // re-prepare, no rebuffer, and ABR keeps adapting underneath the cap.
+        // Rebuilding the source here would also drop the viewer back to the
+        // live edge and throw away the DVR buffer.
+        if (quality.isLive) {
+            _currentQuality.value = quality
+            applyLiveQualityCap(quality)
+            return
+        }
+        reloadPreservingPosition(quality)
+    }
+
+    /**
+     * Constrain the video track to [quality]'s height, or lift the constraint
+     * for the "Auto" entry.
+     *
+     * The height cap alone is only a ceiling - ABR would still be free to sit
+     * two rungs below it, so picking "1080p60" could visibly play 480p. Pairing
+     * it with forceHighestSupportedBitrate makes an explicit pick behave like a
+     * pin (always the best track that fits the cap) while Auto stays adaptive,
+     * which is the split users expect from the menu.
+     *
+     * buildUpon() so this composes with the video-track suspend/restore in
+     * [onEnterBackground] / [onEnterForeground] instead of overwriting it.
+     */
+    /**
+     * Read the player's own target live offset out of [timeline].
+     *
+     * `Timeline.Window.liveConfiguration` is what HlsMediaSource publishes
+     * after every playlist load, so this follows a manifest that changes its
+     * hold-back mid-broadcast rather than pinning the opening value. A window
+     * that is not live, or a source that declares no target, leaves it at zero.
+     */
+    private fun updateLiveTargetOffset(timeline: Timeline) {
+        val index = _exoPlayer?.currentMediaItemIndex ?: 0
+        if (timeline.isEmpty || index !in 0 until timeline.windowCount) {
+            _liveTargetOffsetMs.value = 0L
+            return
+        }
+        val window = timeline.getWindow(index, liveTimelineWindow)
+        val target = window.liveConfiguration?.targetOffsetMs ?: C.TIME_UNSET
+        _liveTargetOffsetMs.value =
+            if (window.isLive() && target != C.TIME_UNSET) target.coerceAtLeast(0L) else 0L
+    }
+
+    private fun applyLiveQualityCap(quality: VideoQuality) {
+        val player = _exoPlayer ?: return
+        val height = quality.resolution.takeWhile { it.isDigit() }.toIntOrNull() ?: 0
+        player.trackSelectionParameters = player.trackSelectionParameters.buildUpon()
+            .apply {
+                when {
+                    // A rung read off the manifest knows its real frame, so a
+                    // vertical 720x1280 "720p" caps at that frame rather than at
+                    // a 720px height that would drop it two rungs.
+                    quality.width > 0 && quality.height > 0 ->
+                        setMaxVideoSize(quality.width, quality.height)
+                    height > 0 -> setMaxVideoSize(Int.MAX_VALUE, height)
+                    else -> clearVideoSizeConstraints()
+                }
+                // Without this, pinning "1080p" beside a 1080p60 rung would
+                // let forceHighestSupportedBitrate pick the 60fps one.
+                setMaxVideoFrameRate(
+                    if (height > 0 && quality.frameRate > 0) quality.frameRate.coerceAtLeast(30)
+                    else Int.MAX_VALUE
+                )
+                setForceHighestSupportedBitrate(height > 0)
+            }
+            .build()
+    }
+
+    /**
+     * Rebuild the media source for a new quality while keeping the current
+     * playback position. Only quality switches and caption changes need this -
+     * both players take the same route: capture the active position, load,
+     * seek back on READY.
+     */
+    private fun reloadPreservingPosition(quality: VideoQuality) {
+        val player = _exoPlayer ?: return
+        val position = player.currentPosition
+
+        // Remove any existing quality change listener to prevent leaks
+        qualityChangeListener?.let { player.removeListener(it) }
+
+        loadQuality(quality)
+
+        // Wait for player to be ready before seeking to preserved position
+        val listener = object : Player.Listener {
+            override fun onPlaybackStateChanged(playbackState: Int) {
+                if (playbackState == Player.STATE_READY) {
+                    seekPlayerTo(player, position, precise = true)
+                    player.removeListener(this)
+                    qualityChangeListener = null
+                }
+            }
+        }
+        qualityChangeListener = listener
+        player.addListener(listener)
+    }
+
+    private suspend fun resolvePlayableStreamResult(videoId: String): VideoStreamResult {
+        // The preference is intent; the display capability decides whether
+        // HDR can produce a visible benefit. This also handles an enabled
+        // value restored onto an SDR-only phone.
+        val includeHdr = themePreferences.isPreferHdrEnabled() && hasHdrDisplay(context) &&
+            !effectGraphBlocksHdr()
+        val result = youtubeRepository.getVideoStreamResult(videoId, includeHdr)
+        val qualities = if (includeHdr) {
+            result.qualities
+        } else {
+            result.qualities.filterNot(VideoQuality::isHdr)
+        }
+        return result.copy(qualities = qualities)
+    }
+
+    /**
+     * One-shot HDR-to-SDR recovery shared by source and decoder failures.
+     *
+     * Not for a 403. HDR and SDR come from one visionOS response, signed under
+     * one token, so a refused HDR URL means the SDR one beside it is refused
+     * too: reloading it only failed again and spent a second token replacement
+     * on the way. [recoverFromSourceError] re-resolves the whole ladder instead,
+     * and the fallback stays armed for a failure HDR itself causes.
+     */
+    private fun fallbackFromHdr(error: PlaybackException): Boolean {
+        val failed = _currentQuality.value ?: return false
+        if (!failed.isHdr || hdrFallbackUsed) return false
+        if (httpResponseCode(error) == 403) return false
+        val fallback = bestSdrFallback(localVideoQualityOptions(_availableQualities.value), failed)
+            ?: return false
+
+        hdrFallbackUsed = true
+        hdrQualityToRestoreAfterMini = null
+        KLog.w(
+            "VideoPlayerVM",
+            "HDR ${failed.displayLabel} failed; falling back to ${fallback.displayLabel}",
+            error,
+        )
+        reloadPreservingPosition(fallback)
+        return true
+    }
+
+    /** Load the caption track list for the current video, once, on demand. */
+    fun ensureCaptionsLoaded() {
+        val video = _currentVideo.value ?: return
+        // A device file's subtitles are the tracks inside it, read by the
+        // player. A download is a YouTube video played from disk: its captions
+        // are the ones saved beside it when it was downloaded.
+        val isDownload = _isLocalPlayback.value && isDownloadedVideoId(video.videoId)
+        if (_isLocalPlayback.value && !isDownload) return
+        if (captionsLoadedForVideoId == video.videoId) return
+        captionsLoadedForVideoId = video.videoId
+        _isCaptionsLoading.value = true
+        viewModelScope.launch {
+            try {
+                val saved = if (isDownload) {
+                    kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+                        downloadedCaptions.tracks(video.videoId)
+                    }
+                } else emptyList()
+                // A download made before captions were kept has none saved;
+                // with a connection the live list still works for it.
+                val tracks = saved.ifEmpty { youtubeRepository.getCaptionTracks(video.videoId) }
+                // Ignore stale results if the user switched videos meanwhile
+                if (_currentVideo.value?.videoId == video.videoId) {
+                    _captionTracks.value = tracks
+                    if (themePreferences.isCaptionsEnabled() && _selectedCaption.value == null) {
+                        restoreSavedCaptionTrack(tracks)
+                    }
+                }
+            } finally {
+                if (_currentVideo.value?.videoId == video.videoId) {
+                    _isCaptionsLoading.value = false
+                }
+            }
+        }
+    }
+
+    /**
+     * Re-apply the persisted caption choice to a fresh track list: the exact
+     * language first, then the same base language in another region ("en" vs
+     * "en-US" or an auto-generated track), then whatever the video offers.
+     * A video with no tracks simply leaves captions off.
+     */
+    private fun restoreSavedCaptionTrack(tracks: List<CaptionTrack>) {
+        val wanted = themePreferences.getCaptionLanguageCode()
+        val match = tracks.firstOrNull { it.languageCode == wanted }
+            ?: tracks.firstOrNull {
+                wanted != null && it.languageCode.substringBefore('-') == wanted.substringBefore('-')
+            }
+            ?: tracks.firstOrNull()
+        match?.let { setCaptionTrack(it) }
+    }
+
+    /**
+     * Select a caption track, or null to turn captions off.
+     *
+     * The choice is persisted: the on/off state and the track's language come
+     * back on the next video, so a user who watches subtitled does not tap CC
+     * every time. [startVideo] re-applies the saved language once the new
+     * video's tracks arrive.
+     *
+     * The playback pipeline is deliberately untouched here. Captions used to be
+     * a text track merged into the media source, so switching them rebuilt that
+     * source: playback re-prepared and its active sample buffer was discarded.
+     * Cues are fetched and parsed on their own instead, and the overlay draws
+     * them over the video surface, which makes the CC toggle instant and free
+     * no matter how many times it is pressed, including when disk caching is off.
+     */
+    fun setCaptionTrack(track: CaptionTrack?) {
+        if (_selectedCaption.value == track) return
+        _selectedCaption.value = track
+        themePreferences.setCaptionsEnabled(track != null)
+        themePreferences.setCaptionLanguageCode(track?.languageCode)
+
+        captionCuesJob?.cancel()
+        if (track == null) {
+            _captionCues.value = emptyList()
+            return
+        }
+        captionCuesJob = viewModelScope.launch {
+            // Saved beside a download, or fetched: the store answers null for
+            // a track that is not one of its own.
+            val cues = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+                downloadedCaptions.cues(track)
+            }
+                ?: youtubeRepository.getCaptionCues(track)
+            // Ignore a load the user has already switched away from
+            if (_selectedCaption.value == track) {
+                _captionCues.value = cues
+                if (cues.isEmpty()) {
+                    KLog.w(
+                        "VideoPlayerVM",
+                        "Caption track ${track.languageCode} produced no cues"
+                    )
+                }
+            }
+        }
+    }
+
+    fun setExpanded(expanded: Boolean) {
+        if (_isExpanded.value == expanded) return
+        _isExpanded.value = expanded
+        if (_isLocalPlayback.value || _isLive.value) return
+
+        val current = _currentQuality.value ?: return
+        if (!expanded && current.isHdr) {
+            val fallback = bestSdrFallback(localVideoQualityOptions(_availableQualities.value), current)
+                ?: return
+            hdrQualityToRestoreAfterMini = current
+            reloadPreservingPosition(fallback)
+            return
+        }
+
+        if (expanded && !current.isHdr) {
+            val remembered = hdrQualityToRestoreAfterMini ?: return
+            hdrQualityToRestoreAfterMini = null
+            if (!themePreferences.isPreferHdrEnabled()) return
+            val restored = localVideoQualityOptions(_availableQualities.value).firstOrNull {
+                it.isHdr && it.resolution == remembered.resolution &&
+                    it.dynamicRange == remembered.dynamicRange
+            } ?: return
+            reloadPreservingPosition(restored)
+        }
+    }
+
+    fun closePlayer() {
+        watchTracker.close()
+        cancelSleepTimer()
+        saveCurrentVideoResumePosition()
+        _resumedFromMs.value = null
+        // Remove quality change listener to prevent leaks if player closed before STATE_READY
+        qualityChangeListener?.let { _exoPlayer?.removeListener(it) }
+        qualityChangeListener = null
+        _exoPlayer?.stop()
+        progressJob?.cancel()
+        progressJob = null
+        hdrQualityToRestoreAfterMini = null
+        // Track selection outlives media items: a player closed while the video
+        // track is suspended would come back audio-only on the next video.
+        onEnterForeground()
+        stopLivePolling()
+        liveChatStartedForVideoId = null
+        _currentVideo.value = null
+        _queue.value = null
+        deferredRestorePositionMs = null
+        leaveLocalPlayback()
+        _isExpanded.value = false
+        // Nothing is playing any more, so nothing should be on the lock screen.
+        com.sentup.android.service.VideoPlaybackService.stop(context)
+        // Whatever opens next - even this same video - gets a fresh chance.
+        frameInterpolation.reset()
+        // Smooth motion and video shaders can only be added or removed by
+        // building a new player, and this is the one moment nothing holds the
+        // old one: the session is gone (just above) and the overlay disposes
+        // its views with the video.
+        if (_exoPlayer != null && (
+            playerHasInterpolation != frameInterpolationWanted() ||
+                _playerHasVideoShaders.value != videoShadersWanted()
+            )
+        ) {
+            _exoPlayer?.release()
+            _exoPlayer = null
+            playerHasInterpolation = false
+            _playerHasVideoShaders.value = false
+        }
+        // An explicit close means "I'm done with this video" - the opposite
+        // of what the resume snapshot is for, so it must not reappear next
+        // launch.
+        clearVideoPlaybackSession()
+        CacheManager.setVideoPlaybackActive(VIDEO_CACHE_OWNER, false)
+    }
+
+    fun togglePlayPause() {
+        deferredRestorePositionMs?.let { position ->
+            val video = _currentVideo.value ?: return
+            startVideo(
+                video = video,
+                forceRestart = true,
+                resumePositionMs = position,
+                resumePaused = false,
+                expand = _isExpanded.value
+            )
+            return
+        }
+        val player = _exoPlayer ?: return
+        if (_isPlaying.value) {
+            player.pause()
+        } else {
+            CacheManager.setVideoPlaybackActive(VIDEO_CACHE_OWNER, true)
+            // After autoplay deliberately stops at the end, Play means replay
+            // this video. ExoPlayer does not leave STATE_ENDED on play() alone.
+            if (player.playbackState == Player.STATE_ENDED) {
+                player.seekToDefaultPosition()
+            }
+            player.play()
+        }
+    }
+
+    /**
+     * Skip [deltaMs] from the current position, clamped to the media.
+     *
+     * Lives here rather than in the player UI because the same step is driven
+     * from outside the composition too - the Picture-in-Picture window's
+     * RemoteActions have no other way to reach the player.
+     */
+    fun seekBy(deltaMs: Long) {
+        _resumedFromMs.value = null
+        deferredRestorePositionMs?.let { restoredPosition ->
+            val duration = _durationMs.value.takeIf { it > 0L } ?: Long.MAX_VALUE
+            val position = (restoredPosition + deltaMs).coerceIn(0L, duration)
+            deferredRestorePositionMs = position
+            _positionMs.value = position
+            _progress.value = if (duration != Long.MAX_VALUE) {
+                (position.toFloat() / duration).coerceIn(0f, 1f)
+            } else {
+                0f
+            }
+            return
+        }
+        val player = _exoPlayer ?: return
+        val duration = player.duration
+        val upperBound = if (duration > 0) duration else Long.MAX_VALUE
+        seekPlayerTo(player, (player.currentPosition + deltaMs).coerceIn(0L, upperBound), precise = false)
+    }
+
+    /**
+     * Seek, choosing how exactly the player has to land on [positionMs].
+     *
+     * ExoPlayer seeks exactly by default: it starts decoding at the sync sample
+     * before the target and discards every frame up to it, so a scrub into a
+     * 1080p60 stream with a multi-second GOP decodes hundreds of frames nobody
+     * ever sees before the first visible one. That cost is paid whether the
+     * bytes came from the sample queue, the disk cache or the network, which is
+     * why a scrub into already-buffered video could still sit on a spinner.
+     * CLOSEST_SYNC renders the nearest keyframe instead.
+     *
+     * The trade is landing up to half a GOP from the requested millisecond.
+     * That is invisible dragging a seek bar and wrong for anything addressing a
+     * specific moment - a chapter start, a comment's timestamp, the position a
+     * session or a quality switch is being restored to - so those pass
+     * [precise] and keep exact seeking.
+     */
+    /**
+     * Draw the paused frame again once a new surface has its size, when the
+     * effect graph is installed (Smooth motion, video shaders or both), and
+     * when a shader setting changes under a paused video.
+     *
+     * The graph draws at the output surface's size, and a view taking the
+     * surface over (the mini bar handing to the page, fullscreen back to
+     * portrait) reaches it before its size does: the paused frame is drawn at
+     * the size the last surface had, a small picture in the bottom-left corner
+     * (GL's origin), and nothing draws again until playback resumes. Media3's
+     * own redraw (`VideoFrameProcessor.REDRAW`) needs a replayable frame cache
+     * that playback never builds, and throws without one [verified September
+     * 2026 against the 1.11.0 bytecode], so an exact seek to where playback
+     * already is renders the frame afresh. Settled briefly, because a
+     * hand-off reports sizes in a burst. Playing needs nothing: the next frame
+     * is drawn at the new size.
+     */
+    private fun redrawPausedFrameThroughGraph() {
+        // [scar, October 2026] This asked for Smooth motion alone, so a player
+        // carrying only the shader stage went fullscreen while paused with its
+        // frame still drawn at the portrait surface's size: a small rectangle
+        // in one corner until Play.
+        if (!playerHasEffectGraph()) return
+        graphRedrawJob?.cancel()
+        graphRedrawJob = viewModelScope.launch {
+            delay(GRAPH_REDRAW_SETTLE_MS)
+            val player = _exoPlayer ?: return@launch
+            if (player.isPlaying || player.playbackState != Player.STATE_READY ||
+                player.isCurrentMediaItemLive
+            ) {
+                return@launch
+            }
+            seekPlayerTo(player, player.currentPosition, precise = true)
+        }
+    }
+
+    private fun seekPlayerTo(player: Player, positionMs: Long, precise: Boolean) {
+        (player as? ExoPlayer)?.setSeekParameters(
+            if (precise) SeekParameters.EXACT else SeekParameters.CLOSEST_SYNC
+        )
+        player.seekTo(positionMs)
+    }
+
+    /** Absolute seek which also works before a restored session has loaded media. */
+    fun seekTo(positionMs: Long, precise: Boolean = false) {
+        _resumedFromMs.value = null
+        deferredRestorePositionMs?.let {
+            val duration = _durationMs.value.takeIf { value -> value > 0L } ?: Long.MAX_VALUE
+            val position = positionMs.coerceIn(0L, duration)
+            deferredRestorePositionMs = position
+            _positionMs.value = position
+            _progress.value = if (duration != Long.MAX_VALUE) {
+                (position.toFloat() / duration).coerceIn(0f, 1f)
+            } else {
+                0f
+            }
+            return
+        }
+        _exoPlayer?.let { seekPlayerTo(it, positionMs.coerceAtLeast(0L), precise) }
+    }
+
+    /** The viewer has read the resume notice and wants it gone. */
+    fun dismissResumeNotice() {
+        _resumedFromMs.value = null
+    }
+
+    /**
+     * Undo an automatic resume.
+     *
+     * The stored checkpoint is dropped as well as seeked away from: asking to
+     * watch this video from the start and then being dropped back into the
+     * middle on the next open would make the notice's only action useless.
+     */
+    fun playFromBeginning() {
+        _currentVideo.value?.videoId?.let(videoHistoryRepository::clearResumePosition)
+        // seekTo already dismisses the notice and knows how to move a restored
+        // session that has not resolved its media yet.
+        seekTo(0L, precise = true)
+    }
+
+    /** Pause without closing the player (music or Shorts playback started). */
+    fun pause() {
+        _exoPlayer?.pause()
+    }
+
+    /** External play/pause entry points (the system PiP window's buttons). */
+    fun playFromExternal() {
+        deferredRestorePositionMs?.let { position ->
+            val video = _currentVideo.value ?: return
+            startVideo(
+                video = video,
+                forceRestart = true,
+                resumePositionMs = position,
+                resumePaused = false,
+                expand = _isExpanded.value
+            )
+            return
+        }
+        val player = _exoPlayer ?: return
+        if (player.playbackState == Player.STATE_ENDED) player.seekToDefaultPosition()
+        player.play()
+    }
+
+    // ---------------- Live chat ----------------
+
+    /**
+     * Start the chat stream. Called when the chat panel opens rather than when
+     * the video loads: a live stream watched without the panel open should not
+     * pay for a poll every 10 seconds.
+     */
+    fun ensureLiveChatStarted() {
+        val videoId = _currentVideo.value?.videoId ?: return
+        if (!_isLive.value) return
+        if (liveChatStartedForVideoId == videoId && liveChatJob?.isActive == true) return
+        liveChatStartedForVideoId = videoId
+        startLiveChatPolling(videoId)
+    }
+
+    /**
+     * Stop polling when the panel closes. Messages are kept so reopening shows
+     * the conversation immediately while the fresh backlog loads behind it -
+     * the poll dedupes by id, so the overlap costs nothing.
+     */
+    fun stopLiveChat() {
+        liveChatJob?.cancel()
+        liveChatJob = null
+        liveChatStartedForVideoId = null
+        _isLiveChatLoading.value = false
+    }
+
+    /**
+     * Run the chat: one coroutine polling the server, one releasing what it
+     * fetched onto the screen.
+     *
+     * They are separate because their rhythms are: the server hands over ten
+     * seconds of chat in a single response, and rendering that in one frame is
+     * what made the panel feel broken. The drain loop spreads a batch across the
+     * interval until the next one is due, so messages arrive at roughly the rate
+     * people actually typed them.
+     */
+    private fun startLiveChatPolling(videoId: String) {
+        liveChatJob?.cancel()
+        pendingLiveChat.clear()
+        seenLiveChatIds.clear()
+        _liveChatMessages.value.forEach { seenLiveChatIds.add(it.id) }
+
+        liveChatJob = viewModelScope.launch {
+            _isLiveChatLoading.value = true
+
+            // Phase 2 usually has the token already; only a chat opened before
+            // watch-next lands pays for a fetch.
+            val start = liveChatContinuation
+                ?: youtubeRepository.getLiveChatSession(videoId)?.continuation
+            if (_currentVideo.value?.videoId != videoId) return@launch
+            if (start == null) {
+                // No conversationBar in the watch-next response: chat is
+                // disabled or unavailable for this broadcast, which is a state
+                // to render, not an error.
+                _isLiveChatAvailable.value = false
+                _isLiveChatLoading.value = false
+                return@launch
+            }
+            liveChatContinuation = start
+
+            coroutineScope {
+                val drain = launch { drainLiveChatQueue() }
+                try {
+                    pollLiveChatLoop(videoId, start)
+                } finally {
+                    drain.cancel()
+                    // Anything still queued was already fetched; drop it on
+                    // screen rather than losing it on the way out.
+                    flushPendingLiveChat()
+                    _isLiveChatLoading.value = false
+                }
+            }
+        }
+    }
+
+    /**
+     * Fetch pages on the cadence the server dictates.
+     *
+     * Every response hands back the next token and the delay before it should be
+     * used (10s on every stream sampled). The wait subtracts the time the request
+     * itself took, so the cycle stays a true 10s instead of drifting further
+     * behind live by one round trip per poll.
+     *
+     * The first response carries the visible backlog - that is history, not new
+     * chat, so it goes straight to the screen; only later pages are paced.
+     */
+    private suspend fun pollLiveChatLoop(videoId: String, firstContinuation: String) {
+        var continuation: String? = firstContinuation
+        var consecutiveFailures = 0
+        var isFirstPage = true
+
+        while (true) {
+            val token = continuation ?: break
+            val startedAt = SystemClock.elapsedRealtime()
+            val page = youtubeRepository.pollLiveChat(token)
+            if (_currentVideo.value?.videoId != videoId) return
+
+            if (page == null) {
+                // A failed poll is usually transient (the stream is still
+                // there), so back off and retry the same token a few times
+                // before declaring the chat gone.
+                consecutiveFailures++
+                if (consecutiveFailures > MAX_LIVE_CHAT_POLL_FAILURES) {
+                    if (_isLiveChatAvailable.value == null) _isLiveChatAvailable.value = false
+                    return
+                }
+                kotlinx.coroutines.delay(LIVE_CHAT_RETRY_DELAY_MS)
+                continue
+            }
+            consecutiveFailures = 0
+
+            _isLiveChatAvailable.value = true
+            _isLiveChatLoading.value = false
+            page.sendParams?.let { _liveChatSendParams.value = it }
+            _liveChatMaxLength.value = page.maxMessageLength
+            _liveChatRestriction.value = page.restrictionMessage
+            if (page.bannerCleared) _liveChatBanner.value = null
+            page.banner?.let { _liveChatBanner.value = it }
+
+            applyLiveChatModeration(page)
+
+            val fresh = page.messages.filter { seenLiveChatIds.add(it.id) }
+            if (isFirstPage) {
+                appendLiveChatMessages(fresh)
+                isFirstPage = false
+            } else {
+                pendingLiveChat.addAll(fresh)
+            }
+            trimSeenLiveChatIds()
+
+            continuation = page.nextContinuation
+            val window = page.timeoutMs.coerceIn(LIVE_CHAT_MIN_WINDOW_MS, LIVE_CHAT_MAX_WINDOW_MS)
+            val wait = (window - (SystemClock.elapsedRealtime() - startedAt))
+                .coerceAtLeast(LIVE_CHAT_MIN_WINDOW_MS)
+            liveChatBatchDueAt = SystemClock.elapsedRealtime() + wait
+            kotlinx.coroutines.delay(wait)
+        }
+    }
+
+    /**
+     * Release queued messages one at a time, spread over the time remaining
+     * until the next batch lands, so the queue empties just as it arrives.
+     *
+     * The first message of a batch shows immediately - the pacing only applies
+     * to the ones behind it - so a quiet chat has no added latency while a busy
+     * one flows instead of arriving in slabs. Falling behind (a burst larger
+     * than the window can pace) collapses the gap to the floor and catches up.
+     */
+    private suspend fun drainLiveChatQueue() {
+        while (true) {
+            val next = pendingLiveChat.removeFirstOrNull()
+            if (next == null) {
+                kotlinx.coroutines.delay(LIVE_CHAT_DRAIN_IDLE_MS)
+                continue
+            }
+            appendLiveChatMessages(listOf(next))
+
+            val remaining = pendingLiveChat.size
+            if (remaining == 0) {
+                kotlinx.coroutines.delay(LIVE_CHAT_DRAIN_IDLE_MS)
+                continue
+            }
+            val budget = liveChatBatchDueAt - SystemClock.elapsedRealtime()
+            kotlinx.coroutines.delay(
+                (budget / (remaining + 1))
+                    .coerceIn(LIVE_CHAT_MIN_GAP_MS, LIVE_CHAT_MAX_GAP_MS)
+            )
+        }
+    }
+
+    /** Put everything still queued on screen at once. */
+    private fun flushPendingLiveChat() {
+        if (pendingLiveChat.isEmpty()) return
+        val rest = pendingLiveChat.toList()
+        pendingLiveChat.clear()
+        appendLiveChatMessages(rest)
+    }
+
+    /**
+     * Append to the visible list, capped at [MAX_LIVE_CHAT_MESSAGES] - the same
+     * cap YouTube declares in the response - so a stream left open overnight
+     * cannot grow the list without bound.
+     */
+    private fun appendLiveChatMessages(new: List<LiveChatMessage>) {
+        if (new.isEmpty()) return
+        _liveChatMessages.update { current -> (current + new).takeLast(MAX_LIVE_CHAT_MESSAGES) }
+    }
+
+    /**
+     * Apply deletions and edits to both the visible list and the queue - a
+     * message deleted while still waiting to be shown must never reach the
+     * screen.
+     */
+    private fun applyLiveChatModeration(page: LiveChatPage) {
+        if (page.removedIds.isEmpty() &&
+            page.removedAuthorIds.isEmpty() &&
+            page.replacements.isEmpty()
+        ) return
+
+        fun survives(message: LiveChatMessage): Boolean =
+            message.id !in page.removedIds &&
+                message.author?.channelId?.let { it !in page.removedAuthorIds } != false
+
+        pendingLiveChat.retainAll { survives(it) }
+        _liveChatMessages.update { current ->
+            current.mapNotNull { message ->
+                if (!survives(message)) null else page.replacements[message.id] ?: message
+            }
+        }
+    }
+
+    /**
+     * Keep the dedupe set from growing for the lifetime of a long stream. Only
+     * ids that are still visible or queued can be re-delivered in a way that
+     * matters.
+     */
+    private fun trimSeenLiveChatIds() {
+        if (seenLiveChatIds.size <= MAX_LIVE_CHAT_MESSAGES * 3) return
+        val live = HashSet<String>(_liveChatMessages.value.size + pendingLiveChat.size)
+        _liveChatMessages.value.forEach { live.add(it.id) }
+        pendingLiveChat.forEach { live.add(it.id) }
+        seenLiveChatIds.retainAll(live)
+    }
+
+    /**
+     * Keep the concurrent viewer count fresh. The endpoint asks for a 5s tick,
+     * which is far more often than a phone needs, so this runs on
+     * [LIVE_METADATA_POLL_MS] instead.
+     */
+    private fun startLiveMetadataPolling(videoId: String) {
+        liveMetadataJob?.cancel()
+        liveMetadataJob = viewModelScope.launch {
+            while (true) {
+                val metadata = youtubeRepository.getLiveMetadata(videoId)
+                if (_currentVideo.value?.videoId != videoId) return@launch
+                metadata?.viewerCountText?.let { _liveViewerCount.value = it }
+                kotlinx.coroutines.delay(LIVE_METADATA_POLL_MS)
+            }
+        }
+    }
+
+    /** Stop both live polls. Safe to call when nothing is live. */
+    fun stopLivePolling() {
+        liveChatJob?.cancel()
+        liveChatJob = null
+        liveMetadataJob?.cancel()
+        liveMetadataJob = null
+    }
+
+    /**
+     * Post a message to the live chat.
+     *
+     * The response echoes the accepted message back, so it goes on screen at
+     * once instead of waiting up to a poll interval to come round - it is marked
+     * seen, so the poll that eventually redelivers it is a no-op.
+     *
+     * [onFailure] reports a rejection (slow mode, a word filter, a ban) so the
+     * composer can put the text back rather than silently swallowing it.
+     */
+    fun sendLiveChatMessage(text: String, onFailure: (String) -> Unit = {}) {
+        val body = text.trim()
+        if (body.isEmpty() || _isSendingLiveChat.value) return
+        val params = _liveChatSendParams.value ?: return
+        viewModelScope.launch {
+            _isSendingLiveChat.value = true
+            try {
+                val result = youtubeRepository.sendLiveChatMessage(params, body)
+                if (result.success) {
+                    result.echo?.let { echo ->
+                        if (seenLiveChatIds.add(echo.id)) appendLiveChatMessages(listOf(echo))
+                    }
+                } else {
+                    onFailure(result.error ?: "Message not sent")
+                }
+            } catch (e: Exception) {
+                KLog.w("VideoPlayerVM", "Failed to send live chat message", e)
+                onFailure("Message not sent")
+            } finally {
+                _isSendingLiveChat.value = false
+            }
+        }
+    }
+
+    // ---------------- Save to playlist / Watch Later ----------------
+
+    /** Load the user's YouTube playlists for the save sheet. Requires login. */
+    fun loadVideoPlaylists(force: Boolean = false) {
+        if (_isVideoPlaylistsLoading.value) return
+        if (_videoPlaylists.value.isNotEmpty() && !force) return
+        viewModelScope.launch {
+            _isVideoPlaylistsLoading.value = true
+            try {
+                _videoPlaylists.value = youtubeRepository.getVideoPlaylists()
+            } finally {
+                _isVideoPlaylistsLoading.value = false
+            }
+        }
+    }
+
+    /**
+     * Add a video to a playlist. Reports the outcome on the main thread so the
+     * save sheet can show inline feedback.
+     *
+     * Same three-way routing as `HomeViewModel.addVideoToPlaylist`: a device
+     * playlist, the device's Watch Later while signed out, or the account.
+     * Duplicated rather than shared because the two ViewModels have no common
+     * base and no DI to hand one an instance of the other; the store underneath
+     * is process-wide, so both see the same list either way.
+     */
+    /** Account playlists holding the video a save sheet is open on. */
+    private val videoPlaylistMembership =
+        com.sentup.android.data.PlaylistMembership(youtubeRepository, viewModelScope)
+    val accountPlaylistsContainingVideo: StateFlow<Set<String>> = videoPlaylistMembership.containing
+
+    /** One account lookup per sheet open. */
+    fun loadVideoPlaylistMembership(videoId: String) = videoPlaylistMembership.load(videoId)
+
+    /** Untick a video in the save sheet; the mirror of adding it. */
+    fun removeVideoFromPlaylist(playlistId: String, video: VideoItem, onResult: (Boolean) -> Unit) {
+        viewModelScope.launch {
+            val local = com.sentup.android.data.LocalVideoPlaylistsRepository
+            val ok = when {
+                local.isLocal(playlistId) -> {
+                    localVideoPlaylistsRepository.removeVideo(playlistId, video.videoId)
+                    true
+                }
+                playlistId == "WL" && !_isLoggedIn.value -> {
+                    localVideoPlaylistsRepository.removeVideo(local.WATCH_LATER_ID, video.videoId)
+                    true
+                }
+                else -> youtubeRepository.removeFromYouTubePlaylist(playlistId, video.videoId, music = false)
+                    .also { if (it) videoPlaylistMembership.record(playlistId, video.videoId, false) }
+            }
+            onResult(ok)
+        }
+    }
+
+    fun addVideoToPlaylist(playlistId: String, video: VideoItem, onResult: (Boolean) -> Unit) {
+        viewModelScope.launch {
+            val local = com.sentup.android.data.LocalVideoPlaylistsRepository
+            onResult(
+                when {
+                    local.isLocal(playlistId) ->
+                        localVideoPlaylistsRepository.addVideo(playlistId, video)
+                    playlistId == "WL" && !_isLoggedIn.value ->
+                        localVideoPlaylistsRepository.addVideo(
+                            localVideoPlaylistsRepository.ensureWatchLater(),
+                            video
+                        )
+                    else -> youtubeRepository.addToYouTubePlaylist(
+                        playlistId,
+                        video.videoId,
+                        music = false
+                    ).also { if (it) videoPlaylistMembership.record(playlistId, video.videoId, true) }
+                }
+            )
+        }
+    }
+
+    /** Create a playlist on the device, from the save sheet. */
+    fun createLocalVideoPlaylist(name: String, onCreated: (String?) -> Unit) {
+        viewModelScope.launch { onCreated(localVideoPlaylistsRepository.create(name)) }
+    }
+
+    // ---------------- Channel page ----------------
+
+    // ---------------- Engagement actions ----------------
+
+    /** Re-check login state and refresh engagement (call after a successful sign-in). */
+    fun onLoginStateChanged() {
+        _isLoggedIn.value = youtubeRepository.isLoggedIn()
+        val video = _currentVideo.value ?: return
+        viewModelScope.launch {
+            _engagement.value = youtubeRepository.getVideoEngagement(video.videoId)
+        }
+    }
+
+    /** Like the video, or remove the like if already liked. Optimistic with rollback. */
+    fun toggleLike() = rate(
+        target = { current -> if (current == LikeStatus.LIKE) LikeStatus.INDIFFERENT else LikeStatus.LIKE }
+    )
+
+    /** Dislike the video, or remove the dislike if already disliked. */
+    fun toggleDislike() = rate(
+        target = { current -> if (current == LikeStatus.DISLIKE) LikeStatus.INDIFFERENT else LikeStatus.DISLIKE }
+    )
+
+    private fun rate(target: (LikeStatus) -> LikeStatus) {
+        val current = _engagement.value ?: return
+        val newStatus = target(current.likeStatus)
+        _engagement.value = current.copy(likeStatus = newStatus)
+        viewModelScope.launch {
+            val ok = youtubeRepository.rateVideo(current.videoId, newStatus)
+            if (!ok) {
+                // Roll back on failure (only if still on the same video)
+                if (_engagement.value?.videoId == current.videoId) {
+                    _engagement.value = _engagement.value?.copy(likeStatus = current.likeStatus)
+                }
+            }
+        }
+    }
+
+    /**
+     * Subscribe/unsubscribe to the current video's channel, routed by the
+     * subscribe-target setting (see [com.sentup.android.data.SubscriptionActions]).
+     * Optimistic with rollback on a failed remote write.
+     */
+    fun toggleSubscribe() {
+        val current = _engagement.value ?: return
+        val channelId = current.channelId ?: return
+        val video = _currentVideo.value
+        val subscribe = !isSubscribedToChannel.value
+
+        // Only the account half is optimistic here; the local half is a
+        // synchronous write whose process-wide flow already drives the button.
+        // A local-only subscribe must leave the account flag alone, or the
+        // next unsubscribe would fire a pointless network call.
+        val writesRemote = subscriptionActions.resolveTarget() != SubscriptionStore.LOCAL
+        _engagement.value = current.copy(
+            isSubscribed = when {
+                !subscribe -> false
+                writesRemote -> true
+                else -> current.isSubscribed
+            }
+        )
+        viewModelScope.launch {
+            val ok = subscriptionActions.setSubscribed(
+                channel = LocalSubscription(
+                    channelId = channelId,
+                    name = video?.channelName?.takeIf { it.isNotBlank() } ?: channelId,
+                    avatarUrl = video?.channelIconUrl
+                ),
+                subscribe = subscribe,
+                remotelySubscribed = current.isSubscribed
+            )
+            if (!ok && _engagement.value?.videoId == current.videoId) {
+                _engagement.value = _engagement.value?.copy(isSubscribed = current.isSubscribed)
+            }
+        }
+    }
+
+    // ---------------- Comments ----------------
+
+    /**
+     * Extract the first playback timestamp mentioned in a comment ("1:23",
+     * "12:05" or "1:02:33") as milliseconds, or null when none is present.
+     */
+    private fun parseFirstTimestampMs(text: String): Long? {
+        val match = TIMESTAMP_REGEX.find(text) ?: return null
+        val hours = match.groupValues[1].toLongOrNull() ?: 0L
+        val minutes = match.groupValues[2].toLongOrNull() ?: return null
+        val seconds = match.groupValues[3].toLongOrNull() ?: return null
+        if (seconds >= 60) return null
+        if (match.groupValues[1].isNotEmpty() && minutes >= 60) return null
+        return ((hours * 60 + minutes) * 60 + seconds) * 1000L
+    }
+
+    /** Load the first page of comments if not already loaded for this video. */
+    fun ensureCommentsLoaded() {
+        val video = _currentVideo.value ?: return
+        if (commentsLoadedForVideoId == video.videoId || _isCommentsLoading.value) return
+        val token = _engagement.value?.commentsToken ?: return
+        _isCommentsLoading.value = true
+        viewModelScope.launch {
+            try {
+                val page = youtubeRepository.getCommentsPage(token)
+                // Ignore stale results if the user switched videos meanwhile
+                if (_currentVideo.value?.videoId == video.videoId && page != null) {
+                    _comments.value = page.comments
+                    commentsNextToken = page.nextPageToken
+                    commentsLoadedForVideoId = video.videoId
+                    _createCommentParams.value = page.createCommentParams
+                }
+            } finally {
+                _isCommentsLoading.value = false
+            }
+        }
+    }
+
+    /** Load the next page of comments (no-op when exhausted or already loading). */
+    fun loadMoreComments() {
+        val video = _currentVideo.value ?: return
+        val token = commentsNextToken ?: return
+        if (_isLoadingMoreComments.value || _isCommentsLoading.value) return
+        _isLoadingMoreComments.value = true
+        viewModelScope.launch {
+            try {
+                val page = youtubeRepository.getCommentsPage(token)
+                if (_currentVideo.value?.videoId == video.videoId && page != null) {
+                    // Guard against duplicates if YouTube repeats items across pages
+                    val known = _comments.value.mapTo(HashSet()) { it.commentId }
+                    _comments.value = _comments.value + page.comments.filter { it.commentId !in known }
+                    commentsNextToken = page.nextPageToken
+                }
+            } finally {
+                _isLoadingMoreComments.value = false
+            }
+        }
+    }
+
+    /** Load replies for a comment (first page only; collapses are handled in UI). */
+    fun loadReplies(comment: CommentItem) {
+        val video = _currentVideo.value ?: return
+        val token = comment.repliesToken ?: return
+        if (_replies.value.containsKey(comment.commentId) ||
+            comment.commentId in _loadingReplyIds.value
+        ) return
+        _loadingReplyIds.value = _loadingReplyIds.value + comment.commentId
+        viewModelScope.launch {
+            try {
+                val page = youtubeRepository.getCommentsPage(token)
+                if (_currentVideo.value?.videoId == video.videoId && page != null) {
+                    _replies.value = _replies.value + (comment.commentId to page.comments)
+                }
+            } finally {
+                _loadingReplyIds.value = _loadingReplyIds.value - comment.commentId
+            }
+        }
+    }
+
+    /**
+     * Post a new top-level comment on the current video. The created comment
+     * is prepended to the list on success. Requires login.
+     */
+    fun postComment(text: String) {
+        val video = _currentVideo.value ?: return
+        val params = _createCommentParams.value ?: return
+        val trimmed = text.trim()
+        if (trimmed.isEmpty() || _isPostingComment.value) return
+        _isPostingComment.value = true
+        viewModelScope.launch {
+            try {
+                val created = youtubeRepository.createComment(params, trimmed)
+                if (created != null && _currentVideo.value?.videoId == video.videoId) {
+                    _comments.value = listOf(created) + _comments.value
+                }
+            } finally {
+                _isPostingComment.value = false
+            }
+        }
+    }
+
+    /**
+     * Post a reply into a comment thread. `target` is the comment being
+     * replied to (a top-level comment or one of its replies — replying to a
+     * reply posts into the same thread, like YouTube); `threadParent` is the
+     * top-level comment whose replies list shows the result. Requires login.
+     */
+    fun postReply(target: CommentItem, threadParent: CommentItem, text: String) {
+        val video = _currentVideo.value ?: return
+        val params = target.replyParams ?: return
+        val trimmed = text.trim()
+        if (trimmed.isEmpty() || _isPostingComment.value) return
+        _isPostingComment.value = true
+        viewModelScope.launch {
+            try {
+                val created = youtubeRepository.createCommentReply(params, trimmed)
+                if (created != null && _currentVideo.value?.videoId == video.videoId) {
+                    val existing = _replies.value[threadParent.commentId]
+                    if (existing != null || threadParent.repliesToken == null) {
+                        // Replies already visible (or none exist yet): append inline
+                        _replies.value = _replies.value +
+                            (threadParent.commentId to (existing ?: emptyList()) + created)
+                    } else {
+                        // Replies exist but are collapsed: fetch the thread so the
+                        // older replies are not hidden behind the local insert
+                        loadReplies(threadParent)
+                    }
+                }
+            } finally {
+                _isPostingComment.value = false
+            }
+        }
+    }
+
+    /**
+     * Like or unlike a comment (top-level or reply). Optimistically flips the
+     * local state, then reverts if the InnerTube action fails. Requires login
+     * and the action params that only arrive on signed-in comment fetches.
+     */
+    fun toggleCommentLike(comment: CommentItem) {
+        val action = (if (comment.isLiked) comment.unlikeParams else comment.likeParams) ?: return
+        val toggled = comment.copy(isLiked = !comment.isLiked)
+        replaceComment(toggled)
+        viewModelScope.launch {
+            if (!youtubeRepository.performCommentAction(action)) {
+                replaceComment(comment)
+            }
+        }
+    }
+
+    /**
+     * Delete one of the user's own comments (top-level or reply). The delete
+     * param only exists on own comments (CommentItem.deleteParams). Optimistic
+     * removal with restore on failure.
+     */
+    fun deleteComment(comment: CommentItem) {
+        val action = comment.deleteParams ?: return
+        val previousComments = _comments.value
+        val previousReplies = _replies.value
+        _comments.value = _comments.value.filterNot { it.commentId == comment.commentId }
+        _replies.value = _replies.value
+            .mapValues { (_, list) -> list.filterNot { it.commentId == comment.commentId } }
+            .filterKeys { it != comment.commentId }
+        viewModelScope.launch {
+            if (!youtubeRepository.performCommentAction(action)) {
+                _comments.value = previousComments
+                _replies.value = previousReplies
+            }
+        }
+    }
+
+    /** Swap a comment (matched by id) in the top-level list and all reply threads. */
+    private fun replaceComment(updated: CommentItem) {
+        _comments.value = _comments.value.map {
+            if (it.commentId == updated.commentId) updated else it
+        }
+        _replies.value = _replies.value.mapValues { (_, list) ->
+            list.map { if (it.commentId == updated.commentId) updated else it }
+        }
+    }
+
+    companion object {
+        private const val VIDEO_CACHE_OWNER = "video"
+        private val TIMESTAMP_REGEX = Regex("""(?<!\d)(?:(\d{1,2}):)?(\d{1,2}):(\d{2})(?!\d)""")
+
+        /** Marks a [PlayerTrackOption] as a YouTube soundtrack rather than a container track. */
+        private const val YOUTUBE_AUDIO_OPTION_PREFIX = "yt-audio:"
+
+        /** Speeds offered in the player's speed menu. */
+        val PLAYBACK_SPEED_OPTIONS = listOf(0.25f, 0.5f, 0.75f, 1f, 1.25f, 1.5f, 1.75f, 2f, 2.5f, 3f, 4f, 8f)
+
+        /**
+         * One skip step, shared by the double-tap gesture on the player, the
+         * media notification and the Picture-in-Picture controls.
+         */
+        const val SEEK_STEP_MS = 10_000L
+
+        /** How long a surface hand-off's size reports are left to settle before a paused redraw. */
+        private const val GRAPH_REDRAW_SETTLE_MS = 150L
+
+        /** Silent re-prepare attempts before a renderer error reaches the UI. */
+        private const val MAX_RENDERER_RETRIES = 2
+
+        /**
+         * Silent re-resolve attempts before a source error reaches the UI. One
+         * is enough: the first pass already remints a rejected visitorData and
+         * fetches brand-new URLs, so a second failure means the video really is
+         * unplayable and the user should get the overlay instead of a spinner.
+         */
+        private const val MAX_SOURCE_RETRIES = 1
+
+        /**
+         * Unplayable videos stepped over in a row before the error overlay wins.
+         *
+         * Three, because that is comfortably more than the run of dead entries a
+         * real playlist has in one place and far fewer than it takes to burn
+         * through a playlist when the network is the thing that is broken. The
+         * count resets on the first video that actually reaches STATE_READY.
+         */
+        private const val MAX_QUEUE_ERROR_SKIPS = 3
+
+        /**
+         * Chat backlog kept in memory. Matches the cap YouTube declares in the
+         * response itself (itemList.liveChatItemListRenderer.maxItemsToDisplay),
+         * so a stream left open for hours cannot grow the list without bound.
+         */
+        private const val MAX_LIVE_CHAT_MESSAGES = 250
+
+        /** Consecutive failed polls tolerated before the chat is given up on. */
+        private const val MAX_LIVE_CHAT_POLL_FAILURES = 3
+        private const val LIVE_CHAT_RETRY_DELAY_MS = 5_000L
+
+        /**
+         * Bounds on the server's requested poll interval. Live streams ask for
+         * 10s; a replay can ask for much less, and a misparse must not turn into
+         * a hot loop.
+         */
+        private const val LIVE_CHAT_MIN_WINDOW_MS = 2_000L
+        private const val LIVE_CHAT_MAX_WINDOW_MS = 30_000L
+
+        /**
+         * Pacing bounds for releasing a batch. The floor keeps a burst from
+         * animating one message per frame; the ceiling stops a sparse batch from
+         * sitting in the queue for seconds when there is nothing behind it.
+         */
+        private const val LIVE_CHAT_MIN_GAP_MS = 45L
+        private const val LIVE_CHAT_MAX_GAP_MS = 700L
+
+        /** Poll interval of the drain loop while the queue is empty. */
+        private const val LIVE_CHAT_DRAIN_IDLE_MS = 120L
+
+        /**
+         * Viewer-count refresh. The endpoint asks for 5s; a phone showing one
+         * number does not need it that often.
+         */
+        private const val LIVE_METADATA_POLL_MS = 25_000L
+
+        /**
+         * How often the playhead is sampled for the seek bar.
+         *
+         * Twice a second: the bar is a thin progress line, so a finer tick buys
+         * nothing visible, and the chapter chip only changes at chapter
+         * boundaries. The music player ticks once a second, but it is driving a
+         * timestamp rather than a scrub bar being watched.
+         */
+        private const val PROGRESS_POLL_MS = 500L
+
+        /**
+         * How long the skip chip stays up. Long enough to read three words and
+         * reach the undo, short enough that it is gone before it becomes part
+         * of the video's furniture.
+         */
+        private const val SKIP_NOTICE_DURATION_MS = 5_000L
+
+        /**
+         * Floor between two resume-snapshot writes from the progress poll.
+         * onEnterBackground() saves immediately on its own; this only guards
+         * the foreground-kill backstop above, where every-500ms would be a
+         * disk write nobody asked for.
+         */
+        private const val SESSION_SAVE_INTERVAL_MS = 15_000L
+    }
+
+    override fun onCleared() {
+        connectionWatcher.stop()
+        watchTracker.close()
+        super.onCleared()
+        // Remove quality change listener to prevent leaks
+        qualityChangeListener?.let { _exoPlayer?.removeListener(it) }
+        qualityChangeListener = null
+        sourceRecoveryJob?.cancel()
+        sourceRecoveryJob = null
+        streamLoadJob?.cancel()
+        streamLoadJob = null
+        watchNextJob?.cancel()
+        watchNextJob = null
+        progressJob?.cancel()
+        progressJob = null
+        stopLivePolling()
+        // Before the release below, not after: stop() drops the MediaSession
+        // synchronously on this thread, and a session outliving the player it
+        // wraps crashes the next time Media3 reads state off it.
+        com.sentup.android.service.VideoPlaybackService.stop(context)
+        _exoPlayer?.release()
+        _exoPlayer = null
+        CacheManager.setVideoPlaybackActive(VIDEO_CACHE_OWNER, false)
+    }
+}
+
+/**
+ * A skip that has just happened and can still be undone.
+ *
+ * [returnToMs] is where the playhead actually was, not the segment start: a
+ * viewer who seeks into the middle of a sponsor read and gets skipped should
+ * land back where they were, not at the beginning of a segment they had
+ * already partly passed.
+ *
+ * [id] exists so the chip animates in again for a second skip of the same
+ * segment category, where the data would otherwise compare equal.
+ */
+data class SponsorSkipNotice(
+    val segment: com.sentup.android.data.SponsorSegment,
+    val returnToMs: Long,
+    val id: Long
+)

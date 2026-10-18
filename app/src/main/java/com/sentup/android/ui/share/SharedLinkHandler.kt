@@ -1,0 +1,267 @@
+package com.sentup.android.ui.share
+
+import android.content.Intent
+import android.widget.Toast
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
+import androidx.compose.ui.platform.LocalContext
+import com.sentup.android.data.Song
+import com.sentup.android.data.VideoItem
+import com.sentup.android.data.VideoQueue
+import com.sentup.android.data.YouTubeLinkParser
+import com.sentup.android.ui.home.HomeViewModel
+import com.sentup.android.ui.player.PlayerViewModel
+import com.sentup.android.ui.video.VideoPlayerViewModel
+
+/**
+ * A link handed to Sentüp from outside the app, waiting to be opened.
+ *
+ * [token] distinguishes two shares of the same URL, which are otherwise
+ * indistinguishable to the effect that acts on them - sharing the same video
+ * twice in a row must open it twice.
+ */
+data class PendingSharedLink(
+    val text: String,
+    val token: Long,
+    /**
+     * Tapped inside Sentüp (a description, a post, a channel's links) rather
+     * than handed over by another app. Such a link opens where the user is:
+     * a channel pushes onto the current screen so back returns to it, and a
+     * video plays in the overlay without first dropping the user on Home.
+     */
+    val fromApp: Boolean = false
+)
+
+/**
+ * The link carried by an incoming intent, if any: the shared text for a share
+ * sheet send, the URL itself for an "open with". Returns null for anything
+ * else, including the launcher intent.
+ */
+fun Intent.sharedLinkText(): String? = when (action) {
+    Intent.ACTION_SEND -> getStringExtra(Intent.EXTRA_TEXT)
+    Intent.ACTION_VIEW -> dataString
+    else -> null
+}?.takeIf { it.isNotBlank() }
+
+/**
+ * Opens a YouTube link shared into Sentüp, choosing the player from where the
+ * link points: music.youtube.com goes to the music player, everything else to
+ * the video player.
+ *
+ * **A link that names a video plays it; a link that names only a playlist opens
+ * that playlist's page.** Both kinds used to play, which meant the one route
+ * into a playlist that never passes through its page was also the only one with
+ * no way to keep it - the Save button lives on the page. So a bare playlist link
+ * resolves its header and hands the page to the Home screen's tab system, and a
+ * watch link carrying a list still plays, because naming a video is asking for
+ * that video. In video mode it starts first and the playlist is attached behind
+ * it, so the fetch costs nothing the viewer can see; a list that cannot be
+ * resolved, or that turns out not to contain the shared video, leaves the video
+ * playing on its own rather than failing.
+ *
+ * A playlist with no page behind it - a generated mix, a private or deleted
+ * list - falls back to playing, which is both what happened before and the right
+ * answer for a mix, since there is no page to open.
+ *
+ * Video links skip metadata resolution entirely: [VideoPlayerViewModel.playVideo]
+ * only needs an id to start streaming, and its second phase fills in the title,
+ * channel and related videos. Music links have no such phase, so they resolve
+ * first and the player opens once there is something to show.
+ */
+@Composable
+fun SharedLinkHandler(
+    pendingLink: PendingSharedLink?,
+    enabled: Boolean,
+    localOnlyMode: Boolean,
+    homeViewModel: HomeViewModel,
+    playerViewModel: PlayerViewModel,
+    videoPlayerViewModel: VideoPlayerViewModel,
+    onNavigateHome: () -> Unit,
+    /**
+     * Open a shared channel link. Takes the reference as the link named it -
+     * a `UC…` id, an `@handle` or a legacy vanity name - because the channel
+     * screen resolves whichever it is given, and resolving here would spend a
+     * request before anything is on screen.
+     */
+    onOpenChannel: (String) -> Unit = {}
+) {
+    val context = LocalContext.current
+
+    // Handled tokens are tracked here rather than cleared at the source: the
+    // effect suspends on a network call, and nulling the state it is keyed on
+    // would cancel the resolution half way through.
+    var lastHandledToken by remember { mutableStateOf<Long?>(null) }
+
+    LaunchedEffect(pendingLink?.token, enabled) {
+        val pending = pendingLink ?: return@LaunchedEffect
+        if (!enabled || lastHandledToken == pending.token) return@LaunchedEffect
+        lastHandledToken = pending.token
+
+        fun toast(message: String) =
+            Toast.makeText(context, message, Toast.LENGTH_LONG).show()
+
+        // A Spotify playlist or album: nothing to play, so it goes to the
+        // import screen, which finds the same songs on YouTube Music.
+        if (com.sentup.android.data.SpotifyLinks.parse(pending.text) != null) {
+            if (localOnlyMode) {
+                toast("Local only mode is on. Turn it off in Settings to import from Spotify.")
+            } else {
+                onNavigateHome()
+                homeViewModel.requestSpotifyImport(pending.text)
+            }
+            return@LaunchedEffect
+        }
+
+        val link = YouTubeLinkParser.parseFromSharedText(pending.text)
+        if (link == null) {
+            toast("No YouTube link found in what you shared")
+            return@LaunchedEffect
+        }
+        if (localOnlyMode) {
+            toast("Local only mode is on. Turn it off in Settings to open YouTube links.")
+            return@LaunchedEffect
+        }
+
+        val videoId = link.videoId
+        val playlistId = link.playlistId
+        val channelRef = link.channelRef
+
+        // The music player and playlist pages live inside the Home screen, so
+        // they have nothing to draw on top of Settings or Downloads. A channel
+        // or a video tapped inside the app does not need Home: the channel
+        // route pushes over wherever the user is, and the video overlay sits
+        // above every route, so leaving the screen would only lose their place.
+        val staysInPlace = pending.fromApp && !link.isMusicLink &&
+            (channelRef != null || (videoId != null && playlistId == null))
+        if (!staysInPlace) onNavigateHome()
+
+        when {
+            // A channel link, in any of its four shapes.
+            channelRef != null -> onOpenChannel(channelRef)
+
+            // A music playlist with no track named: open the playlist's page.
+            // Playing it straight off was the whole list arriving with nowhere
+            // to keep it - the Save button lives on that page, and a link is
+            // the one way into a playlist that never passed through it.
+            link.isMusicLink && playlistId != null && videoId == null -> {
+                val page = homeViewModel.resolvePlaylistPageFromLink(playlistId)
+                if (page != null) {
+                    homeViewModel.requestPlaylistPage(page)
+                } else {
+                    // No page behind the id - a mix, a private list, or a
+                    // failed lookup. Playing it is both the old behaviour and
+                    // the right answer for a mix, which has no page to open.
+                    val songs = homeViewModel.resolvePlaylistSongsFromLink(playlistId)
+                    if (songs.isEmpty()) toast("Couldn't open that playlist")
+                    else playerViewModel.playQueue(songs, songs.first())
+                }
+            }
+
+            // Music playlist opening on the track the link named. A link that
+            // names a track is a link to that track, so it plays; only the
+            // playlist itself opens a page.
+            link.isMusicLink && playlistId != null -> {
+                val songs = homeViewModel.resolvePlaylistSongsFromLink(playlistId)
+                if (songs.isEmpty()) {
+                    toast("Couldn't open that playlist")
+                } else {
+                    val start = songs.firstOrNull { it.id == videoId } ?: songs.first()
+                    playerViewModel.playQueue(songs, start)
+                }
+            }
+
+            link.isMusicLink && videoId != null -> {
+                val video = homeViewModel.resolveVideoFromLink(videoId)
+                if (video == null) {
+                    toast("Couldn't open that link")
+                } else {
+                    playerViewModel.playSong(video.toSong())
+                }
+            }
+
+            // A watch link that also names a playlist. The video starts first
+            // and the playlist is attached behind it: resolving the list is a
+            // round trip, and making the shared video wait on it would trade
+            // the thing the user actually tapped for context they did not ask
+            // for. `playQueue` on the video that is already playing attaches
+            // the queue without restarting, which is what makes the two-step
+            // invisible.
+            videoId != null && playlistId != null -> {
+                videoPlayerViewModel.playVideo(placeholderVideo(videoId))
+                val videos = homeViewModel.resolvePlaylistVideosFromLink(playlistId)
+                val startIndex = videos.indexOfFirst { it.videoId == videoId }
+                // The list may not resolve, may not contain the shared video,
+                // and the user may have moved on entirely while it was in
+                // flight. In all three cases the video they opened keeps
+                // playing, unqueued, which is where they already are.
+                if (startIndex >= 0 &&
+                    videoPlayerViewModel.currentVideo.value?.videoId == videoId
+                ) {
+                    videoPlayerViewModel.playQueue(
+                        VideoQueue(
+                            videos = videos,
+                            index = startIndex,
+                            title = "Shared playlist",
+                            playlistId = playlistId
+                        )
+                    )
+                }
+            }
+
+            videoId != null -> videoPlayerViewModel.playVideo(placeholderVideo(videoId))
+
+            // A video playlist on its own, same as the music side: the page
+            // rather than immediate playback, because the page is where it can
+            // be kept, played in order, or looked at before either.
+            playlistId != null -> {
+                val page = homeViewModel.resolvePlaylistPageFromLink(playlistId)
+                if (page != null) {
+                    homeViewModel.requestVideoPlaylistPage(page)
+                } else {
+                    val videos = homeViewModel.resolvePlaylistVideosFromLink(playlistId)
+                    if (videos.isEmpty()) {
+                        toast("Couldn't open that playlist")
+                    } else {
+                        videoPlayerViewModel.playQueue(
+                            VideoQueue(
+                                videos = videos,
+                                index = 0,
+                                title = "Shared playlist",
+                                playlistId = playlistId
+                            )
+                        )
+                    }
+                }
+            }
+        }
+    }
+}
+
+/**
+ * The bare minimum [VideoItem] needed to start playback from an id alone. The
+ * thumbnail is derived rather than fetched so the player has a poster to show
+ * while the first frames buffer; the title and channel arrive with the
+ * watch-next phase a moment later.
+ */
+private fun placeholderVideo(videoId: String) = VideoItem(
+    videoId = videoId,
+    title = "",
+    channelName = "",
+    thumbnailUrl = "https://i.ytimg.com/vi/$videoId/hqdefault.jpg",
+    duration = 0L,
+    viewCount = ""
+)
+
+/** Music-mode representation of a video resolved from a shared link. */
+private fun VideoItem.toSong(): Song = Song.fromYouTube(
+    videoId = videoId,
+    title = title,
+    artist = channelName,
+    album = "",
+    duration = duration * 1000,
+    thumbnailUrl = thumbnailUrl
+)

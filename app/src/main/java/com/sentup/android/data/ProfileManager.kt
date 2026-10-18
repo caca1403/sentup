@@ -1,0 +1,794 @@
+package com.sentup.android.data
+
+import com.sentup.android.util.KLog
+
+import android.content.Context
+import androidx.security.crypto.EncryptedSharedPreferences
+import androidx.security.crypto.MasterKey
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import org.json.JSONArray
+import org.json.JSONObject
+import java.util.UUID
+
+/** What kind of identity a profile is. */
+enum class ProfileKind { YOUTUBE, LOCAL }
+
+/**
+ * One identity in the app.
+ *
+ * A [ProfileKind.YOUTUBE] profile has a stored cookie string and a Google
+ * identity behind it. A [ProfileKind.LOCAL] profile has neither - it is a
+ * device-only identity, which is a first-class thing here rather than a
+ * consolation prize: this app is built to work fully signed out, so "signed
+ * out" is simply the local profile that always exists.
+ *
+ * [id] is a device-local UUID and never changes, because it keys this
+ * profile's stored cookies and its feed-shaping data. [datasyncId] is
+ * YouTube's own account identifier (`responseContext.mainAppWebResponseContext
+ * .datasyncId`, verified August 2026), filled in by
+ * [YouTubeRepository.fetchAccountInfo] once an authenticated call has
+ * answered. It exists to recognise that an account is one already in the
+ * roster, so signing back into it updates rather than duplicates - and so a
+ * restored backup can tell that an account in the file is the one this device
+ * is already signed into. **It is null until that first authenticated call
+ * lands**, so anything matching on it needs a path for null rather than
+ * assuming every YouTube profile has one.
+ */
+data class Profile(
+    val id: String,
+    val kind: ProfileKind,
+    val name: String,
+    val handle: String? = null,
+    val avatarUrl: String? = null,
+    val datasyncId: String? = null,
+    val addedAt: Long = System.currentTimeMillis(),
+    /**
+     * The channel of the account behind this profile the user picked, when it
+     * is not the account's primary channel: a brand channel's Google page id,
+     * sent on every request as `X-Goog-PageId`.
+     *
+     * Null - the usual case - means "the primary channel", which is also what
+     * [datasyncId] is consulted for: a profile that was never pointed anywhere
+     * still targets whatever channel YouTube reports its session is on
+     * ([brandChannelIdOf]). This field is the explicit override, and it is
+     * written verbatim, so setting it back to null returns the profile to the
+     * primary channel while leaving the account signed in.
+     */
+    val pageId: String? = null,
+    /**
+     * Whether [pageId] is a choice the user made, rather than merely unused.
+     *
+     * Three states need telling apart, and two fields is the cheapest honest
+     * way to do it: never chosen (`pageId = null`, this false) follows the
+     * channel YouTube reports the session is on; the account's own channel
+     * (`pageId = null`, this true) is a real choice that must send no page id
+     * even when the session is on a brand channel; a brand channel is
+     * (an id, true).
+     */
+    val channelPinned: Boolean = false,
+    /**
+     * True once YouTube answered this profile's authenticated call as
+     * anonymous. Per-profile on purpose: a single global flag would badge the
+     * wrong row the moment there is more than one account.
+     */
+    val expired: Boolean = false
+) {
+    val isLocal: Boolean get() = kind == ProfileKind.LOCAL
+
+    /**
+     * The channel this profile is pointed at, or null for the account's own.
+     *
+     * The rule itself lives in [resolvePageId], because the network layer and
+     * the picker both need it and must not answer differently.
+     */
+    val resolvedPageId: String? get() = resolvePageId(pageId, channelPinned, datasyncId)
+}
+
+/**
+ * The roster of profiles and which one is active.
+ *
+ * **Switching is deliberately just "point at another stored cookie string".**
+ * Every consumer in this app resolves the session fresh on each call -
+ * [SessionManager.getCookies] is a preference read, and NewPipe's downloader,
+ * though initialised once, holds a SessionManager that resolves the same way -
+ * so redirecting the active profile is enough to move the whole app onto
+ * another account. No re-authentication, no network, works offline. What does
+ * need doing is invalidation, and that is [AccountSwitcher]'s job.
+ *
+ * State is companion-scoped for the usual reason (see
+ * [LocalSubscriptionsRepository]): with no DI, every ViewModel news up its own
+ * instance, and a switch has to reach all of them at once.
+ */
+class ProfileManager(context: Context) {
+
+    private val appContext = context.applicationContext
+
+    // Opened once per process, not once per instance: SessionManager holds one
+    // of these and is itself newed up in seven places, and each
+    // EncryptedSharedPreferences.create is a keystore round trip.
+    private val prefs = sharedPrefs(appContext)
+
+    init {
+        synchronized(LOCK) {
+            if (sharedProfiles == null) {
+                migrateIfNeeded()
+                sharedProfiles = MutableStateFlow(loadProfiles())
+                sharedActiveId = MutableStateFlow(loadActiveId())
+            }
+        }
+    }
+
+    val profiles: StateFlow<List<Profile>> get() = sharedProfiles!!.asStateFlow()
+
+    /**
+     * The active profile's id. Everything that caches account-derived state
+     * observes this and resets when it changes.
+     */
+    val activeProfileId: StateFlow<String> get() = sharedActiveId!!.asStateFlow()
+
+    fun active(): Profile = sharedProfiles!!.value.firstOrNull { it.id == sharedActiveId!!.value }
+        ?: ensureDefaultLocal()
+
+    fun get(id: String): Profile? = sharedProfiles!!.value.firstOrNull { it.id == id }
+
+    // ---------------- Cookies (per profile) ----------------
+
+    fun cookiesFor(id: String): String? =
+        prefs.getString(keyCookies(id), null)?.takeIf { it.isNotBlank() }
+
+    /**
+     * Store a cookie string the user signed in with.
+     *
+     * Bumps the profile's session generation, which is what makes a re-login a
+     * *different* login: anything still in flight for the previous one stops
+     * matching. A rotation goes through [mergeSessionCookies] instead and keeps
+     * the generation, because a refreshed cookie is the same login.
+     */
+    fun saveCookiesFor(id: String, cookies: String) {
+        synchronized(LOCK) {
+            prefs.edit().putString(keyCookies(id), cookies)
+                .putLong(keyGeneration(id), prefs.getLong(keyGeneration(id), 0L) + 1L)
+                .apply()
+        }
+    }
+
+    internal fun captureSession(): YouTubeSession? = synchronized(LOCK) {
+        val profile = active()
+        if (profile.isLocal) return@synchronized null
+        cookiesFor(profile.id)?.let { cookies ->
+            // A multi-channel account fetch (see [com.sentup.android.data.youtube.AccountChannels])
+            // reads the same login as the account's other channels while it
+            // pages; its view overrides the profile's own pick for the duration.
+            val view = com.sentup.android.data.youtube.ChannelView.active()
+            YouTubeSession(
+                profileId = profile.id,
+                generation = prefs.getLong(keyGeneration(profile.id), 0L),
+                cookies = cookies,
+                // A channel the user pinned wins, including pinning the
+                // account's own channel, which is a null page id on purpose.
+                // Otherwise the channel YouTube reports this session is
+                // already on, so an app that was never pointed anywhere still
+                // reads the account the way YouTube itself does.
+                pageId = if (view != null) view.pageId else profile.resolvedPageId,
+            )
+        }
+    }
+
+    /**
+     * [session] with the cookies stored now, or null if that login is over.
+     * [requireActive] is what separates "may I write to the account" - which
+     * must not touch a profile the user has switched away from - from "whose
+     * row does this response belong to", which still has an answer afterwards.
+     */
+    internal fun currentSession(session: YouTubeSession, requireActive: Boolean = true): YouTubeSession? =
+        synchronized(LOCK) {
+            val profile = get(session.profileId) ?: return@synchronized null
+            if (profile.isLocal || (requireActive && active().id != profile.id)) return@synchronized null
+            if (prefs.getLong(keyGeneration(profile.id), 0L) != session.generation) return@synchronized null
+            cookiesFor(profile.id)?.let { session.copy(cookies = it) }
+        }
+
+    /** Fold rotated cookies into the profile that sent the request. */
+    internal fun mergeSessionCookies(session: YouTubeSession, updates: Map<String, String>) {
+        synchronized(LOCK) {
+            val current = currentSession(session, requireActive = false) ?: return
+            val merged = mergeSessionCookieUpdates(session.cookies, current.cookies, updates)
+            if (merged != current.cookies) prefs.edit().putString(keyCookies(session.profileId), merged).apply()
+        }
+    }
+
+    internal fun noteSessionExpired(session: YouTubeSession, expired: Boolean): Boolean = synchronized(LOCK) {
+        if (currentSession(session, requireActive = false) == null) return@synchronized false
+        setExpired(session.profileId, expired)
+        active().id == session.profileId
+    }
+
+    internal fun updateSessionIdentity(
+        session: YouTubeSession, name: String? = null, avatarUrl: String? = null, datasyncId: String? = null,
+    ) {
+        synchronized(LOCK) {
+            if (currentSession(session, requireActive = false) == null) return
+            updateIdentity(session.profileId, name = name, avatarUrl = avatarUrl, datasyncId = datasyncId)
+        }
+    }
+
+    // ---------------- Roster writes ----------------
+
+    /**
+     * Add (or refresh) a YouTube profile from a captured cookie string.
+     *
+     * When [datasyncId] matches a profile already in the roster this updates
+     * that one in place and returns it, so re-signing into an account that is
+     * already here repairs it instead of leaving two rows that look identical.
+     */
+    fun addYouTubeProfile(
+        cookies: String,
+        name: String? = null,
+        handle: String? = null,
+        avatarUrl: String? = null,
+        datasyncId: String? = null
+    ): Profile {
+        val existing = datasyncId?.let { sync ->
+            sharedProfiles!!.value.firstOrNull { it.datasyncId == sync }
+        }
+        val profile = existing?.copy(
+            name = name ?: existing.name,
+            handle = handle ?: existing.handle,
+            avatarUrl = avatarUrl ?: existing.avatarUrl,
+            expired = false
+        ) ?: Profile(
+            id = UUID.randomUUID().toString(),
+            kind = ProfileKind.YOUTUBE,
+            name = name ?: "YouTube account",
+            handle = handle,
+            avatarUrl = avatarUrl,
+            datasyncId = datasyncId
+        )
+        saveCookiesFor(profile.id, cookies)
+        upsert(profile)
+        return profile
+    }
+
+    /** Create a device-only profile. Needs no account and never makes a request. */
+    fun addLocalProfile(name: String): Profile {
+        val profile = Profile(
+            id = UUID.randomUUID().toString(),
+            kind = ProfileKind.LOCAL,
+            name = name.trim().takeIf { it.isNotBlank() } ?: "Local profile"
+        )
+        upsert(profile)
+        return profile
+    }
+
+    /**
+     * Fill in identity details once an authenticated call has revealed them.
+     *
+     * A different account arriving on the same profile takes any pinned channel
+     * with it: that page id belonged to the login which just left, and sending
+     * it to another account would ask for a channel that account does not own.
+     * Re-signing into the *same* account keeps the choice, which is what the
+     * account half of the `DATASYNC_ID` is compared for
+     * ([accountIdOf]) - a profile signed in again should come back where the
+     * user left it.
+     */
+    fun updateIdentity(
+        id: String,
+        name: String? = null,
+        handle: String? = null,
+        avatarUrl: String? = null,
+        datasyncId: String? = null
+    ) {
+        val current = get(id) ?: return
+        val accountChanged = datasyncId != null &&
+            current.datasyncId != null &&
+            accountIdOf(datasyncId) != accountIdOf(current.datasyncId)
+        upsert(
+            current.copy(
+                name = name?.takeIf { it.isNotBlank() } ?: current.name,
+                handle = handle ?: current.handle,
+                avatarUrl = avatarUrl ?: current.avatarUrl,
+                datasyncId = datasyncId ?: current.datasyncId,
+                pageId = if (accountChanged) null else current.pageId,
+                channelPinned = if (accountChanged) false else current.channelPinned,
+            )
+        )
+    }
+
+    /**
+     * Point a profile at one of its account's channels, or back at the primary
+     * channel with null.
+     *
+     * Written verbatim rather than with [updateIdentity]'s "a non-null argument
+     * wins" rule, because going back to the primary channel is a real choice and
+     * the only way to express it is with a null.
+     */
+    fun setPageId(id: String, pageId: String?) {
+        val current = get(id) ?: return
+        if (current.channelPinned && current.pageId == pageId) return
+        upsert(current.copy(pageId = pageId, channelPinned = true))
+    }
+
+    fun setExpired(id: String, expired: Boolean) {
+        val current = get(id) ?: return
+        if (current.expired == expired) return
+        upsert(current.copy(expired = expired))
+    }
+
+    /**
+     * Remove a profile and its cookies.
+     *
+     * Its profile-scoped data (history, likes, subscriptions, blocklist) is
+     * left where it is rather than deleted: the id is never reissued, so the
+     * data is unreachable either way, and nothing a slip of the finger can do
+     * should be able to destroy it.
+     *
+     * The last remaining profile cannot be removed - there is always an
+     * identity, even if it is only the default local one - and removing the
+     * active profile falls back to another rather than leaving nothing active.
+     * [beforePublish] is passed to [setActive] when that fallback happens.
+     */
+    fun remove(id: String, beforePublish: (() -> Unit)? = null): Boolean {
+        val list = sharedProfiles!!.value
+        if (list.size <= 1) return false
+        val target = list.firstOrNull { it.id == id } ?: return false
+        prefs.edit().remove(keyCookies(id)).apply()
+        val next = list.filterNot { it.id == id }
+        saveProfiles(next)
+        if (sharedActiveId!!.value == target.id) {
+            setActive(next.first().id, beforePublish = beforePublish)
+        }
+        return true
+    }
+
+    /**
+     * Turn a profile into a device-only one: drop its cookies and its Google
+     * identity, keep everything else.
+     *
+     * This is what signing out of the *last* remaining account does. The id is
+     * deliberately kept, so the feed-shaping data scoped to it - local
+     * subscriptions, the not-recommended list - survives the sign-out. Those
+     * are device-local things the user built up; losing them because an
+     * account was disconnected would be the app throwing away work it never
+     * needed an account for.
+     */
+    fun replaceWithFreshLocal(id: String) {
+        val current = get(id) ?: return
+        prefs.edit().remove(keyCookies(id)).apply()
+        upsert(
+            current.copy(
+                kind = ProfileKind.LOCAL,
+                name = DEFAULT_LOCAL_NAME,
+                handle = null,
+                avatarUrl = null,
+                datasyncId = null,
+                expired = false
+            )
+        )
+    }
+
+    /**
+     * Add profiles read out of a backup, keeping the ids they arrived with,
+     * and drop [dropping] in the same write.
+     *
+     * The one place a profile is created with an id rather than a fresh UUID,
+     * and it has to be: [profileScopedKey] suffixes a profile's local
+     * subscriptions and blocklist with its id, so a restored profile that got
+     * a new one would be an identity with none of its own data.
+     *
+     * Anything whose id is already in the roster is skipped rather than
+     * overwritten, so this can never take a live session away from a row.
+     * [dropping] exists for one case that [BackupRepository] decides on - a
+     * fresh install's untouched default profile, which would otherwise sit
+     * beside the restored one under the same name - and is applied in the same
+     * write so the roster is never briefly wrong. It is refused if it would
+     * empty the roster, since there is always an identity.
+     */
+    fun restoreProfiles(restored: List<Profile>, dropping: Set<String> = emptySet()) {
+        val current = sharedProfiles!!.value
+        val known = current.map { it.id }.toSet()
+        val additions = restored.filterNot { it.id in known }.distinctBy { it.id }
+        val next = (current + additions).filterNot { it.id in dropping }
+        if (next.isEmpty() || next == current) return
+        if (dropping.isNotEmpty()) {
+            val editor = prefs.edit()
+            dropping.forEach { editor.remove(keyCookies(it)) }
+            editor.commit()
+        }
+        saveProfiles(next, commitNow = true)
+    }
+
+    /**
+     * Point the app at another profile. Invalidation is [AccountSwitcher]'s job.
+     *
+     * [commitNow] forces the write to disk before returning, which only a
+     * restore needs: it kills the process on purpose, and an `apply()` still
+     * queued when it does is lost, leaving the restored data scoped to a
+     * profile the app comes back on the wrong side of.
+     *
+     * [beforePublish] runs after the stored id has changed and before
+     * [activeProfileId] emits. [scar] ViewModels collect that flow on
+     * `Dispatchers.Main.immediate`, so a switch made on the main thread runs
+     * their reset handlers inline, inside this call: anything re-pointed only
+     * afterwards (the process-wide profile-scoped stores) was still holding the
+     * previous profile's data while those handlers read it. It must resolve the
+     * profile from the stored id ([activeProfileId] with a context), never
+     * from this instance, whose flow still names the profile being left.
+     */
+    fun setActive(id: String, commitNow: Boolean = false, beforePublish: (() -> Unit)? = null) {
+        if (get(id) == null) return
+        val leaving = sharedActiveId!!.value
+        if (leaving.isNotBlank() && leaving != id) sharedPreviousId.value = leaving
+        val editor = prefs.edit().putString(KEY_ACTIVE_PROFILE, id)
+        if (commitNow) editor.commit() else editor.apply()
+        beforePublish?.invoke()
+        sharedActiveId!!.value = id
+    }
+
+    /**
+     * The profile the user was on before this one, for the long-press
+     * quick-toggle. In memory only: it describes what this session has been
+     * doing, and a value restored from disk would send the first long-press
+     * after a restart somewhere the user did not just come from.
+     */
+    val previousProfileId: StateFlow<String?> get() = sharedPreviousId.asStateFlow()
+
+    // ---------------- Internals ----------------
+
+    private fun upsert(profile: Profile) {
+        val list = sharedProfiles!!.value
+        val next = if (list.any { it.id == profile.id }) {
+            list.map { if (it.id == profile.id) profile else it }
+        } else {
+            list + profile
+        }
+        saveProfiles(next)
+    }
+
+    private fun ensureDefaultLocal(): Profile {
+        val existing = sharedProfiles!!.value.firstOrNull()
+        if (existing != null) {
+            setActive(existing.id)
+            return existing
+        }
+        val profile = Profile(
+            id = UUID.randomUUID().toString(),
+            kind = ProfileKind.LOCAL,
+            name = DEFAULT_LOCAL_NAME
+        )
+        saveProfiles(listOf(profile))
+        setActive(profile.id)
+        return profile
+    }
+
+    /**
+     * Bring a pre-profiles install forward.
+     *
+     * An existing signed-in session becomes the first YouTube profile and
+     * keeps its stored name and avatar, so the upgrade is invisible: the app
+     * comes back signed into the same account. An install with no session gets
+     * the default local profile. Either way the existing feed-shaping data
+     * (local subscriptions, the not-recommended list) belongs to whichever
+     * profile this produces - it is what the user was looking at before the
+     * upgrade, and [profileScopedKey] leaves the un-suffixed keys as that
+     * profile's own.
+     */
+    private fun migrateIfNeeded() {
+        if (prefs.contains(KEY_PROFILES)) return
+        val legacyCookies = prefs.getString(LEGACY_KEY_COOKIES, null)?.takeIf { it.isNotBlank() }
+        val profile = if (legacyCookies != null) {
+            Profile(
+                id = UUID.randomUUID().toString(),
+                kind = ProfileKind.YOUTUBE,
+                name = prefs.getString(LEGACY_KEY_USER_NAME, null)?.takeIf { it.isNotBlank() }
+                    ?: "YouTube account",
+                avatarUrl = prefs.getString(LEGACY_KEY_USER_AVATAR, null)?.takeIf { it.isNotBlank() }
+            )
+        } else {
+            Profile(
+                id = UUID.randomUUID().toString(),
+                kind = ProfileKind.LOCAL,
+                name = DEFAULT_LOCAL_NAME
+            )
+        }
+        val editor = prefs.edit()
+        editor.putString(KEY_PROFILES, JSONArray().put(profile.toJson()).toString())
+        editor.putString(KEY_ACTIVE_PROFILE, profile.id)
+        editor.putString(KEY_MIGRATED_LEGACY_ID, profile.id)
+        if (legacyCookies != null) editor.putString(keyCookies(profile.id), legacyCookies)
+        editor.apply()
+    }
+
+    private fun saveProfiles(list: List<Profile>, commitNow: Boolean = false) {
+        val array = JSONArray()
+        list.forEach { array.put(it.toJson()) }
+        val editor = prefs.edit().putString(KEY_PROFILES, array.toString())
+        if (commitNow) editor.commit() else editor.apply()
+        sharedProfiles!!.value = list
+    }
+
+    private fun loadProfiles(): List<Profile> {
+        val raw = prefs.getString(KEY_PROFILES, null) ?: return emptyList()
+        return try {
+            val array = JSONArray(raw)
+            (0 until array.length()).mapNotNull { i ->
+                array.optJSONObject(i)?.let { fromJson(it) }
+            }
+        } catch (e: Exception) {
+            KLog.e(TAG, "Failed to load profiles", e)
+            emptyList()
+        }
+    }
+
+    private fun loadActiveId(): String {
+        val stored = prefs.getString(KEY_ACTIVE_PROFILE, null)
+        val list = loadProfiles()
+        return stored?.takeIf { id -> list.any { it.id == id } }
+            ?: list.firstOrNull()?.id
+            ?: ""
+    }
+
+    private fun Profile.toJson(): JSONObject = JSONObject().apply {
+        put("id", id)
+        put("kind", kind.name)
+        put("name", name)
+        put("handle", handle ?: JSONObject.NULL)
+        put("avatarUrl", avatarUrl ?: JSONObject.NULL)
+        put("datasyncId", datasyncId ?: JSONObject.NULL)
+        put("pageId", pageId ?: JSONObject.NULL)
+        put("channelPinned", channelPinned)
+        put("addedAt", addedAt)
+        put("expired", expired)
+    }
+
+    private fun fromJson(obj: JSONObject): Profile? {
+        val id = obj.optString("id").takeIf { it.isNotBlank() } ?: return null
+        fun str(key: String) = obj.optString(key).takeIf { it.isNotBlank() && it != "null" }
+        return Profile(
+            id = id,
+            kind = if (obj.optString("kind") == ProfileKind.LOCAL.name) ProfileKind.LOCAL
+            else ProfileKind.YOUTUBE,
+            name = str("name") ?: "Profile",
+            handle = str("handle"),
+            avatarUrl = str("avatarUrl"),
+            datasyncId = str("datasyncId"),
+            pageId = str("pageId"),
+            channelPinned = obj.optBoolean("channelPinned", false),
+            addedAt = obj.optLong("addedAt", 0L),
+            expired = obj.optBoolean("expired", false)
+        )
+    }
+
+    companion object {
+        private const val TAG = "ProfileManager"
+        private const val PREFS_FILE_NAME = "yt_music_session"
+
+        private const val KEY_PROFILES = "profiles"
+        private const val KEY_ACTIVE_PROFILE = "active_profile"
+        private const val KEY_MIGRATED_LEGACY_ID = "migrated_legacy_profile"
+
+        // Pre-profiles keys, read once by the migration and then left alone.
+        private const val LEGACY_KEY_COOKIES = "session_cookies"
+        private const val LEGACY_KEY_USER_NAME = "user_name"
+        private const val LEGACY_KEY_USER_AVATAR = "user_avatar"
+
+        const val DEFAULT_LOCAL_NAME = "No account"
+
+        private fun keyCookies(id: String) = "cookies_$id"
+
+        // Never cleared with the cookies: a removed profile's id is never
+        // reissued, and a counter that restarted at zero would make an old
+        // in-flight session match a new login.
+        private fun keyGeneration(id: String) = "cookie_generation_$id"
+
+        private fun buildPrefs(context: Context) = EncryptedSharedPreferences.create(
+            context,
+            PREFS_FILE_NAME,
+            MasterKey.Builder(context).setKeyScheme(MasterKey.KeyScheme.AES256_GCM).build(),
+            EncryptedSharedPreferences.PrefKeyEncryptionScheme.AES256_SIV,
+            EncryptedSharedPreferences.PrefValueEncryptionScheme.AES256_GCM
+        )
+
+        @Volatile
+        private var prefsInstance: android.content.SharedPreferences? = null
+
+        /**
+         * The one encrypted store, shared by every ProfileManager and
+         * SessionManager in the process. Carries the same keystore-corruption
+         * recovery SessionManager has always done, since it is the same file.
+         */
+        fun sharedPrefs(context: Context): android.content.SharedPreferences {
+            prefsInstance?.let { return it }
+            return synchronized(LOCK) {
+                prefsInstance ?: run {
+                    val app = context.applicationContext
+                    val created = try {
+                        buildPrefs(app)
+                    } catch (e: Exception) {
+                        KLog.e(TAG, "EncryptedSharedPreferences corrupted, resetting", e)
+                        try {
+                            // The preference ciphertext and its device-bound
+                            // key are one unit. Delete both synchronously before
+                            // rebuilding; clear().apply() followed by raw file
+                            // deletion races its own asynchronous disk write.
+                            app.deleteSharedPreferences(PREFS_FILE_NAME)
+                            runCatching {
+                                java.security.KeyStore.getInstance("AndroidKeyStore").apply {
+                                    load(null)
+                                    deleteEntry(MasterKey.DEFAULT_MASTER_KEY_ALIAS)
+                                }
+                            }.onFailure {
+                                KLog.w(TAG, "Could not remove unusable master key", it)
+                            }
+                            buildPrefs(app)
+                        } catch (retry: Exception) {
+                            // Do not turn a permanently unavailable keystore
+                            // into a launch loop, and never fall back to storing
+                            // account cookies in plaintext.
+                            KLog.e(TAG, "Encrypted preferences unavailable; using volatile session", retry)
+                            VolatileSharedPreferences()
+                        }
+                    }
+                    prefsInstance = created
+                    created
+                }
+            }
+        }
+
+        /** The profile that inherited the pre-profiles install's un-suffixed keys. */
+        fun legacyProfileId(context: Context): String? =
+            sharedPrefs(context).getString(KEY_MIGRATED_LEGACY_ID, null)
+
+        /**
+         * The active profile id, read straight from the store.
+         *
+         * A direct read rather than the flow, so the profile-scoped stores can
+         * resolve their keys without depending on a ProfileManager instance
+         * having been constructed first.
+         */
+        fun activeProfileId(context: Context): String =
+            sharedPrefs(context).getString(KEY_ACTIVE_PROFILE, null).orEmpty()
+
+        /**
+         * Suffix a SharedPreferences key with the profile that owns it.
+         *
+         * The profile migrated from a pre-profiles install keeps the
+         * *un-suffixed* keys, so an upgrade does not orphan the subscriptions
+         * and blocklist the user already had - they simply become that
+         * profile's.
+         */
+        fun profileScopedKey(base: String, profileId: String, legacyProfileId: String?): String =
+            if (profileId == legacyProfileId) base else "${base}_$profileId"
+
+        /**
+         * [activeProfileId], building the roster first on the one path where
+         * nothing has yet: a fresh install whose first read comes from a store
+         * rather than from a screen. A blank id would otherwise scope that
+         * store's data to a key no profile ever reads again.
+         */
+        fun requireActiveProfileId(context: Context): String =
+            activeProfileId(context).ifBlank { ProfileManager(context).active().id }
+
+        /**
+         * The profile that kept the device's listening history, likes and
+         * search history when those became per-profile (September 2026).
+         *
+         * They were device-wide until then, so on the first run of that build
+         * the data on disk had to belong to somebody, and it went to whoever
+         * was active - the profile the person was actually using. [scar] It
+         * could not follow [legacyProfileId] the way local subscriptions did:
+         * signing in from "No account" creates a new profile and switches to
+         * it, so on most signed-in installs the legacy profile is a "No
+         * account" row nobody opens, and keying on it would have made
+         * everyone's history and likes vanish from the account they use.
+         *
+         * Recorded once, on first use, in the credential store - which no
+         * backup carries, so a restore can never rewrite it - and never
+         * changed afterwards. That profile keeps the un-suffixed keys and file
+         * names, which is also what an older build reads after a downgrade.
+         */
+        fun historyOwnerProfileId(context: Context): String {
+            cachedHistoryOwner?.let { return it }
+            return synchronized(LOCK) {
+                cachedHistoryOwner ?: run {
+                    val prefs = sharedPrefs(context)
+                    val owner = prefs.getString(KEY_HISTORY_OWNER, null)?.takeIf { it.isNotBlank() }
+                        ?: requireActiveProfileId(context).also { id ->
+                            prefs.edit().putString(KEY_HISTORY_OWNER, id).commit()
+                        }
+                    cachedHistoryOwner = owner
+                    owner
+                }
+            }
+        }
+
+        /** [profileScopedKey] for the stores [historyOwnerProfileId] owns. */
+        fun historyScopedKey(base: String, profileId: String, context: Context): String =
+            profileScopedKey(base, profileId, historyOwnerProfileId(context))
+
+        /**
+         * A file name under `filesDir` for one profile's copy of a
+         * [historyOwnerProfileId] store: `play_history.json` for the owner,
+         * `play_history_<id>.json` for everyone else.
+         *
+         * The id is restricted to UUID characters before it becomes part of a
+         * path. Ids are UUIDs, but a restored profile keeps the id its backup
+         * file claimed, and that file is whatever the user picked.
+         */
+        fun historyScopedFileName(base: String, extension: String, profileId: String, context: Context): String =
+            historyScopedFileName(base, extension, profileId, historyOwnerProfileId(context))
+
+        /** [historyScopedFileName] with the owner given, for tests. */
+        internal fun historyScopedFileName(base: String, extension: String, profileId: String, ownerId: String): String =
+            if (profileId == ownerId) "$base.$extension"
+            else "${base}_${profileId.replace(UNSAFE_FILE_CHARS, "_")}.$extension"
+
+        /** Whether [name] is [base]'s file for some profile, the owner's included. */
+        fun isHistoryScopedFileName(name: String, base: String, extension: String): Boolean =
+            Regex("^${Regex.escape(base)}(_[A-Za-z0-9_-]+)?\\.${Regex.escape(extension)}$").matches(name)
+
+        /**
+         * Copy one store's values from [fromProfileId]'s keys to
+         * [toProfileId]'s, for a profile that should start with another's
+         * data. Never overwrites: a key the destination already holds is left
+         * alone, so a copy can only ever add.
+         */
+        internal fun copyScopedPreferences(
+            prefs: android.content.SharedPreferences,
+            bases: List<String>,
+            fromProfileId: String,
+            toProfileId: String,
+            key: (base: String, profileId: String) -> String,
+        ) {
+            val all = prefs.getAll()
+            val editor = prefs.edit()
+            var changed = false
+            for (base in bases) {
+                val from = key(base, fromProfileId)
+                val to = key(base, toProfileId)
+                if (from == to || all.containsKey(to)) continue
+                when (val value = all[from]) {
+                    is String -> editor.putString(to, value)
+                    is Set<*> -> editor.putStringSet(to, value.filterIsInstance<String>().toSet())
+                    else -> continue
+                }
+                changed = true
+            }
+            if (changed) editor.apply()
+        }
+
+        /**
+         * [copyScopedPreferences] for a file store. Written beside the target
+         * and renamed into place, so a copy cut short leaves nothing rather
+         * than half a JSON file that would read as an empty history.
+         */
+        internal fun copyScopedFile(from: java.io.File, to: java.io.File) {
+            if (from == to || !from.isFile || to.exists()) return
+            val partial = java.io.File(to.parentFile, "${to.name}.partial")
+            runCatching {
+                from.copyTo(partial, overwrite = true)
+                if (!partial.renameTo(to)) partial.delete()
+            }.onFailure {
+                partial.delete()
+                KLog.w(TAG, "Could not copy ${from.name} to a new profile", it)
+            }
+        }
+
+        private const val KEY_HISTORY_OWNER = "history_owner_profile"
+        private val UNSAFE_FILE_CHARS = Regex("[^A-Za-z0-9-]")
+
+        @Volatile
+        private var cachedHistoryOwner: String? = null
+
+        private val LOCK = Any()
+
+        @Volatile
+        private var sharedProfiles: MutableStateFlow<List<Profile>>? = null
+
+        @Volatile
+        private var sharedActiveId: MutableStateFlow<String>? = null
+
+        private val sharedPreviousId = MutableStateFlow<String?>(null)
+    }
+}

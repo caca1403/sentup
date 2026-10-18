@@ -1,0 +1,5 @@
+blank_issues_enabled: false
+contact_links:
+  - name: Discussions
+    url: https://github.com/caca1403/sentup/discussions
+    about: Questions, help with a problem and general discussion. Faster than an issue for anything that is not a bug report.

@@ -1,0 +1,17 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <string name="hf_section_appearance">Ana sayfa görünümü</string>
+    <string name="hf_hero_card">Vitrin kartı</string>
+    <string name="hf_hero_card_sub">Ana sayfanın tepesindeki büyük kart.</string>
+    <string name="hf_resume_shelf">Devam şeridi</string>
+    <string name="hf_resume_shelf_sub">Kaldığın yerden sürdür, vitrinin içinde.</string>
+    <string name="hf_mix_shelf">Karışım rafı</string>
+    <string name="hf_mix_shelf_sub">Günlük ve otomatik karışımlar.</string>
+    <string name="hf_artist_shelf">Sanatçı rafı</string>
+    <string name="hf_artist_shelf_sub">En çok dinlediğin sanatçılar.</string>
+    <string name="hf_artist_density">Sanatçı karo boyutu</string>
+    <string name="hf_density_large">Büyük</string>
+    <string name="hf_density_compact">Sıkı</string>
+    <string name="hf_listening_strip">Dinleme özeti</string>
+    <string name="hf_listening_strip_sub">Bu haftanın dakikaları ve öne çıkan sanatçın.</string>
+</resources>

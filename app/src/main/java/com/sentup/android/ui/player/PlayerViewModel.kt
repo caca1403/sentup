@@ -1,0 +1,2037 @@
+package com.sentup.android.ui.player
+
+import com.sentup.android.util.KLog
+
+import android.content.ComponentName
+import android.content.Context
+import androidx.lifecycle.ViewModel
+import androidx.lifecycle.viewModelScope
+import androidx.media3.common.MediaItem
+import androidx.media3.common.Player
+import androidx.media3.common.util.UnstableApi
+import androidx.media3.session.MediaController
+import androidx.media3.session.SessionToken
+import com.google.common.util.concurrent.ListenableFuture
+import com.google.common.util.concurrent.MoreExecutors
+import com.sentup.android.data.Song
+import com.sentup.android.data.ThemePreferences
+import com.sentup.android.data.MusicQueueItem
+import com.sentup.android.data.QUEUE_START_ABSENT
+import com.sentup.android.data.arrangedBy
+import com.sentup.android.data.playOrderQueuingUpNext
+import com.sentup.android.data.queueIndexForPlayOrder
+import com.sentup.android.data.queueStartIndex
+import com.sentup.android.data.LikedSongsRepository
+import com.sentup.android.data.LyricsRepository
+import com.sentup.android.data.LyricsResult
+import com.sentup.android.service.MusicService
+import com.sentup.android.service.EXTRA_QUEUE_ITEM_ID
+import com.sentup.android.service.toPlaybackMediaItem
+import com.sentup.android.service.toQueueSong
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.flow.MutableSharedFlow
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.SharedFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asSharedFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.flow.collectLatest
+import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.drop
+import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.flow.stateIn
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.launch
+import kotlinx.coroutines.Job
+
+@UnstableApi
+class PlayerViewModel(private val context: Context) : ViewModel() {
+
+    private var controllerFuture: ListenableFuture<MediaController>? = null
+    private val controller: MediaController?
+        get() = try {
+            if (controllerFuture?.isDone == true) controllerFuture?.get() else null
+        } catch (e: Exception) {
+            // Future may have completed exceptionally if the service connection
+            // failed (e.g. onGetSession returned null during a teardown race).
+            KLog.w("PlayerViewModel", "controller getter: failed future", e)
+            null
+        }
+    private var connectRetryAttempts = 0
+
+    /**
+     * A tap can beat the asynchronous MediaController connection on cold
+     * start. Keep only the latest request: a second tap means the user changed
+     * their mind, and replaying both after connection would flash the wrong
+     * song before landing on the right one.
+     */
+    private data class PendingPlayRequest(
+        val queue: List<MusicQueueItem>,
+        val startIndex: Int,
+        val startPositionMs: Long = 0L
+    )
+
+    private var pendingPlayRequest: PendingPlayRequest? = null
+
+    /** A song MusicService could not play, and what it did about it. */
+    data class PlaybackFailure(val title: String?, val outcome: Outcome) {
+        enum class Outcome { SKIPPED, STOPPED, REFUSED }
+    }
+
+    /**
+     * Songs the service gave up on, for the app to say so. Without this a
+     * failed song was a silent jump in the queue, or a player that simply
+     * stopped. Only the newest matters: a run of failures (a dead network)
+     * should read as one message, not a stack of them.
+     */
+    private val _playbackFailures = MutableSharedFlow<PlaybackFailure>(
+        extraBufferCapacity = 1,
+        onBufferOverflow = kotlinx.coroutines.channels.BufferOverflow.DROP_OLDEST,
+    )
+    val playbackFailures: SharedFlow<PlaybackFailure> = _playbackFailures.asSharedFlow()
+
+    private val _currentSong = MutableStateFlow<Song?>(null)
+    val currentSong: StateFlow<Song?> = _currentSong.asStateFlow()
+
+    private val _isPlaying = MutableStateFlow(false)
+    val isPlaying: StateFlow<Boolean> = _isPlaying.asStateFlow()
+
+    private val _progress = MutableStateFlow(0L)
+    val progress: StateFlow<Long> = _progress.asStateFlow()
+
+    private val _duration = MutableStateFlow(0L)
+    val duration: StateFlow<Long> = _duration.asStateFlow()
+
+    private val _isBuffering = MutableStateFlow(false)
+    val isBuffering: StateFlow<Boolean> = _isBuffering.asStateFlow()
+
+    private val _shuffleModeEnabled = MutableStateFlow(false)
+    val shuffleModeEnabled: StateFlow<Boolean> = _shuffleModeEnabled.asStateFlow()
+
+    private val _repeatMode = MutableStateFlow(Player.REPEAT_MODE_OFF)
+    val repeatMode: StateFlow<Int> = _repeatMode.asStateFlow()
+
+    private val _playWhenReady = MutableStateFlow(false)
+    val playWhenReady: StateFlow<Boolean> = _playWhenReady.asStateFlow()
+
+    private val _currentQueue = MutableStateFlow<List<MusicQueueItem>>(emptyList())
+    val currentQueue: StateFlow<List<MusicQueueItem>> = _currentQueue.asStateFlow()
+
+    private val _currentQueueItemId = MutableStateFlow<String?>(null)
+    val currentQueueItemId: StateFlow<String?> = _currentQueueItemId.asStateFlow()
+
+    /** Queue positions in playing order, as last published by the service. */
+    private val _playOrder = MutableStateFlow(IntArray(0))
+
+    /**
+     * Occurrence ids of the rows the listener queued themselves - Add to
+     * queue and Play next - in the current queue. With shuffle on, a later
+     * Add to queue lines up behind the ones still to come, rather than behind
+     * the whole shuffled playlist (see [playOrderQueuingUpNext]).
+     */
+    private val userQueuedIds = mutableSetOf<String>()
+
+    /**
+     * The queue in the order it will actually be heard.
+     *
+     * **This, not [currentQueue], is what a queue screen draws.** With shuffle
+     * off the two are the same list. With shuffle on they are not, and every
+     * queue surface in the app used to draw [currentQueue] anyway: the order
+     * songs were added in, while the player played a different one. "Up next"
+     * named a song that was not next, the row highlighted as playing was
+     * usually somewhere in the middle, and Bento's next-track line - which
+     * takes the item at index + 1 - named a song more or less at random.
+     *
+     * The order comes from the service, which walks its own player's timeline
+     * and publishes the result. It cannot be read here: a `MediaController`'s
+     * timeline is the plain base class, whose shuffle-aware walk is
+     * `index + 1` (see [MusicService.EXTRA_PLAY_ORDER]).
+     *
+     * An order that does not cover the queue exactly once is not trusted - it
+     * is a published order that has not caught up with a queue edited a moment
+     * ago - and the plain order is drawn instead. A wrong order is worse than
+     * an unshuffled one, because only one of the two looks wrong.
+     */
+    val playOrderQueue: StateFlow<List<MusicQueueItem>> = combine(
+        _currentQueue,
+        _playOrder,
+    ) { queue, order ->
+        queue.arrangedBy(order)
+    }.stateIn(viewModelScope, kotlinx.coroutines.flow.SharingStarted.Eagerly, emptyList())
+
+    // Stats tracking
+    private var lastRecordedSongId: String? = null
+    private var playRecordingJob: Job? = null
+
+    // In-flight radio fill for the last playSongRadio() seed
+    private var radioJob: Job? = null
+    private var radioSeedId: String? = null
+    // In-flight auto-queue top-up from loadMoreRecommendations()
+    private var loadMoreJob: Job? = null
+
+    // Flag to prevent listener from restoring song after clear
+    private var isPlayerCleared = false
+    
+    // Liked songs functionality
+    private val likedSongsRepository = LikedSongsRepository(context)
+    
+    private val _isCurrentSongLiked = MutableStateFlow(false)
+    val isCurrentSongLiked: StateFlow<Boolean> = _isCurrentSongLiked.asStateFlow()
+    
+    val likedSongIds: StateFlow<Set<String>> = likedSongsRepository.likedSongIds
+    
+    // Downloads
+    private val downloadRepository = com.sentup.android.data.DownloadRepository.getInstance(context)
+    val downloadedSongs = downloadRepository.downloadedSongs
+    val downloadingIds = downloadRepository.downloadingIds
+    val downloadProgress = downloadRepository.downloadProgress
+
+    // YouTube Repository for fetching more songs
+    private val youTubeRepository = com.sentup.android.data.YouTubeRepository(context)
+
+    // Taste-profile based recommendations for the auto-queue
+    private val recommendationEngine = com.sentup.android.data.RecommendationEngine(context, youTubeRepository)
+
+    // Loading state for "Load More" button
+    private val _isLoadingMore = MutableStateFlow(false)
+    val isLoadingMore: StateFlow<Boolean> = _isLoadingMore.asStateFlow()
+    
+    // Lyrics Repository and State
+    private val lyricsRepository = LyricsRepository(context)
+    
+    // Stats Repository
+    private val statsRepository = com.sentup.android.data.StatsRepository(context)
+
+    /**
+     * Songs played in the last three days, for picking where a Shuffle opens.
+     * The service orders the rest of the shuffle the same way; this only
+     * decides the first song, which it cannot move without a skip.
+     */
+    private val recentSongIds: MutableSet<String> =
+        java.util.concurrent.ConcurrentHashMap.newKeySet()
+
+    // Playback session snapshots for resume-on-reopen
+    private val playbackSessionRepository = com.sentup.android.data.PlaybackSessionRepository(context)
+
+    private val _lyricsResult = MutableStateFlow<LyricsResult>(LyricsResult.Loading)
+    val lyricsResult: StateFlow<LyricsResult> = _lyricsResult.asStateFlow()
+    
+    // Playlist Repository (Local Playlists)
+    private val playlistRepository = com.sentup.android.data.PlaylistRepository(context)
+
+    private val _localPlaylists = playlistRepository.userPlaylists
+    val localPlaylists: StateFlow<List<com.sentup.android.data.PlaylistDisplayItem>> =
+        _localPlaylists.map { list ->
+            list.map { it.toDisplayItem() }
+        }.stateIn(viewModelScope, kotlinx.coroutines.flow.SharingStarted.WhileSubscribed(5000), emptyList())
+
+    // YouTube playlists songs can be added to (loaded on demand when the
+    // Add to Playlist sheet opens; only real "PL..." playlists are editable,
+    // not the synthesized Supermix/Likes entries)
+    private val _youtubeAddablePlaylists =
+        MutableStateFlow<List<com.sentup.android.data.PlaylistDisplayItem>>(emptyList())
+
+    private val hiddenPlaylistsRepository =
+        com.sentup.android.data.HiddenPlaylistsRepository(context)
+
+    private val notInterestedRepository = com.sentup.android.data.NotInterestedRepository(context)
+
+    private val notInterestedActions = com.sentup.android.data.NotInterestedActions(
+        notInterestedRepository,
+        youTubeRepository
+    )
+
+    /**
+     * Stop recommending this song's artist, from the player's overflow.
+     *
+     * The artist and not the song, matching what video mode's player offers:
+     * "not interested" in the thing currently playing is a contradiction, and
+     * the store is a recommendation filter rather than a skip list, so hiding
+     * the playing track would do nothing visible anyway.
+     */
+    fun blockArtist(song: Song) = notInterestedActions.blockArtist(song)
+
+    /**
+     * Local playlists followed by editable YouTube playlists, for the Add to
+     * Playlist sheet.
+     *
+     * A playlist the user hid is left out here too. "Do not show me this" reads
+     * the same way in a picker as it does in the Library, and offering a target
+     * that is invisible everywhere else is how a song ends up somewhere its
+     * owner cannot find it.
+     */
+    val addToPlaylistItems: StateFlow<List<com.sentup.android.data.PlaylistDisplayItem>> =
+        kotlinx.coroutines.flow.combine(
+            localPlaylists,
+            _youtubeAddablePlaylists,
+            hiddenPlaylistsRepository.hiddenPlaylists
+        ) { local, youtube, hidden ->
+            val hiddenIds = hidden.map { it.playlistId }.toSet()
+            (local + youtube).filterNot { it.id in hiddenIds }
+        }.stateIn(viewModelScope, kotlinx.coroutines.flow.SharingStarted.WhileSubscribed(5000), emptyList())
+
+    /** Account playlists holding the song the picker is open on. */
+    private val playlistMembership = com.sentup.android.data.PlaylistMembership(youTubeRepository, viewModelScope)
+    val accountPlaylistsContaining: StateFlow<Set<String>> = playlistMembership.containing
+    val isPlaylistMembershipLoading: StateFlow<Boolean> = playlistMembership.loading
+
+    /** Device playlists, songs included, for the picker's local check marks. */
+    val localPlaylistContents: StateFlow<List<com.sentup.android.data.UserPlaylist>> = playlistRepository.userPlaylists
+
+    /**
+     * Prepare the picker for [song]: re-read the device playlists (another
+     * screen's repository instance may have written since) and ask the account
+     * once which of its playlists hold it.
+     */
+    fun loadPlaylistMembership(song: Song) {
+        viewModelScope.launch { playlistRepository.refreshPlaylists() }
+        if (song.source == com.sentup.android.data.SongSource.YOUTUBE) playlistMembership.load(song.id)
+    }
+
+    /** Tick or untick [song] in a playlist from the picker. */
+    fun setPlaylistMembership(playlistId: String, song: Song, contains: Boolean) {
+        viewModelScope.launch {
+            val isLocal = playlistRepository.userPlaylists.value.any { it.id == playlistId }
+            if (isLocal) {
+                if (contains) playlistRepository.addSongToPlaylist(playlistId, song)
+                else playlistRepository.removeSongFromPlaylist(playlistId, song.id)
+                return@launch
+            }
+            if (song.source != com.sentup.android.data.SongSource.YOUTUBE) return@launch
+            playlistMembership.record(playlistId, song.id, contains)
+            val ok = if (contains) {
+                youTubeRepository.addToYouTubePlaylist(playlistId, song.id, music = true)
+            } else {
+                youTubeRepository.removeFromYouTubePlaylist(playlistId, song.id, music = true)
+            }
+            if (!ok) playlistMembership.forget(playlistId, song.id)
+        }
+    }
+
+    /** Fetch the user's YouTube playlists for the Add to Playlist sheet (once per session). */
+    fun loadYouTubePlaylistsForSheet() {
+        if (_youtubeAddablePlaylists.value.isNotEmpty() || !youTubeRepository.isLoggedIn()) return
+        viewModelScope.launch {
+            _youtubeAddablePlaylists.value = youTubeRepository.getUserPlaylists()
+                .filter { it.id.startsWith("PL") }
+        }
+    }
+        
+    // Cache & Crossfade Settings exposed for UI
+    private val themePreferences = com.sentup.android.data.ThemePreferences(context)
+    val cacheEnabled = themePreferences.cacheEnabled
+    val maxCacheSizeMb = themePreferences.maxCacheSizeMb
+    val currentCacheSize = com.sentup.android.data.CacheManager.currentCacheSizeBytes
+    
+    val crossfadeEnabled = themePreferences.crossfadeEnabled
+    val crossfadeDurationMs = themePreferences.crossfadeDurationMs
+
+    init {
+        initializeController()
+        startProgressUpdates()
+        startBufferingWatchdog()
+        seedRecentSongs()
+        observeProfileSwitches()
+        // The heart can be flipped from outside this ViewModel - the media
+        // notification's like button, or another screen's instance - so it
+        // follows the shared store rather than only song changes.
+        viewModelScope.launch {
+            likedSongsRepository.likedSongIds.collect { updateCurrentSongLikedStatus() }
+        }
+    }
+
+    private fun seedRecentSongs() {
+        viewModelScope.launch {
+            val cutoff = System.currentTimeMillis() - 3L * 24 * 60 * 60 * 1000
+            runCatching { statsRepository.loadHistory() }.getOrNull()
+                ?.asSequence()
+                ?.takeWhile { it.timestamp >= cutoff }
+                ?.forEach { recentSongIds += it.songId }
+        }
+    }
+
+    /**
+     * Follow a profile switch. Playback carries on - the queue is the
+     * listener's, not the account's - but what this ViewModel holds of the
+     * account does not: the add-to-playlist sheet's YouTube playlists (adding
+     * to the last account's playlist would fail), the heart on the playing
+     * song (likes are per profile), and the recently heard songs a fresh-first
+     * shuffle plays last (listening history is per profile).
+     */
+    private fun observeProfileSwitches() {
+        viewModelScope.launch {
+            com.sentup.android.data.ProfileManager(context)
+                .activeProfileId
+                .drop(1)
+                .distinctUntilChanged()
+                .collect {
+                    _youtubeAddablePlaylists.value = emptyList()
+                    updateCurrentSongLikedStatus()
+                    recentSongIds.clear()
+                    seedRecentSongs()
+                }
+        }
+    }
+
+    /**
+     * Global buffering watchdog: whenever the spinner has been showing for 30s
+     * without playback starting, clear it. Covers every path that sets
+     * _isBuffering (playQueue, skip, auto-advance) so a failed resolution can
+     * never leave the UI on an eternal loading state.
+     */
+    private fun startBufferingWatchdog() {
+        viewModelScope.launch {
+            _isBuffering.collectLatest { buffering ->
+                if (buffering) {
+                    delay(30_000)
+                    if (_isBuffering.value && !_isPlaying.value) {
+                        KLog.w("PlayerViewModel", "Buffering watchdog: clearing stuck state")
+                        _isBuffering.value = false
+                    }
+                }
+            }
+        }
+    }
+    
+    /**
+     * Restore the previous playback session on cold start: the full queue,
+     * the song that was playing, and the position inside it — paused, so the
+     * user decides when to jump back in. Falls back to the legacy single-song
+     * restore when no session snapshot exists.
+     */
+    private fun restoreLastSession() {
+        // Only restore if there's no current song and no items in the controller
+        if (_currentSong.value != null) return
+        if ((controller?.mediaItemCount ?: 0) > 0) return
+
+        viewModelScope.launch {
+            val session = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+                playbackSessionRepository.load()
+            }
+            // Re-check: playback may have started while the file was read
+            if (_currentSong.value != null) return@launch
+            if ((controller?.mediaItemCount ?: 0) > 0) return@launch
+
+            if (session == null) {
+                restoreLastPlayedSong()
+                return@launch
+            }
+
+            val queueItem = session.queue[session.currentIndex]
+            val song = queueItem.song
+            KLog.d(
+                "PlayerViewModel",
+                "Restoring session: ${session.queue.size} songs, index=${session.currentIndex}, pos=${session.positionMs}"
+            )
+
+            _currentQueue.value = session.queue
+            _currentQueueItemId.value = queueItem.id
+            _currentSong.value = song
+            _progress.value = session.positionMs
+            if (song.duration > 0) _duration.value = song.duration
+            updateCurrentSongLikedStatus()
+
+            controller?.let { player ->
+                val items = session.queue.map { createMediaItem(it) }
+                player.setMediaItems(items, session.currentIndex, session.positionMs)
+                player.prepare()
+                // The shuffle order it was walking, so songs already heard
+                // stay behind the current one.
+                session.playOrder.takeIf { player.shuffleModeEnabled && it.size == items.size }
+                    ?.let { sendPlayOrder(it.toIntArray()) }
+            }
+
+            fetchLyrics(song)
+        }
+    }
+
+    /**
+     * Legacy fallback restore (pre-session snapshots): last played song only,
+     * from preferences.
+     */
+    private fun restoreLastPlayedSong() {
+        val song = themePreferences.getLastPlayedSong() ?: return
+
+        KLog.d("PlayerViewModel", "Restoring last played song: ${song.title}")
+
+        // Set the current song for UI display
+        val queueItem = MusicQueueItem(song = song)
+        _currentSong.value = song
+        _currentQueue.value = listOf(queueItem)
+        _currentQueueItemId.value = queueItem.id
+
+        // Prepare the song in the player (but don't auto-play)
+        val mediaItem = createMediaItem(queueItem)
+        controller?.setMediaItem(mediaItem)
+        controller?.prepare()
+
+        // Fetch lyrics for this song
+        fetchLyrics(song)
+    }
+
+    private fun initializeController() {
+        val sessionToken = SessionToken(context, ComponentName(context, MusicService::class.java))
+        val future = MediaController.Builder(context, sessionToken)
+            // The sleep timer runs in the service and reports back through the
+            // session's extras, which arrive on MediaController.Listener rather
+            // than on the Player.Listener installed below.
+            .setListener(object : MediaController.Listener {
+                override fun onExtrasChanged(
+                    controller: MediaController,
+                    extras: android.os.Bundle
+                ) {
+                    applySleepTimerExtras(extras)
+                    applyPlaybackSpeedExtras(extras)
+                    applyPlayOrderExtras(extras)
+                }
+
+                override fun onCustomCommand(
+                    controller: MediaController,
+                    command: androidx.media3.session.SessionCommand,
+                    args: android.os.Bundle,
+                ): ListenableFuture<androidx.media3.session.SessionResult> {
+                    if (command.customAction != MusicService.EVENT_PLAYBACK_FAILED) {
+                        return super.onCustomCommand(controller, command, args)
+                    }
+                    val outcome = when (args.getString(MusicService.ARG_FAILED_OUTCOME)) {
+                        MusicService.FAILURE_STOPPED -> PlaybackFailure.Outcome.STOPPED
+                        MusicService.FAILURE_REFUSED -> PlaybackFailure.Outcome.REFUSED
+                        else -> PlaybackFailure.Outcome.SKIPPED
+                    }
+                    _playbackFailures.tryEmit(
+                        PlaybackFailure(args.getString(MusicService.ARG_FAILED_TITLE), outcome)
+                    )
+                    return com.google.common.util.concurrent.Futures.immediateFuture(
+                        androidx.media3.session.SessionResult(androidx.media3.session.SessionResult.RESULT_SUCCESS)
+                    )
+                }
+            })
+            .buildAsync()
+        controllerFuture = future
+
+        future.addListener({
+            val ctrl = try {
+                future.get()
+            } catch (e: Exception) {
+                // "Session not found" / connection rejected — usually a race during
+                // service teardown after the app was swiped away. Retry a couple of
+                // times with backoff so the next time the user opens the app the
+                // controller binds cleanly instead of leaving the UI dead.
+                KLog.w("PlayerViewModel", "MediaController connect failed: ${e.message}")
+                // Release the failed future before scheduling a retry so we don't
+                // leak it — Media3 requires every buildAsync() future to be released
+                // exactly once, and initializeController() will overwrite the field.
+                MediaController.releaseFuture(future)
+                controllerFuture = null
+                if (connectRetryAttempts < 3) {
+                    connectRetryAttempts++
+                    viewModelScope.launch {
+                        delay(300L * connectRetryAttempts)
+                        initializeController()
+                    }
+                }
+                return@addListener
+            }
+            connectRetryAttempts = 0
+
+            // SYNC EXISTING SESSION STATE
+            // This runs when we reconnect to an already-playing session
+            syncStateFromController(ctrl)
+
+            ctrl.addListener(object : Player.Listener {
+                override fun onIsPlayingChanged(isPlaying: Boolean) {
+                    _isPlaying.value = isPlaying
+                    // Clear buffering state when playback actually starts
+                    if (isPlaying) {
+                        _isBuffering.value = false
+                    }
+                }
+
+                override fun onPlayWhenReadyChanged(playWhenReady: Boolean, reason: Int) {
+                    _playWhenReady.value = playWhenReady
+                    // Only set buffering if we're actively in BUFFERING state.
+                    // Avoid setting it for IDLE — playQueue() already handles that,
+                    // and re-setting here causes races where buffering flag gets stuck.
+                    if (playWhenReady && !controller!!.isPlaying) {
+                        val state = controller?.playbackState ?: Player.STATE_IDLE
+                        if (state == Player.STATE_BUFFERING) {
+                            _isBuffering.value = true
+                        }
+                    }
+                }
+
+                override fun onPlaybackStateChanged(playbackState: Int) {
+                    when (playbackState) {
+                        Player.STATE_BUFFERING -> {
+                            _isBuffering.value = true
+                        }
+                        Player.STATE_READY -> {
+                            // Only clear buffering if we were actually playing or about to
+                            _isBuffering.value = false
+                            // Only set duration if it's a valid positive value
+                            val dur = controller?.duration ?: 0L
+                            if (dur > 0) {
+                                _duration.value = dur
+                            }
+                        }
+                        Player.STATE_ENDED -> {
+                            _isBuffering.value = false
+                        }
+                        Player.STATE_IDLE -> {
+                            // Don't aggressively set buffering here.
+                            // playQueue() already sets _isBuffering = true before calling prepare().
+                            // Setting it again here causes race conditions with STATE_READY
+                            // especially for local songs that transition through IDLE->READY
+                            // almost instantly.
+                        }
+                    }
+                }
+
+                override fun onPlayerError(error: androidx.media3.common.PlaybackException) {
+                    KLog.e("PlayerViewModel", "Playback error: ${error.errorCodeName}", error)
+                    // MusicService retries and skips on its own; if it recovers,
+                    // the player re-enters BUFFERING and the flag comes back.
+                    // Clearing here guarantees the spinner can't outlive a
+                    // playback that is never going to start.
+                    _isBuffering.value = false
+                }
+
+                override fun onShuffleModeEnabledChanged(shuffleModeEnabled: Boolean) {
+                    _shuffleModeEnabled.value = shuffleModeEnabled
+                }
+
+                override fun onRepeatModeChanged(repeatMode: Int) {
+                    _repeatMode.value = repeatMode
+                }
+
+                override fun onMediaItemTransition(mediaItem: MediaItem?, reason: Int) {
+                    // If we just cleared the player, don't restore from this callback
+                    if (isPlayerCleared) {
+                        KLog.d("PlayerViewModel", "Ignoring media transition - player was cleared")
+                        return
+                    }
+
+                    // A crossfade swaps the MediaSession onto an incoming
+                    // player that is already STATE_READY, so there may be no
+                    // later READY callback to refresh these values. Publish
+                    // the new timeline values at the item boundary instead of
+                    // leaving the previous song's duration on screen.
+                    //
+                    // [scar] The incoming item's own metadata is asked first,
+                    // and the order is the whole point. `MediaController`'s
+                    // duration is not read off the player - it is
+                    // `playerInfo.sessionPositionInfo.durationMs`, a value the
+                    // session transports [verified September 2026 against the
+                    // Media3 1.11 bytecode] - so at the instant this callback
+                    // runs it can still describe the song that just ended.
+                    // Preferring it therefore published the *previous* song's
+                    // length, and because it was a positive number the
+                    // metadata fallback never ran. The item's own
+                    // `durationMs` is set from `Song.duration` on every queue
+                    // item, is per-occurrence, and cannot be one song behind.
+                    val transitionedDuration = mediaItem?.mediaMetadata?.durationMs?.takeIf { it > 0L }
+                        ?: controller?.duration?.takeIf { it > 0L }
+                        ?: 0L
+                    _duration.value = transitionedDuration
+                    _progress.value = controller?.currentPosition?.coerceAtLeast(0L) ?: 0L
+                    
+                    // The controller's index identifies the exact queue
+                    // occurrence. mediaId only identifies the underlying song
+                    // and is ambiguous when the same track appears twice.
+                    val id = mediaItem?.mediaId
+                    val currentIndex = controller?.currentMediaItemIndex ?: -1
+                    // Metadata carries the occurrence ID through placeholder
+                    // resolution and crossfade player swaps. Prefer it over
+                    // the timeline index so a briefly drifted duplicate cannot
+                    // be mistaken for another copy of the same song.
+                    val mediaQueueItemId = mediaItem?.mediaMetadata?.extras
+                        ?.getString(EXTRA_QUEUE_ITEM_ID)
+                    var queueItem = mediaQueueItemId
+                        ?.let { queueItemId -> _currentQueue.value.find { it.id == queueItemId } }
+                        ?: _currentQueue.value.getOrNull(currentIndex)
+                            ?.takeIf { id.isNullOrEmpty() || it.song.id == id }
+
+                    var song: Song? = queueItem?.song
+                    
+                    // If still null, try to reconstruct from MediaItem metadata
+                    if (song == null && mediaItem != null) {
+                        song = extractSongFromMediaItem(mediaItem)
+                    }
+                    
+                    song?.let {
+                        _currentQueueItemId.value = queueItem?.id
+                        _currentSong.value = it
+                        updateCurrentSongLikedStatus()
+                        fetchLyrics(it)
+                        
+                        // Save as last played song for restoration
+                        themePreferences.saveLastPlayedSong(it)
+
+                        // STATS RECORDING WITH THRESHOLD
+                        // Cancel previous job if any
+                        playRecordingJob?.cancel()
+                        
+                        // Sync history with YouTube and Local Stats
+                        // CRITICAL: Only record play if it's a new song or a deliberate repeat/auto-next.
+                        // We filter out transitions caused by Media Item Replacement (Resolution) 
+                        // by checking if the ID actually changed.
+                        val isResolutionTransition = reason == Player.MEDIA_ITEM_TRANSITION_REASON_PLAYLIST_CHANGED && it.id == lastRecordedSongId
+                        
+                        if (!isResolutionTransition) {
+                            val currentSongId = it.id
+                            playRecordingJob = viewModelScope.launch {
+                                // Wait for 15 seconds of playback before counting as a 'play'
+                                // This prevents skips and resolution changes from inflating stats.
+                                delay(15_000)
+                                // A cold-start session restore fires this transition too but
+                                // never plays; only count it once playback actually ran.
+                                if (isActive && (_isPlaying.value || controller?.playWhenReady == true)) {
+                                    lastRecordedSongId = currentSongId
+                                    recentSongIds += currentSongId
+                                    youTubeRepository.reportPlayback(currentSongId)
+                                    // Fresh pref read: the toggle is flipped
+                                    // from the settings screen and from the
+                                    // history screen's own menu, both holding
+                                    // their own ThemePreferences, so this VM's
+                                    // StateFlow copy is stale at decision time.
+                                    if (themePreferences.isSaveMusicHistoryEnabled()) {
+                                        statsRepository.addPlayEvent(it)
+                                    }
+                                }
+                            }
+                        }
+                        
+                        // AUTO-QUEUE: top the queue up with recommendations when
+                        // fewer than 5 songs are left after the current one.
+                        // Fresh pref read: the settings screen toggles through
+                        // its own ThemePreferences instance, so this VM's
+                        // StateFlow copy is stale at decision time.
+                        // Counted in play order: shuffled, the timeline index
+                        // says nothing about how much of the queue is left.
+                        val totalItems = controller?.mediaItemCount ?: 0
+                        val currentIndex = controller?.currentMediaItemIndex ?: 0
+                        val order = _playOrder.value
+                        val playedThrough = if (order.size == totalItems) {
+                            order.indexOf(currentIndex).coerceAtLeast(0)
+                        } else currentIndex
+                        val songsLeft = totalItems - playedThrough - 1
+
+                        if (songsLeft < 5 && !_isLoadingMore.value &&
+                            themePreferences.isAutoLoadQueueEnabled()
+                        ) {
+                             KLog.d("PlayerViewModel", "Auto-Queue: $songsLeft songs left, loading more...")
+                             loadMoreRecommendations()
+                        }
+                    }
+                }
+            })
+
+            // A user tap wins over cold-start restoration. Previously a tap
+            // made during controller connection updated the mini player but
+            // silently lost the actual play command, leaving the song paused
+            // until Play was tapped a second time.
+            // Before the queue below: a Shuffle button pressed during
+            // connection left both a queue and a mode waiting, and applying
+            // the mode after setMediaItems would start the first song
+            // unshuffled and only shuffle from the second one on.
+            pendingShuffleEnabled?.let { enabled ->
+                pendingShuffleEnabled = null
+                ctrl.shuffleModeEnabled = enabled
+            }
+
+            pendingPlayRequest?.let { pending ->
+                pendingPlayRequest = null
+                playQueueItems(pending.queue, pending.startIndex, pending.startPositionMs)
+            } ?: restoreLastSession()
+        }, MoreExecutors.directExecutor())
+    }
+    
+    /**
+     * Sync UI state from an already-connected MediaController.
+     * Called when the app reconnects to a session that's already playing.
+     */
+    private fun syncStateFromController(ctrl: MediaController) {
+        // Sync playback state
+        _isPlaying.value = ctrl.isPlaying
+        _playWhenReady.value = ctrl.playWhenReady
+        _isBuffering.value = ctrl.playbackState == Player.STATE_BUFFERING
+        _duration.value = if (ctrl.duration > 0) ctrl.duration else 0L
+        _progress.value = ctrl.currentPosition
+        _shuffleModeEnabled.value = ctrl.shuffleModeEnabled
+        _repeatMode.value = ctrl.repeatMode
+        // Extras carry the shuffle seed, and onExtrasChanged only fires on a
+        // change - a controller connecting to a session that is already
+        // shuffling would otherwise never be told which permutation it is in.
+        applyPlayOrderExtras(ctrl.sessionExtras)
+
+        // Rebuild queue from MediaSession
+        val itemCount = ctrl.mediaItemCount
+        if (itemCount > 0 && _currentQueue.value.isEmpty()) {
+            val queueItems = mutableListOf<MusicQueueItem>()
+            for (i in 0 until itemCount) {
+                val mediaItem = ctrl.getMediaItemAt(i)
+                extractSongFromMediaItem(mediaItem)?.let { song ->
+                    queueItems.add(
+                        MusicQueueItem(
+                            id = mediaItem.mediaMetadata.extras
+                                ?.getString(EXTRA_QUEUE_ITEM_ID)
+                                ?: java.util.UUID.randomUUID().toString(),
+                            song = song
+                        )
+                    )
+                }
+            }
+            if (queueItems.isNotEmpty()) {
+                _currentQueue.value = queueItems
+            }
+        }
+        
+        // Sync current song
+        val currentMediaItem = ctrl.currentMediaItem
+        if (currentMediaItem != null && _currentSong.value == null) {
+            val currentItem = currentMediaItem.mediaMetadata.extras
+                ?.getString(EXTRA_QUEUE_ITEM_ID)
+                ?.let { id -> _currentQueue.value.find { it.id == id } }
+                ?: _currentQueue.value.getOrNull(ctrl.currentMediaItemIndex)
+                    ?.takeIf { it.song.id == currentMediaItem.mediaId }
+            var song = currentItem?.song
+            if (song == null) {
+                song = extractSongFromMediaItem(currentMediaItem)
+            }
+            song?.let {
+                _currentQueueItemId.value = currentItem?.id
+                _currentSong.value = it
+                updateCurrentSongLikedStatus()
+                fetchLyrics(it)
+            }
+        }
+        
+        KLog.d("PlayerViewModel", "Synced state: playing=${_isPlaying.value}, song=${_currentSong.value?.title}, queue=${_currentQueue.value.size} items")
+    }
+    
+    /**
+     * The song a queue row describes. The same reading the service uses to
+     * save the queue, so a row reconnected to here and a row restored from a
+     * saved session come back as the same song.
+     */
+    private fun extractSongFromMediaItem(mediaItem: MediaItem): Song? = mediaItem.toQueueSong()
+
+    /** Which queue occurrence [_duration] currently describes - see the loop. */
+    private var durationItemKey: String? = null
+
+    private fun startProgressUpdates() {
+        viewModelScope.launch {
+            var lastPosition = 0L
+            while (isActive) {
+                controller?.let {
+                    val currentPos = it.currentPosition
+
+                    // Only update progress if it's a valid non-negative value
+                    if (currentPos >= 0) {
+                        _progress.value = currentPos
+                    }
+                    
+                    // Duration belongs to one queue occurrence, so it is
+                    // tracked against one: a value published for the previous
+                    // song can then never survive into this one, whatever the
+                    // session did or did not deliver at the boundary. Without
+                    // this the only guard was "is it different from what we
+                    // last showed", which a stale-but-positive duration
+                    // satisfies forever.
+                    val item = it.currentMediaItem
+                    val itemKey = item?.mediaMetadata?.extras?.getString(EXTRA_QUEUE_ITEM_ID)
+                        ?: item?.mediaId
+                    val metadataDuration = item?.mediaMetadata?.durationMs?.takeIf { d -> d > 0L }
+                    if (itemKey != durationItemKey) {
+                        durationItemKey = itemKey
+                        _duration.value = metadataDuration ?: 0L
+                    }
+                    // The item's own duration wins over the session's while it
+                    // has one. It comes from Song.duration - MediaStore for a
+                    // file, the video length for a stream - so it can be off
+                    // by a fraction of a second against the decoded track,
+                    // which is invisible on a progress bar and a far better
+                    // trade than showing another song's length.
+                    val resolved = metadataDuration ?: it.duration.takeIf { d -> d > 0L }
+                    if (resolved != null && _duration.value != resolved) {
+                        _duration.value = resolved
+                    }
+                    
+                    // Update buffering sanity check
+                    if (it.isPlaying) {
+                        // Failsafe: if we are playing and updating progress, we are NOT buffering
+                        if (_isBuffering.value) {
+                             _isBuffering.value = false
+                        }
+                    }
+                    
+                    lastPosition = currentPos
+                }
+                // A controller with no media only needs to notice an external
+                // session adoption eventually; waking once a second forever
+                // on the Home screen buys no visible progress update.
+                delay(if ((controller?.mediaItemCount ?: 0) > 0) 1000 else 5000)
+            }
+        }
+    }
+
+    fun playSong(song: Song) {
+        playQueue(listOf(song))
+    }
+
+    fun playQueue(songs: List<Song>, startSong: Song? = null) {
+        playQueueAtPosition(songs, startSong, 0L)
+    }
+
+    /**
+     * Play [songs] starting [startSong] at [startPositionMs] - the entry point
+     * for handing playback over from another pipeline (video mode's "Listen
+     * as music") rather than starting a list from its top. The absent-start
+     * guard is [playQueue]'s: a start song the list does not contain plays
+     * ahead of that list instead of clamping to index 0.
+     */
+    fun playQueueAtPosition(songs: List<Song>, startSong: Song? = null, startPositionMs: Long = 0L) {
+        if (songs.isEmpty() && startSong == null) return
+
+        val startIndex = queueStartIndex(songs, startSong)
+
+        // A start song the list does not contain means this call site was
+        // handed a list it is not the one showing - the half-wired shape this
+        // codebase has met before, and nothing compile-fails when it happens.
+        // Clamping to index 0 answered a tap on one song by playing a
+        // different one, with nothing logged. Play what was actually asked for
+        // and keep the list behind it, and say so loudly enough that the
+        // wiring gets fixed rather than the symptom being lived with.
+        if (startSong != null && startIndex == QUEUE_START_ABSENT) {
+            KLog.w(
+                "PlayerViewModel",
+                "Start song ${startSong.id} is absent from the list it was played from " +
+                    "(${songs.size} songs); playing it ahead of that list",
+            )
+            playQueueItems(
+                (listOf(startSong) + songs).map { MusicQueueItem(song = it) },
+                0,
+                startPositionMs.coerceAtLeast(0L),
+            )
+            return
+        }
+
+        playQueueItems(
+            songs.map { MusicQueueItem(song = it) },
+            startIndex.coerceAtLeast(0),
+            startPositionMs.coerceAtLeast(0L),
+        )
+    }
+
+    private fun playQueueItems(queue: List<MusicQueueItem>, startIndex: Int, startPositionMs: Long = 0L) {
+        if (queue.isEmpty()) return
+
+        val playbackQueue = queue
+        val safeStartIndex = startIndex.coerceIn(playbackQueue.indices)
+
+        // Reset cleared flag - user is actively playing
+        isPlayerCleared = false
+
+        // A song removed from the queue that is being replaced is no longer
+        // undoable: putting it back would drop it into a queue it was never in.
+        lastQueueRemoval = null
+        userQueuedIds.clear()
+
+        _currentQueue.value = playbackQueue
+        
+        // Update current song immediately for UI responsiveness
+        val currentItem = playbackQueue[safeStartIndex]
+        val currentSong = currentItem.song
+        _currentQueueItemId.value = currentItem.id
+        _currentSong.value = currentSong
+        _isBuffering.value = true // Immediately show loading
+        _duration.value = 0L // Reset duration until we load the new song
+        // A handed-over position (video mode's "Listen as music", a restored
+        // session) is the position until the controller reports its own.
+        if (startPositionMs > 0) _progress.value = startPositionMs
+        if (currentSong.duration > 0) _duration.value = currentSong.duration
+        updateCurrentSongLikedStatus()
+        fetchLyrics(currentSong)
+        
+        val player = controller
+        if (player == null) {
+            pendingPlayRequest = PendingPlayRequest(playbackQueue, safeStartIndex, startPositionMs)
+            return
+        }
+        pendingPlayRequest = null
+        player.let {
+            // Replace the queue as one Media3 command. Building it through one
+            // set followed by multiple adds exposes intermediate timelines to
+            // the service, its transition listener and external controllers.
+            // The complete queue and the intended occurrence now become
+            // current together.
+            it.setMediaItems(
+                playbackQueue.map(::createMediaItem),
+                safeStartIndex,
+                startPositionMs,
+            )
+            it.prepare()
+            it.play()
+        }
+    }
+    
+    /**
+     * Start a radio from [song]: play it right away, then fill the queue with
+     * YouTube's related-songs mix for that track (the same RDAMVM radio
+     * YouTube Music autoplays into).
+     *
+     * This is the right behaviour for a one-off tap — a search result or a
+     * pasted link — where the surrounding list is a set of same-titled matches
+     * rather than a real playlist, so queueing it means hearing the same song
+     * six times from six uploaders.
+     *
+     * Local songs have no radio to fetch, so they just play on their own; list
+     * playback for those still goes through [playQueue].
+     */
+    fun playSongRadio(song: Song) {
+        if (song.source != com.sentup.android.data.SongSource.YOUTUBE) {
+            playSong(song)
+            return
+        }
+
+        playQueue(listOf(song))
+
+        radioJob?.cancel()
+        // Claim the auto-queue slot synchronously: the media-item transition
+        // that playQueue() just triggered lands on the main thread after this
+        // returns and would otherwise fire its own continuation fetch for the
+        // same seed.
+        _isLoadingMore.value = true
+        radioSeedId = song.id
+        radioJob = viewModelScope.launch {
+            try {
+                var radio = youTubeRepository.getRelatedSongs(song.id)
+                    .filter { it.id != song.id }
+
+                // Radio came back empty (no /next mix, or the call failed):
+                // fall back to the taste-profile continuation so the user
+                // isn't left with a one-song queue.
+                if (radio.isEmpty()) {
+                    radio = recommendationEngine.getQueueContinuation(
+                        currentSong = song,
+                        excludeIds = setOf(song.id),
+                        limit = 20
+                    )
+                }
+
+                // Only extend if the user is still on this radio — a tap on
+                // something else while /next was in flight must not graft the
+                // old mix onto the new queue.
+                val queue = _currentQueue.value
+                if (radio.isNotEmpty() && queue.size == 1 && queue[0].song.id == song.id) {
+                    appendToQueue(radio, queuedByUser = false)
+                }
+            } catch (e: Exception) {
+                KLog.e("PlayerViewModel", "Radio fetch failed for ${song.id}", e)
+            } finally {
+                // A cancelled predecessor must not release the flag it no
+                // longer owns — only the current seed clears it.
+                if (radioSeedId == song.id) _isLoadingMore.value = false
+            }
+        }
+    }
+
+    /**
+     * Jump to a song that is already in the queue without rebuilding the
+     * player's timeline, so buffered and prefetched data is kept.
+     * Falls back to [playQueue] if the song isn't in the queue.
+     */
+    fun skipToSong(song: Song) {
+        val queue = _currentQueue.value
+        val index = queue.indexOfFirst { it.song === song }
+            .takeIf { it >= 0 }
+            ?: queue.indexOfFirst { it.song.id == song.id }
+        if (index < 0) {
+            playQueue(listOf(song), song)
+            return
+        }
+        skipToQueueItem(index)
+    }
+
+    /** Jump to one exact queue occurrence, even when its song appears twice. */
+    fun skipToQueueItem(queueItemId: String) {
+        val index = _currentQueue.value.indexOfFirst { it.id == queueItemId }
+        if (index >= 0) skipToQueueItem(index)
+    }
+
+    /**
+     * Seek the player to the queue item at [index] and start playback.
+     */
+    fun skipToQueueItem(index: Int) {
+        val queue = _currentQueue.value
+        val queueItem = queue.getOrNull(index) ?: return
+        val song = queueItem.song
+        val player = controller
+        if (player == null) {
+            playQueueItems(queue, index)
+            return
+        }
+
+        // Guard: if the player's timeline drifted from the UI queue, rebuild.
+        if (!timelineAgreesAt(index)) {
+            playQueueItems(queue, index)
+            return
+        }
+
+        if (index == player.currentMediaItemIndex) {
+            player.play()
+            return
+        }
+
+        isPlayerCleared = false
+
+        // Update UI state immediately for responsiveness (same as playQueue)
+        _currentQueueItemId.value = queueItem.id
+        _currentSong.value = song
+        // The outgoing track remains audible while the target prepares, so
+        // this is not a buffering state and must not show a spinner.
+        _isBuffering.value = false
+        _duration.value = 0L
+        updateCurrentSongLikedStatus()
+        fetchLyrics(song)
+
+        sendSkipCommand(MusicService.CMD_SKIP_TO_INDEX, index)
+    }
+
+    /**
+     * Load more recommendations from YouTube Music and add to queue.
+     */
+    fun loadMoreRecommendations() {
+        if (_isLoadingMore.value) return
+
+        loadMoreJob = viewModelScope.launch {
+            _isLoadingMore.value = true
+            try {
+                // Related-songs radio for the current track, falling back to
+                // seeds from the user's local taste profile (top artists).
+                val newSongs = recommendationEngine.getQueueContinuation(
+                    currentSong = _currentSong.value,
+                    excludeIds = _currentQueue.value.map { it.song.id }.toSet(),
+                    limit = 10
+                )
+
+                if (newSongs.isNotEmpty()) {
+                    appendToQueue(newSongs, queuedByUser = false)
+                }
+            } catch (e: Exception) {
+                KLog.e("PlayerViewModel", "Could not extend the music queue", e)
+            } finally {
+                _isLoadingMore.value = false
+            }
+        }
+    }
+
+    /** "Add to queue": the listener asking to hear these after what is already lined up. */
+    fun addToQueue(songs: List<Song>) = appendToQueue(songs, queuedByUser = true)
+
+    /**
+     * Append [songs] to the end of the queue.
+     *
+     * [queuedByUser] separates the listener's Add to queue from the app's own
+     * top-ups (radio, auto-queue). Both land at the end of the queue; with
+     * shuffle on, the listener's songs are then moved in the play order to
+     * right after the current song and any songs queued before them, while
+     * recommendations stay at the end so they never mix into the playlist.
+     */
+    private fun appendToQueue(songs: List<Song>, queuedByUser: Boolean) {
+        if (songs.isEmpty()) return
+        // The app's own top-ups never refill a player the listener dismissed.
+        if (!queuedByUser && isPlayerCleared) return
+
+        // Radio and auto-queue are recommendations, so "Don't recommend"
+        // applies to them. Without this a blocked artist was queued anyway,
+        // played, and came back in the history as something listened to. What
+        // the listener queues by hand is their own choice and is never filtered.
+        val wanted = if (queuedByUser) songs else notInterestedRepository.filterSongs(songs)
+        val acceptedSongs = songsForCurrentOutput(wanted)
+        if (acceptedSongs.isEmpty()) return
+        val added = acceptedSongs.map { MusicQueueItem(song = it) }
+        val before = _currentQueue.value
+        _currentQueue.value = before + added
+        if (queuedByUser) added.forEach { userQueuedIds += it.id }
+
+        controller?.let { player ->
+            // The new rows' queue indices are only the ones computed below
+            // when the timeline and this list agree about the queue's length.
+            val timelineInStep = player.mediaItemCount == before.size
+            player.addMediaItems(added.map { createMediaItem(it) })
+            if (queuedByUser && timelineInStep && _shuffleModeEnabled.value) {
+                val order = _playOrder.value
+                if (order.size == before.size) {
+                    playOrderQueuingUpNext(order, player.currentMediaItemIndex, added.size) { index ->
+                        before.getOrNull(index)?.id in userQueuedIds
+                    }?.let(::sendPlayOrder)
+                }
+            }
+        }
+    }
+
+    /**
+     * Put [songs] straight after whatever is playing.
+     *
+     * The other half of "add to queue", and the one people reach for more: it
+     * is the difference between "I want this next" and "I want this eventually".
+     * With nothing playing there is no "after", so it starts playback instead of
+     * quietly building a queue nobody asked to hear.
+     */
+    fun playNext(songs: List<Song>) {
+        if (songs.isEmpty()) return
+        val acceptedSongs = songsForCurrentOutput(songs)
+        if (acceptedSongs.isEmpty()) return
+        val currentList = _currentQueue.value
+        if (currentList.isEmpty() || _currentSong.value == null) {
+            playQueue(acceptedSongs)
+            return
+        }
+
+        val player = controller
+        val insertAt = ((player?.currentMediaItemIndex ?: currentIndexInQueue()) + 1)
+            .coerceIn(0, currentList.size)
+
+        val added = acceptedSongs.map { MusicQueueItem(song = it) }
+        // Queued by the listener, so a later Add to queue lines up behind them.
+        added.forEach { userQueuedIds += it.id }
+        _currentQueue.value = currentList.toMutableList().apply { addAll(insertAt, added) }
+        // The timeline can be shorter than the UI queue when the two have
+        // drifted, and Media3 throws rather than clamping an out-of-range
+        // insert. Append in that case; the order is wrong either way, and the
+        // next explicit jump rebuilds the timeline from the queue.
+        player?.let {
+            it.addMediaItems(
+                insertAt.coerceAtMost(it.mediaItemCount),
+                added.map { createMediaItem(it) }
+            )
+            // Behind the last queue row an insertion looks like an append,
+            // which the shuffle order plays last; put it after the current song.
+            val order = _playOrder.value
+            val currentAt = order.indexOf(insertAt - 1)
+            if (_shuffleModeEnabled.value && insertAt == currentList.size &&
+                order.size == currentList.size && currentAt >= 0
+            ) {
+                sendPlayOrder(
+                    order.toMutableList()
+                        .apply { addAll(currentAt + 1, added.indices.map { i -> insertAt + i }) }
+                        .toIntArray()
+                )
+            }
+        }
+    }
+
+    fun playNext(song: Song) = playNext(listOf(song))
+
+    fun addToQueue(song: Song) = addToQueue(listOf(song))
+
+    private fun songsForCurrentOutput(songs: List<Song>): List<Song> = songs
+
+    /** Where the playing song sits in [_currentQueue], or 0 if it is not in it. */
+    private fun currentIndexInQueue(): Int {
+        val queueItemId = _currentQueueItemId.value
+        if (queueItemId != null) {
+            val index = _currentQueue.value.indexOfFirst { it.id == queueItemId }
+            if (index >= 0) return index
+        }
+        val songId = _currentSong.value?.id ?: return 0
+        return _currentQueue.value.indexOfFirst { it.song.id == songId }.coerceAtLeast(0)
+    }
+
+    /**
+     * True when the player's timeline still agrees with [_currentQueue] at
+     * [index].
+     *
+     * The two can drift - a failed resolution, a session restored underneath
+     * us - and [skipToQueueItem] has always checked before seeking. A move or a
+     * remove that does not check is worse than a seek that does not: it edits
+     * the wrong song and leaves the queue and the timeline further apart than
+     * it found them.
+     */
+    private fun timelineAgreesAt(index: Int): Boolean {
+        val player = controller ?: return false
+        val queueItem = _currentQueue.value.getOrNull(index) ?: return false
+        if (index >= player.mediaItemCount) return false
+        val mediaItem = player.getMediaItemAt(index)
+        val mediaQueueItemId = mediaItem.mediaMetadata.extras?.getString(EXTRA_QUEUE_ITEM_ID)
+        return mediaItem.mediaId == queueItem.song.id &&
+            (mediaQueueItemId == null || mediaQueueItemId == queueItem.id)
+    }
+
+    /**
+     * Move a queue item.
+     *
+     * [persist] no longer does anything: the session is saved by MusicService
+     * once the queue stops changing, which already folds a drag's steps into
+     * one write. It stays so the drag call sites need not change.
+     */
+    @Suppress("UNUSED_PARAMETER")
+    fun moveQueueItem(fromIndex: Int, toIndex: Int, persist: Boolean = true) {
+        val currentList = _currentQueue.value
+        if (fromIndex !in currentList.indices || toIndex !in currentList.indices || fromIndex == toIndex) return
+
+        val agrees = timelineAgreesAt(fromIndex)
+
+        val mutable = currentList.toMutableList()
+        val movedItem = mutable.removeAt(fromIndex)
+        mutable.add(toIndex, movedItem)
+        _currentQueue.value = mutable
+
+        // Only touch the timeline when it was in step to begin with. Out of
+        // step, the UI list is the one the user is looking at and the player
+        // will be rebuilt from it on the next explicit jump.
+        if (agrees) controller?.moveMediaItem(fromIndex, toIndex)
+    }
+
+    /**
+     * Move a queue item the user dragged on a queue screen.
+     *
+     * The screens draw [playOrderQueue], so both positions are positions in
+     * the play order, and with shuffle on that is not the queue: dragging row
+     * five onto row two and passing those straight to [moveQueueItem] would
+     * pick up whichever songs happen to sit at queue positions five and two -
+     * two songs the user was not touching. Unshuffled the two orders are the
+     * same list and this is exactly the old call.
+     */
+    @Suppress("UNUSED_PARAMETER")
+    fun movePlayOrderItem(fromIndex: Int, toIndex: Int, persist: Boolean = true) {
+        val order = _playOrder.value
+        val size = _currentQueue.value.size
+
+        // Shuffle off: the two orders are the same list and this is the old
+        // call, queue edit and all.
+        if (!_shuffleModeEnabled.value || order.size != size) {
+            moveQueueItem(
+                queueIndexForPlayOrder(order, size, fromIndex),
+                queueIndexForPlayOrder(order, size, toIndex),
+            )
+            return
+        }
+
+        // Shuffle on: what the user is editing is the order, not the queue, so
+        // the queue is left exactly as it is. Going through moveMediaItem here
+        // would be worse than doing nothing - ExoPlayer clones its ShuffleOrder
+        // on a timeline move and DefaultShuffleOrder.cloneAndInsert drops the
+        // item at a random position in the permutation, so the song would
+        // leave the row it was dropped on and reappear somewhere arbitrary.
+        if (fromIndex !in order.indices || toIndex !in order.indices || fromIndex == toIndex) return
+        val rearranged = order.toMutableList()
+        rearranged.add(toIndex, rearranged.removeAt(fromIndex))
+        sendPlayOrder(rearranged.toIntArray())
+    }
+
+    /** Replace the service's shuffle permutation; refused there unless it fits the queue. */
+    private fun sendPlayOrder(order: IntArray) {
+        _playOrder.value = order
+        controller?.sendCustomCommand(
+            androidx.media3.session.SessionCommand(
+                MusicService.CMD_SET_PLAY_ORDER,
+                android.os.Bundle.EMPTY,
+            ),
+            android.os.Bundle().apply { putIntArray(MusicService.ARG_PLAY_ORDER, order) },
+        )
+    }
+
+    /**
+     * The drag has settled. Nothing to do here any more: MusicService saves
+     * the session itself, a moment after the queue stops changing, so the
+     * steps of a drag already collapse into one write. Kept as the queue
+     * screens' settle hook.
+     */
+    fun commitQueueOrder() = Unit
+
+    /**
+     * Take a song out of the queue.
+     *
+     * The last song stays: an empty queue with a song still playing is a state
+     * nothing else in the app knows how to draw. Removing what is currently
+     * playing is allowed, and Media3 advances to the next item on its own,
+     * which is what every other player does.
+     */
+    fun removeQueueItem(index: Int) {
+        val currentList = _currentQueue.value
+        if (index !in currentList.indices) return
+        if (currentList.size <= 1) return
+
+        val agrees = timelineAgreesAt(index)
+        lastQueueRemoval = QueueRemoval(currentList[index], index)
+
+        val mutable = currentList.toMutableList()
+        mutable.removeAt(index)
+        _currentQueue.value = mutable
+
+        if (agrees) controller?.removeMediaItem(index)
+    }
+
+    /** Remove one exact queue occurrence without relying on a stale UI index. */
+    fun removeQueueItem(queueItemId: String) {
+        val index = _currentQueue.value.indexOfFirst { it.id == queueItemId }
+        if (index >= 0) removeQueueItem(index)
+    }
+
+    /** A song just taken out of the queue, kept so the snackbar can put it back. */
+    data class QueueRemoval(val item: MusicQueueItem, val index: Int)
+
+    private var lastQueueRemoval: QueueRemoval? = null
+
+    /**
+     * Put the last removed song back where it was.
+     *
+     * Restoring at the recorded index rather than appending, because "undo"
+     * that drops the song at the end of the queue has not undone anything the
+     * user can see.
+     */
+    fun undoQueueRemoval() {
+        val removal = lastQueueRemoval ?: return
+        lastQueueRemoval = null
+        val currentList = _currentQueue.value
+        val at = removal.index.coerceIn(0, currentList.size)
+
+        _currentQueue.value = currentList.toMutableList().apply { add(at, removal.item) }
+        controller?.let { player ->
+            if (at <= player.mediaItemCount) {
+                player.addMediaItem(at, createMediaItem(removal.item))
+            }
+        }
+    }
+
+    private fun createMediaItem(queueItem: MusicQueueItem): MediaItem =
+        queueItem.toPlaybackMediaItem()
+
+    fun togglePlayPause() {
+        controller?.let {
+            if (it.isPlaying) {
+                it.pause()
+            } else {
+                it.play()
+            }
+        }
+    }
+
+    /**
+     * Pause music playback without touching the queue. Also cancels a pending
+     * playWhenReady while a track is still buffering, so a song that finishes
+     * resolving after a video started does not begin playing over it.
+     */
+    fun pause() {
+        controller?.pause()
+    }
+
+    fun toggleShuffle() {
+        setShuffleEnabled(!(controller?.shuffleModeEnabled ?: false))
+    }
+
+    fun setShuffleEnabled(enabled: Boolean) {
+        val ctrl = controller
+        if (ctrl == null) {
+            // Nothing to write to yet. Remembered rather than dropped, because
+            // the one caller that hits this is a Shuffle button pressed on a
+            // cold start, where the queue it is shuffling is also waiting in
+            // pendingPlayRequest.
+            pendingShuffleEnabled = enabled
+            return
+        }
+        ctrl.shuffleModeEnabled = enabled
+    }
+
+    private var pendingShuffleEnabled: Boolean? = null
+
+    /**
+     * Play a collection with shuffle on, for the Shuffle button on a playlist,
+     * album, artist or the library.
+     *
+     * **This is a mode, not a one-off.** Those buttons used to play a
+     * `songs.shuffled()` copy as an ordinary queue while the player's shuffle
+     * toggle stayed off, so the two controls disagreed about what had just
+     * happened: the toggle said "not shuffling" over an obviously shuffled
+     * queue, turning it off did nothing, and turning it on shuffled the
+     * already-shuffled copy again.
+     *
+     * The start song is picked at random rather than taken from the top:
+     * the shuffle order opens with the song playback starts on, so starting
+     * at 0 would open every shuffle of an album with track one. And from the
+     * songs not heard lately where there are any, so pressing Shuffle twice in
+     * a day does not open on the same few songs (the service puts those at
+     * the back of the order for the same reason).
+     */
+    fun playQueueShuffled(songs: List<Song>) {
+        if (songs.isEmpty()) return
+        setShuffleEnabled(true)
+        val start = songs.filterNot { it.id in recentSongIds }.randomOrNull() ?: songs.random()
+        playQueueAtPosition(songs, start, 0L)
+    }
+
+    fun toggleRepeat() {
+        controller?.let {
+            val nextMode = when (it.repeatMode) {
+                Player.REPEAT_MODE_OFF -> Player.REPEAT_MODE_ALL
+                Player.REPEAT_MODE_ALL -> Player.REPEAT_MODE_ONE
+                Player.REPEAT_MODE_ONE -> Player.REPEAT_MODE_OFF
+                else -> Player.REPEAT_MODE_OFF
+            }
+            it.repeatMode = nextMode
+        }
+    }
+
+    fun seekTo(position: Long) {
+        controller?.seekTo(position)
+        _progress.value = position
+    }
+
+    // --- Sleep timer ---
+    //
+    // Owned by MusicService, not by this ViewModel. The timer used to be a
+    // viewModelScope.launch { delay(...) } here, which meant it was cancelled
+    // the moment MainActivity was destroyed - backing out of the app while the
+    // music kept playing, which is exactly what someone who has just set a
+    // sleep timer does. It died silently and playback ran on. Everything below
+    // is a remote control for the service's copy.
+
+    /** Wall-clock time when the sleep timer fires, or null when inactive. */
+    private val _sleepTimerEndsAt = MutableStateFlow<Long?>(null)
+    val sleepTimerEndsAt: StateFlow<Long?> = _sleepTimerEndsAt.asStateFlow()
+
+    /** True while playback is set to stop at the end of the current track. */
+    private val _sleepTimerEndOfTrack = MutableStateFlow(false)
+    val sleepTimerEndOfTrack: StateFlow<Boolean> = _sleepTimerEndOfTrack.asStateFlow()
+
+    /** Stop playback after [minutes]; playback fades out rather than cutting. */
+    fun startSleepTimer(minutes: Int) {
+        sendSleepTimerCommand(MusicService.CMD_SLEEP_TIMER_SET, minutes)
+    }
+
+    /** Stop playback when the track that is playing now finishes. */
+    fun startSleepTimerEndOfTrack() {
+        sendSleepTimerCommand(MusicService.CMD_SLEEP_TIMER_SET, 0)
+    }
+
+    fun cancelSleepTimer() {
+        sendSleepTimerCommand(MusicService.CMD_SLEEP_TIMER_CANCEL, 0)
+    }
+
+    private fun sendSleepTimerCommand(action: String, minutes: Int) {
+        val ctrl = controller ?: return
+        val args = android.os.Bundle().apply {
+            putInt(MusicService.ARG_SLEEP_TIMER_MINUTES, minutes)
+        }
+        ctrl.sendCustomCommand(
+            androidx.media3.session.SessionCommand(action, android.os.Bundle.EMPTY),
+            args
+        )
+    }
+
+    /**
+     * The rate music is playing at, 1f being the recorded speed. The service
+     * owns the value - it belongs to both crossfade engines rather than to one
+     * player - and publishes it back here, so this is a mirror of the service's
+     * state rather than a second copy of it.
+     */
+    private val _playbackSpeed = MutableStateFlow(ThemePreferences.DEFAULT_PLAYBACK_SPEED)
+    val playbackSpeed: StateFlow<Float> = _playbackSpeed.asStateFlow()
+
+    /**
+     * Set the playback rate.
+     *
+     * @param persist false while a slider is still under the finger: the rate
+     *   applies immediately either way, because it is judged by ear, and is
+     *   written to preferences once when the gesture ends.
+     */
+    fun setPlaybackSpeed(speed: Float, persist: Boolean = true) {
+        val bounded = speed.coerceIn(
+            ThemePreferences.MIN_PLAYBACK_SPEED,
+            ThemePreferences.MAX_PLAYBACK_SPEED,
+        )
+        // Move the UI on the local value rather than waiting for the round
+        // trip through the session, so the label tracks the finger even if the
+        // service is slow to answer; the published extras correct it after.
+        _playbackSpeed.value = bounded
+        val ctrl = controller ?: return
+        ctrl.sendCustomCommand(
+            androidx.media3.session.SessionCommand(
+                MusicService.CMD_SET_PLAYBACK_SPEED,
+                android.os.Bundle.EMPTY,
+            ),
+            android.os.Bundle().apply {
+                putFloat(MusicService.ARG_PLAYBACK_SPEED, bounded)
+                putBoolean(MusicService.ARG_PLAYBACK_SPEED_PERSIST, persist)
+            },
+        )
+    }
+
+    /**
+     * Adopt the play order the service published, so the queue screens draw
+     * what is going to be played. Also read on connect, so a player reopened
+     * mid-session shows the order already in force rather than the order the
+     * songs were queued in.
+     */
+    private fun applyPlayOrderExtras(extras: android.os.Bundle) {
+        if (!extras.containsKey(MusicService.EXTRA_PLAY_ORDER)) return
+        _playOrder.value = extras.getIntArray(MusicService.EXTRA_PLAY_ORDER) ?: IntArray(0)
+    }
+
+    private fun applyPlaybackSpeedExtras(extras: android.os.Bundle) {
+        if (!extras.containsKey(MusicService.EXTRA_PLAYBACK_SPEED)) return
+        _playbackSpeed.value = extras.getFloat(
+            MusicService.EXTRA_PLAYBACK_SPEED,
+            ThemePreferences.DEFAULT_PLAYBACK_SPEED,
+        )
+    }
+
+    /**
+     * Adopt the timer state the service published. Also called on connect, so
+     * a player reopened after the activity was destroyed picks the running
+     * countdown back up instead of showing nothing.
+     */
+    private fun applySleepTimerExtras(extras: android.os.Bundle) {
+        if (!extras.containsKey(MusicService.EXTRA_SLEEP_TIMER_ENDS_AT)) return
+        val endsAt = extras.getLong(MusicService.EXTRA_SLEEP_TIMER_ENDS_AT, 0L)
+        _sleepTimerEndsAt.value = endsAt.takeIf { it > 0L }
+        _sleepTimerEndOfTrack.value =
+            extras.getBoolean(MusicService.EXTRA_SLEEP_TIMER_END_OF_TRACK, false)
+    }
+
+    fun skipToNext() {
+        controller?.let { player ->
+            if (!player.hasNextMediaItem()) {
+                // FALLBACK: The player might not have the full queue loaded yet.
+                // Check if our local queue has more items.
+                val currentIndex = player.currentMediaItemIndex
+                val queue = _currentQueue.value
+                if (currentIndex < queue.lastIndex) {
+                    // We have a next song in our list, but Player doesn't know it yet.
+                    // Add it before asking the service to overlap into it.
+                    val nextItem = createMediaItem(queue[currentIndex + 1])
+                    player.addMediaItem(currentIndex + 1, nextItem)
+                }
+            }
+            sendSkipCommand(MusicService.CMD_SKIP_NEXT)
+        }
+    }
+
+    fun skipToPrevious() {
+        if (controller == null) return
+        sendSkipCommand(MusicService.CMD_SKIP_PREVIOUS)
+    }
+
+    /**
+     * Get the playing song a fresh stream from YouTube, keeping its place. Only
+     * a failure says anything: success is the player buffering and carrying
+     * on, which is already visible.
+     */
+    fun refreshCurrentStream() {
+        val ctrl = controller ?: return
+        val future = ctrl.sendCustomCommand(
+            androidx.media3.session.SessionCommand(MusicService.CMD_REFRESH_STREAM, android.os.Bundle.EMPTY),
+            android.os.Bundle.EMPTY,
+        )
+        future.addListener(
+            {
+                val code = runCatching { future.get().resultCode }
+                    .getOrDefault(androidx.media3.session.SessionResult.RESULT_ERROR_UNKNOWN)
+                if (code == androidx.media3.session.SessionResult.RESULT_ERROR_IO ||
+                    code == androidx.media3.session.SessionResult.RESULT_ERROR_UNKNOWN
+                ) {
+                    android.widget.Toast.makeText(
+                        context,
+                        com.sentup.android.R.string.np_refresh_failed,
+                        android.widget.Toast.LENGTH_SHORT
+                    ).show()
+                }
+            },
+            androidx.core.content.ContextCompat.getMainExecutor(context)
+        )
+    }
+
+    private fun sendSkipCommand(action: String, index: Int? = null) {
+        val ctrl = controller ?: return
+        val args = android.os.Bundle().apply {
+            index?.let { putInt(MusicService.ARG_SKIP_INDEX, it) }
+        }
+        ctrl.sendCustomCommand(
+            androidx.media3.session.SessionCommand(action, android.os.Bundle.EMPTY),
+            args,
+        )
+    }
+
+    /**
+     * Toggle the like status of the current song.
+     */
+    fun toggleCurrentSongLike() {
+        val song = _currentSong.value ?: return
+        // Pass the full song so its metadata is persisted — the Library's
+        // Liked Songs list needs it to display YouTube songs without a login.
+        val isNowLiked = likedSongsRepository.toggleLike(song)
+        _isCurrentSongLiked.value = isNowLiked
+    }
+
+    /**
+     * Check if a specific song is liked.
+     */
+    fun isSongLiked(songId: String): Boolean {
+        return likedSongsRepository.isLiked(songId)
+    }
+
+    /**
+     * Toggle the like status of any song, not only the playing one.
+     *
+     * [toggleCurrentSongLike] reads the player; the song options sheet acts on
+     * whatever row was long-pressed, which is usually not what is playing.
+     *
+     * @return true when the song is now liked.
+     */
+    fun toggleLike(song: Song): Boolean {
+        val isNowLiked = likedSongsRepository.toggleLike(song)
+        if (song.id == _currentSong.value?.id) _isCurrentSongLiked.value = isNowLiked
+        return isNowLiked
+    }
+
+    /**
+     * Update the liked status for the current song (called when song changes).
+     */
+    private fun updateCurrentSongLikedStatus() {
+        val songId = _currentSong.value?.id
+        _isCurrentSongLiked.value = if (songId != null) {
+            likedSongsRepository.isLiked(songId)
+        } else {
+            false
+        }
+    }
+    
+    // --- Download Actions ---
+
+    private val _pendingSongDownload = MutableStateFlow<Song?>(null)
+    val pendingSongDownload: StateFlow<Song?> = _pendingSongDownload.asStateFlow()
+
+    /** Resolve the album behind a YouTube song id (one music /next call). */
+    suspend fun getSongAlbumRef(videoId: String): com.sentup.android.data.SongAlbumRef? {
+        return try {
+            youTubeRepository.getSongAlbumRef(videoId)
+        } catch (e: kotlinx.coroutines.CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            null
+        }
+    }
+
+    fun toggleDownload(song: Song) {
+        if (downloadRepository.isDownloaded(song.id)) {
+            viewModelScope.launch {
+                downloadRepository.deleteDownload(song.id)
+            }
+        } else if (!downloadRepository.isLocalOriginal(song) && !isDownloading(song.id)) {
+            _pendingSongDownload.value = song
+        }
+    }
+
+    fun dismissPendingSongDownload() {
+        _pendingSongDownload.value = null
+    }
+
+    fun confirmPendingSongDownload(options: com.sentup.android.data.MusicDownloadOptions) {
+        val song = _pendingSongDownload.value ?: return
+        _pendingSongDownload.value = null
+        viewModelScope.launch { downloadRepository.downloadSong(song, options) }
+    }
+    
+    fun isDownloaded(songId: String): Boolean {
+        return downloadRepository.isDownloaded(songId)
+    }
+    
+    fun isDownloading(songId: String): Boolean {
+        return downloadingIds.value.contains(songId)
+    }
+    
+    fun isLocalOriginal(song: Song): Boolean {
+        return downloadRepository.isLocalOriginal(song)
+    }
+    
+    fun downloadPlaylist(songs: List<Song>) {
+        viewModelScope.launch {
+            downloadRepository.downloadPlaylist(songs)
+        }
+    }
+    
+    /**
+     * Whether the full-screen music player is open.
+     *
+     * Owned by the screen that hosts it - this only mirrors it - because the
+     * video overlay needs to know and cannot ask: it is drawn above the
+     * NavHost, while the music player lives inside Home, so the two never share
+     * a scope and the video bar was free to draw over an open music player.
+     */
+    private val _isPlayerExpanded = MutableStateFlow(false)
+    val isPlayerExpanded: StateFlow<Boolean> = _isPlayerExpanded.asStateFlow()
+
+    fun setPlayerExpanded(expanded: Boolean) {
+        _isPlayerExpanded.value = expanded
+    }
+
+    /**
+     * Asks the screen hosting the player to open it full-screen.
+     *
+     * [setPlayerExpanded] cannot do this: it is a mirror, and writing true into
+     * it would only tell the video overlay the player is open while the sheet
+     * itself stayed shut. A handover that arrives from outside Home - "Listen
+     * as music", which starts in an overlay above the NavHost - has to ask
+     * instead, and the ask is dropped when nothing is listening (no replay, one
+     * slot of buffer): off the Home route there is no player sheet to open, and
+     * a queued request would spring one open minutes later when Home returns.
+     */
+    private val _playerExpandRequests = MutableSharedFlow<Unit>(extraBufferCapacity = 1)
+    val playerExpandRequests: SharedFlow<Unit> = _playerExpandRequests.asSharedFlow()
+
+    fun requestPlayerExpanded() {
+        _playerExpandRequests.tryEmit(Unit)
+    }
+
+    /**
+     * Standby, the full-screen bedside view of the playing song. Held here
+     * because it is opened from the player's menu, inside Home, and drawn by
+     * an overlay above everything in MainActivity; this ViewModel is the one
+     * thing both can see. Nothing to show means nothing to open.
+     */
+    private val _isStandbyOpen = MutableStateFlow(false)
+    val isStandbyOpen: StateFlow<Boolean> = _isStandbyOpen.asStateFlow()
+
+    fun openStandby() {
+        if (_currentSong.value != null) _isStandbyOpen.value = true
+    }
+
+    fun closeStandby() {
+        _isStandbyOpen.value = false
+    }
+
+    fun pauseDownload(id: String) = downloadRepository.pauseDownload(id)
+    fun resumeDownload(id: String) = downloadRepository.resumeDownload(id)
+
+    fun cancelDownload(songId: String) {
+        downloadRepository.cancelDownload(songId)
+    }
+
+    /**
+     * Re-queue a failed download. Distinct from toggleDownload, which would
+     * treat the leftover failed entry as a fresh request and leave it in the
+     * progress list.
+     */
+    fun retryDownload(request: com.sentup.android.data.DownloadRequest) {
+        downloadRepository.retryDownload(request)
+    }
+
+    val downloadedVideos = downloadRepository.downloadedVideos
+    val downloadQueue = downloadRepository.downloadQueue
+
+    fun downloadVideo(video: com.sentup.android.data.VideoItem) {
+        viewModelScope.launch { downloadRepository.downloadVideo(video) }
+    }
+
+    fun deleteVideoDownload(videoId: String) {
+        downloadRepository.deleteVideoDownload(videoId)
+    }
+
+    /** Cancel every queued and in-flight download. */
+    fun cancelAllDownloads() {
+        downloadRepository.cancelAll()
+    }
+    
+    fun deleteDownload(songId: String) {
+        downloadRepository.deleteDownload(songId)
+    }
+    
+    // --- Lyrics Actions ---
+
+    private var lyricsFetchJob: Job? = null
+
+    /**
+     * Look the current song's lyrics up again. The lyrics screen offers this
+     * as its single action when the sources had no match: the lookup itself is
+     * unchanged, but the second pass retries with the title's YouTube
+     * decoration stripped, so a retry can succeed where the first attempt
+     * failed to name the song.
+     */
+    fun retryLyrics() {
+        val song = _currentSong.value ?: return
+        fetchLyrics(song)
+    }
+
+    /**
+     * Fetch synced lyrics for the given song.
+     */
+    private fun fetchLyrics(song: Song) {
+        // Cancel the in-flight fetch: on a quick skip A -> B, A's slower
+        // response would otherwise land last and show A's lyrics over B.
+        lyricsFetchJob?.cancel()
+
+        _lyricsResult.value = LyricsResult.Loading
+
+        lyricsFetchJob = viewModelScope.launch {
+            val result = lyricsRepository.fetchLyrics(
+                song = song,
+                // Local lyrics are always checked first. Local-only mode only
+                // disables the provider fallback; it must not disable files
+                // already stored on the device.
+                allowRemote = !themePreferences.isLocalOnlyModeEnabled()
+            )
+            // Belt and braces for the same race: only apply the result if
+            // this is still the song on screen.
+            if (_currentSong.value?.id == song.id) {
+                _lyricsResult.value = result
+            }
+        }
+    }
+    
+    // --- Playlist Actions ---
+
+    fun createPlaylist(name: String, description: String?) {
+        viewModelScope.launch {
+            // Same accent colors the Library's create flow uses, so a playlist
+            // made from the player is not the odd one out in the grid.
+            playlistRepository.createPlaylist(
+                name,
+                description,
+                com.sentup.android.ui.theme.playlistCoverSeeds(context)
+            )
+        }
+    }
+
+    /**
+     * Make a playlist and put [song] straight into it.
+     *
+     * [createPlaylist] only makes an empty one, which is right for the player's
+     * own sheet where the song is added by a second tap on the new row. From
+     * the song options sheet there is no second tap - creating a playlist there
+     * is a way of filing the song you long-pressed, so leaving it empty would
+     * silently drop what the user asked for.
+     */
+    fun createPlaylistWithSong(name: String, description: String?, song: Song) {
+        viewModelScope.launch {
+            val id = playlistRepository.createPlaylist(
+                name,
+                description,
+                com.sentup.android.ui.theme.playlistCoverSeeds(context)
+            )
+            playlistRepository.addSongToPlaylist(id, song)
+        }
+    }
+
+    /**
+     * Save the current queue as a local playlist, in the order it is playing.
+     *
+     * Always local: the queue is a device-side construct, so saving works
+     * signed out and never touches the account or a saved reference. Order and
+     * duplicates go through [replacePlaylistSongs] rather than repeated
+     * [addSongToPlaylist] calls, because the add path drops a track whose id
+     * is already present and a queue may legitimately hold the same track
+     * twice. Reads the queue but never disturbs playback or the queue itself.
+     *
+     * @param onSaved the committed playlist name and track count, for the
+     *   caller's confirmation. Not called when there was nothing to save.
+     */
+    fun saveQueueAsPlaylist(
+        name: String,
+        description: String? = null,
+        onSaved: (savedName: String, trackCount: Int) -> Unit = { _, _ -> }
+    ) {
+        val trimmedName = name.trim()
+        if (trimmedName.isEmpty()) return
+        val tracks = com.sentup.android.data.queueTracksForPlaylist(_currentQueue.value)
+        if (tracks.isEmpty()) return
+        viewModelScope.launch {
+            try {
+                val id = playlistRepository.createPlaylist(
+                    trimmedName,
+                    description?.trim()?.takeUnless { it.isBlank() },
+                    com.sentup.android.ui.theme.playlistCoverSeeds(context)
+                )
+                playlistRepository.replacePlaylistSongs(id, tracks)
+                onSaved(trimmedName, tracks.size)
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                KLog.e("PlayerViewModel", "Could not save the queue as a playlist", e)
+            }
+        }
+    }
+
+    fun addToPlaylist(playlistId: String, song: Song? = _currentSong.value) {
+        if (song == null) return
+        viewModelScope.launch {
+            val isLocal = playlistRepository.userPlaylists.value.any { it.id == playlistId }
+            if (isLocal) {
+                playlistRepository.addSongToPlaylist(playlistId, song)
+            } else if (song.source == com.sentup.android.data.SongSource.YOUTUBE) {
+                // YouTube playlist target: the song id is the videoId
+                youTubeRepository.addToYouTubePlaylist(playlistId, song.id, music = true)
+            }
+        }
+    }
+    
+    /**
+     * Clear the current player state, stop playback, and dismiss the mini player.
+     * This removes the last played song from preferences so it won't restore on next launch.
+     */
+    fun clearPlayer() {
+        // Set flag BEFORE clearing to prevent listener from restoring
+        isPlayerCleared = true
+        pendingPlayRequest = null
+
+        // A radio or auto-queue fetch still in flight would otherwise land
+        // after the clear and put songs back into the emptied player: the
+        // service then saves them as a session, so a song nobody is playing
+        // lingers in the system media controls and comes back on next launch.
+        radioJob?.cancel()
+        loadMoreJob?.cancel()
+        _isLoadingMore.value = false
+
+        controller?.let { player ->
+            player.stop()
+            player.clearMediaItems()
+        }
+        
+        // Clear UI state
+        _currentSong.value = null
+        _currentQueue.value = emptyList()
+        _currentQueueItemId.value = null
+        _isPlaying.value = false
+        _isBuffering.value = false
+        _playWhenReady.value = false
+        _progress.value = 0L
+        _duration.value = 0L
+        _lyricsResult.value = LyricsResult.Loading
+        
+        // Clear stored last played song and session so neither restores
+        themePreferences.clearLastPlayedSong()
+        viewModelScope.launch(kotlinx.coroutines.Dispatchers.IO) {
+            playbackSessionRepository.clear()
+        }
+        
+        KLog.d("PlayerViewModel", "Player cleared and mini player dismissed")
+    }
+
+    override fun onCleared() {
+        super.onCleared()
+        controllerFuture?.let(MediaController::releaseFuture)
+    }
+
+    
+    // --- Settings Actions ---
+    
+    fun clearCache() {
+        viewModelScope.launch(kotlinx.coroutines.Dispatchers.IO) {
+            com.sentup.android.data.CacheManager.clearCache()
+        }
+    }
+    
+    fun setMaxCacheSize(sizeMb: Long) {
+        themePreferences.setMaxCacheSizeMb(sizeMb)
+    }
+    
+    fun toggleCrossfade() {
+        themePreferences.toggleCrossfadeEnabled()
+    }
+    
+    fun setCrossfadeDuration(durationMs: Int) {
+        themePreferences.setCrossfadeDuration(durationMs)
+    }
+}

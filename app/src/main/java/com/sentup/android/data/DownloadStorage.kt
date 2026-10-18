@@ -1,0 +1,385 @@
+package com.sentup.android.data
+
+import com.sentup.android.util.KLog
+
+import android.content.ContentUris
+import android.content.ContentValues
+import android.content.Context
+import android.net.Uri
+import android.os.Environment
+import android.provider.MediaStore
+import java.io.File
+import java.io.OutputStream
+
+/**
+ * Where a download lands in the user's shared storage.
+ *
+ * Both live under the public Downloads directory so they show up in the Files
+ * app as Downloads > Sentüp > Music / Video. [Environment.DIRECTORY_DOWNLOADS] is
+ * the string "Download" (singular) even though Files displays it as "Downloads"
+ * - do not spell it out by hand.
+ */
+enum class DownloadMediaType(
+    val folderName: String,
+    val mimeType: String,
+    val extension: String
+) {
+    MUSIC("Music", "audio/mp4", "m4a"),
+    VIDEO("Video", "video/mp4", "mp4");
+
+    val relativePath: String
+        get() = "${Environment.DIRECTORY_DOWNLOADS}/Sentüp/$folderName"
+}
+
+/**
+ * Writes downloads into shared storage through MediaStore so they are visible
+ * and manageable in the Files app, rather than hidden in the app's private
+ * filesDir.
+ *
+ * Consequences worth knowing about, because they shape the repository:
+ *  - the user can delete these files behind our back, so stored metadata must
+ *    be reconciled against MediaStore rather than trusted,
+ *  - files survive uninstall,
+ *  - no storage permission is needed for entries this app created (API 29+),
+ *    which is why this never touches MANAGE_EXTERNAL_STORAGE.
+ *
+ * Writes go out as IS_PENDING and are only published on success, so a partial
+ * transfer never appears in the Files app as a playable file.
+ */
+class DownloadStorage(private val context: Context) {
+
+    companion object {
+        private const val TAG = "DownloadStorage"
+
+        /** Characters that are illegal in FAT/exFAT names, plus control chars. */
+        private val ILLEGAL_FILENAME_CHARS = Regex("""[\\/:*?"<>|\x00-\x1F]""")
+
+        /**
+         * Cap on the name portion. Most Android volumes are exFAT with a 255
+         * byte limit; multi-byte titles can blow past that well before 255
+         * characters, so this stays conservative.
+         */
+        private const val MAX_NAME_LENGTH = 100
+    }
+
+    private val resolver get() = context.contentResolver
+
+    /**
+     * App-only downloads. Files here are not indexed by MediaStore, are not
+     * reachable from ordinary file managers, are excluded from cloud backup,
+     * and are removed with Sentüp.
+     */
+    private val privateRoot = File(context.noBackupFilesDir, "downloads")
+
+    private val collection: Uri
+        get() = MediaStore.Downloads.getContentUri(MediaStore.VOLUME_EXTERNAL_PRIMARY)
+
+    /**
+     * Turn a title/artist into something safe and readable on disk. These names
+     * are user-facing now, so "Blinding Lights - The Weeknd.m4a" beats the old
+     * "<videoId>.m4a".
+     */
+    fun buildFileName(title: String, artist: String, type: DownloadMediaType): String {
+        return "${safeBaseName(title, artist)}.${type.extension}"
+    }
+
+    /** A cover or LRC that intentionally shares the audio file's stem. */
+    fun buildMusicCompanionFileName(title: String, artist: String, extension: String): String =
+        "${safeBaseName(title, artist)}.${extension.trimStart('.')}"
+
+    private fun safeBaseName(title: String, artist: String): String {
+        val base = if (artist.isBlank()) title else "$title - $artist"
+        return ILLEGAL_FILENAME_CHARS.replace(base, "")
+            .replace(Regex("""\s+"""), " ")
+            .trim()
+            .trim('.')
+            .take(MAX_NAME_LENGTH)
+            .trim()
+            .ifBlank { "Sentüp download" }
+    }
+
+    /**
+     * Create a pending entry and return its URI, or null if MediaStore refused.
+     * The file stays invisible to other apps until [publish].
+     */
+    fun createPending(
+        displayName: String,
+        type: DownloadMediaType,
+        privateStorage: Boolean = false
+    ): Uri? {
+        return if (privateStorage) {
+            createPrivatePending(displayName, type)
+        } else {
+            createMediaStorePending(displayName, type.mimeType, type.relativePath)
+        }
+    }
+
+    /**
+     * Create lyric data beside a music download. It follows the audio's chosen
+     * visibility, unlike artwork which is always private.
+     */
+    fun createPendingMusicCompanion(
+        displayName: String,
+        mimeType: String,
+        privateStorage: Boolean = false
+    ): Uri? {
+        return if (privateStorage) {
+            createPrivatePending(displayName, DownloadMediaType.MUSIC)
+        } else {
+            createMediaStorePending(displayName, mimeType, DownloadMediaType.MUSIC.relativePath)
+        }
+    }
+
+    /**
+     * Album artwork never belongs in shared storage. The cover is embedded in
+     * the M4A for other players; this copy only exists for Sentüp's offline UI.
+     * Publishing it as image/jpeg was what made every cover appear in Gallery.
+     */
+    fun createPrivateMusicArtwork(id: String): Uri? =
+        createPrivatePending("artwork_${safePrivateId(id)}.jpg", DownloadMediaType.MUSIC)
+
+    private fun createMediaStorePending(
+        displayName: String,
+        mimeType: String,
+        relativePath: String
+    ): Uri? {
+        return try {
+            val values = ContentValues().apply {
+                put(MediaStore.MediaColumns.DISPLAY_NAME, displayName)
+                put(MediaStore.MediaColumns.MIME_TYPE, mimeType)
+                put(MediaStore.MediaColumns.RELATIVE_PATH, relativePath)
+                put(MediaStore.MediaColumns.IS_PENDING, 1)
+            }
+            resolver.insert(collection, values)
+        } catch (e: Exception) {
+            KLog.e(TAG, "Failed to create MediaStore entry for $displayName", e)
+            null
+        }
+    }
+
+    private fun createPrivatePending(displayName: String, type: DownloadMediaType): Uri? {
+        return try {
+            val directory = privateDirectory(type).apply { mkdirs() }
+            if (!directory.isDirectory) return null
+
+            val requested = File(directory, displayName)
+            val target = if (!requested.exists()) {
+                requested
+            } else {
+                val stem = requested.nameWithoutExtension
+                val extension = requested.extension.takeIf(String::isNotBlank)?.let { ".$it" }.orEmpty()
+                generateSequence(1) { it + 1 }
+                    .map { index -> File(directory, "$stem ($index)$extension") }
+                    .first { !it.exists() }
+            }
+            if (!target.createNewFile()) return null
+            Uri.fromFile(target)
+        } catch (e: Exception) {
+            KLog.e(TAG, "Failed to create private download for $displayName", e)
+            null
+        }
+    }
+
+    fun openOutput(uri: Uri): OutputStream? {
+        return try {
+            if (uri.scheme == "file") {
+                uri.path?.let(::File)?.outputStream()
+            } else {
+                resolver.openOutputStream(uri)
+            }
+        } catch (e: Exception) {
+            KLog.e(TAG, "Failed to open output for $uri", e)
+            null
+        }
+    }
+
+    /** Clear IS_PENDING, making the file visible in the Files app. */
+    fun publish(uri: Uri): Boolean {
+        if (uri.scheme == "file") {
+            return uri.path?.let(::File)?.let { it.isFile && it.length() > 0L } == true
+        }
+        return try {
+            val values = ContentValues().apply {
+                put(MediaStore.MediaColumns.IS_PENDING, 0)
+            }
+            resolver.update(uri, values, null, null) > 0
+        } catch (e: Exception) {
+            KLog.e(TAG, "Failed to publish $uri", e)
+            false
+        }
+    }
+
+    /**
+     * Delete a download. Returns false when the row was already gone, which is
+     * a normal outcome if the user deleted it from the Files app.
+     */
+    fun delete(uri: Uri): Boolean {
+        return try {
+            if (uri.scheme == "file") {
+                uri.path?.let(::File)?.delete() == true
+            } else {
+                resolver.delete(uri, null, null) > 0
+            }
+        } catch (e: Exception) {
+            KLog.e(TAG, "Failed to delete $uri", e)
+            false
+        }
+    }
+
+    /**
+     * Whether the row still exists. Used to drop metadata for files the user
+     * removed outside the app.
+     */
+    fun exists(uri: Uri): Boolean {
+        if (uri.scheme == "file") {
+            return uri.path?.let(::File)?.isFile == true
+        }
+        return try {
+            resolver.query(
+                uri,
+                arrayOf(MediaStore.MediaColumns._ID),
+                null,
+                null,
+                null
+            )?.use { it.moveToFirst() } ?: false
+        } catch (e: Exception) {
+            false
+        }
+    }
+
+    /** Guard companion cleanup so an old external artwork URI is never deleted. */
+    fun isMusicCompanion(uri: Uri): Boolean {
+        if (uri.scheme == "file") {
+            val file = uri.path?.let(::File) ?: return false
+            return runCatching {
+                file.canonicalFile.parentFile == privateDirectory(DownloadMediaType.MUSIC).canonicalFile &&
+                    (file.extension.lowercase() in setOf("jpg", "jpeg", "png", "webp", "lrc", "ttml"))
+            }.getOrDefault(false)
+        }
+        if (uri.scheme != "content") return false
+        return try {
+            resolver.query(
+                uri,
+                arrayOf(
+                    MediaStore.MediaColumns.RELATIVE_PATH,
+                    MediaStore.MediaColumns.MIME_TYPE,
+                    MediaStore.MediaColumns.DISPLAY_NAME
+                ),
+                null,
+                null,
+                null
+            )?.use { cursor ->
+                if (!cursor.moveToFirst()) return@use false
+                val path = cursor.getString(0).orEmpty()
+                val mimeType = cursor.getString(1).orEmpty()
+                val displayName = cursor.getString(2).orEmpty().lowercase()
+                path.startsWith(DownloadMediaType.MUSIC.relativePath) &&
+                    (mimeType.startsWith("image/") ||
+                        mimeType.startsWith("text/") ||
+                        displayName.endsWith(".lrc") ||
+                        displayName.endsWith(".ttml"))
+            } ?: false
+        } catch (e: Exception) {
+            false
+        }
+    }
+
+    fun isPrivateDownload(uri: Uri, type: DownloadMediaType): Boolean {
+        if (uri.scheme != "file") return false
+        val file = uri.path?.let(::File) ?: return false
+        return runCatching {
+            file.canonicalFile.parentFile == privateDirectory(type).canonicalFile
+        }.getOrDefault(false)
+    }
+
+    /** Whether an old shared companion is the standalone cover leaked to Gallery. */
+    fun isSharedMusicArtwork(uri: Uri): Boolean {
+        if (uri.scheme != "content") return false
+        return try {
+            resolver.query(
+                uri,
+                arrayOf(
+                    MediaStore.MediaColumns.RELATIVE_PATH,
+                    MediaStore.MediaColumns.MIME_TYPE
+                ),
+                null,
+                null,
+                null
+            )?.use { cursor ->
+                cursor.moveToFirst() &&
+                    cursor.getString(0).orEmpty()
+                        .startsWith(DownloadMediaType.MUSIC.relativePath) &&
+                    cursor.getString(1).orEmpty().startsWith("image/")
+            } ?: false
+        } catch (e: Exception) {
+            false
+        }
+    }
+
+    /**
+     * Copy a previously published cover into app-only storage, then remove its
+     * MediaStore row so gallery apps stop indexing it. Copy-before-delete keeps
+     * offline artwork intact if either side fails.
+     */
+    fun moveSharedArtworkToPrivate(source: Uri, id: String): Uri? {
+        if (!isSharedMusicArtwork(source)) return null
+        val target = createPrivateMusicArtwork(id) ?: return null
+        val copied = runCatching {
+            resolver.openInputStream(source)?.use { input ->
+                openOutput(target)?.use { output -> input.copyTo(output) }
+            } != null
+        }.getOrDefault(false)
+        if (!copied || !publish(target)) {
+            delete(target)
+            return null
+        }
+        if (!delete(source)) {
+            delete(target)
+            return null
+        }
+        return target
+    }
+
+    /**
+     * Every published file this app owns under the given Sentüp folder, keyed by
+     * URI. Lets the repository reconcile in one query rather than probing each
+     * stored entry individually.
+     */
+    fun listExisting(type: DownloadMediaType): Map<Uri, String> {
+        val result = mutableMapOf<Uri, String>()
+        try {
+            resolver.query(
+                collection,
+                arrayOf(
+                    MediaStore.MediaColumns._ID,
+                    MediaStore.MediaColumns.DISPLAY_NAME
+                ),
+                "${MediaStore.MediaColumns.RELATIVE_PATH} LIKE ?",
+                arrayOf("${type.relativePath}%"),
+                null
+            )?.use { cursor ->
+                val idColumn = cursor.getColumnIndexOrThrow(MediaStore.MediaColumns._ID)
+                val nameColumn =
+                    cursor.getColumnIndexOrThrow(MediaStore.MediaColumns.DISPLAY_NAME)
+                while (cursor.moveToNext()) {
+                    val uri = ContentUris.withAppendedId(collection, cursor.getLong(idColumn))
+                    result[uri] = cursor.getString(nameColumn) ?: ""
+                }
+            }
+        } catch (e: Exception) {
+            KLog.e(TAG, "Failed to list ${type.relativePath}", e)
+        }
+
+        privateDirectory(type).listFiles()
+            ?.asSequence()
+            ?.filter(File::isFile)
+            ?.forEach { file -> result[Uri.fromFile(file)] = file.name }
+        return result
+    }
+
+    private fun privateDirectory(type: DownloadMediaType): File =
+        File(privateRoot, type.folderName.lowercase())
+
+    private fun safePrivateId(id: String): String =
+        id.replace(Regex("[^A-Za-z0-9_-]"), "_").ifBlank { "download" }
+}

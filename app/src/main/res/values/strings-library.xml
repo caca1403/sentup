@@ -1,0 +1,48 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+    <!-- LibraryScreen segment tabs. Keys live in their own file on purpose:
+         strings.xml was being appended to by parallel work, and a merged file
+         edited twice at once loses one of the edits. Labels are kept short so
+         four segments fit one row on a phone without ellipsis. -->
+    <string name="lib_tab_all">All</string>
+    <string name="lib_tab_playlists">Lists</string>
+    <string name="lib_tab_artists">Artists</string>
+    <string name="lib_tab_albums">Albums</string>
+    <string name="lib_group_sort_title">By title</string>
+    <string name="vs_section_title">Video analytics</string>
+    <string name="vs_watch_time">Watch time</string>
+    <string name="vs_top_channels">Most watched channels</string>
+    <string name="vs_videos">Videos</string>
+    <string name="vs_empty">Nothing watched yet. Videos you play show up here.</string>
+    <string name="dur_hm">%1$d h %2$d min</string>
+    <string name="dur_m">%1$d min</string>
+    <string name="lk_your_likes">Your Likes</string>
+    <string name="lk_liked_videos">Liked Videos</string>
+    <string name="lk_audio_library">YouTube Audio Library</string>
+    <string name="lk_episodes_later">Watch Later</string>
+    <string name="lk_popular_uploads">Popular Uploads</string>
+    <string name="lk_popular_videos">Popular Videos</string>
+    <string name="lk_presenting">Presenting %1$s</string>
+    <string name="lk_uploads_from">Uploads from %1$s</string>
+    <string name="hf_personal_title">Made for you</string>
+    <string name="capsule_otonom">Autopilot mix</string>
+    <string name="mixmaker_title">Build an autonomous list</string>
+    <string name="mixmaker_sub">Pick artists and a length; the list is built from your listening history, most-played first. Pick nothing and it draws from everything.</string>
+    <string name="mixmaker_artists">Artists</string>
+    <string name="mixmaker_size">Length</string>
+    <string name="mixmaker_name_hint">Name (optional)</string>
+    <string name="mixmaker_create">Create</string>
+    <string name="mixmaker_created">List created: %1$s</string>
+    <string name="mixmaker_empty">Play some songs first.</string>
+    <string name="mixmaker_default_name">Autopilot</string>
+    <string name="browse_new_title">New releases</string>
+    <string name="pinned_caption">Pinned</string>
+    <string name="mixmaker_search_hint">Search artists on YouTube Music</string>
+    <string name="mixmaker_artists_recent">From your plays</string>
+    <string name="mixmaker_picked">Selected</string>
+    <string name="mixmaker_per_artist">Songs per artist</string>
+    <string name="browse_charts_title">Charts</string>
+    <string name="home_discovery_title">Fresh for you</string>
+    <string name="explore_discover_trending">Happening now</string>
+    <string name="home_moods_title">Moods &amp; genres</string>
+</resources>

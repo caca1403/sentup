@@ -1,0 +1,97 @@
+package com.sentup.android.data
+
+import com.sentup.android.data.youtube.BROWSER_USER_AGENT
+import okhttp3.OkHttpClient
+import okhttp3.Request
+import org.schabi.newpipe.extractor.downloader.Downloader
+import org.schabi.newpipe.extractor.downloader.Request as ExtractorRequest
+import org.schabi.newpipe.extractor.downloader.Response
+import org.schabi.newpipe.extractor.exceptions.ReCaptchaException
+import java.io.IOException
+
+/**
+ * A custom Downloader implementation for NewPipeExtractor using OkHttp.
+ * This is required to initialize NewPipe and supports cookie injection for authenticated requests.
+ */
+class NewPipeDownloaderImpl(
+    private val client: OkHttpClient,
+    private val sessionManager: SessionManager? = null
+) : Downloader() {
+
+    override fun execute(request: ExtractorRequest): Response {
+        val httpMethod = request.httpMethod()
+        val url = request.url()
+        val headers = request.headers()
+        val dataToSend = request.dataToSend()
+
+        val requestBuilder = Request.Builder()
+            .url(url)
+            .method(httpMethod, if (dataToSend != null) {
+                okhttp3.RequestBody.create(null, dataToSend)
+            } else if (httpMethod == "POST" || httpMethod == "PUT") {
+                okhttp3.RequestBody.create(null, ByteArray(0))
+            } else {
+                null
+            })
+
+        // Add headers
+        headers.forEach { (key, values) ->
+            values.forEach { value ->
+                requestBuilder.addHeader(key, value)
+            }
+        }
+
+        // Add cookies from SessionManager if available for authenticated
+        // requests. Tagged with the session they came from so a cookie Google
+        // rotates on the way back is folded into that profile rather than into
+        // whichever one is active when the response lands.
+        sessionManager?.captureSession()?.let { session ->
+            requestBuilder.addHeader("Cookie", session.cookies)
+            requestBuilder.tag(YouTubeSession::class.java, session)
+        }
+
+        // Add default user agent if not present
+        if (!headers.containsKey("User-Agent")) {
+            // Use the shared Browser UA to ensure consistency with playback
+            requestBuilder.addHeader(
+                "User-Agent",
+                BROWSER_USER_AGENT
+            )
+        }
+
+        try {
+            val response = client.newCall(requestBuilder.build()).execute()
+            
+            if (response.code == 429) {
+                // Record it before throwing. This was the only place in the app
+                // that noticed a 429 at all, and it converted it straight into
+                // an exception nobody catches, so the fan-out paths kept firing
+                // into a limit they had no way to see.
+                YouTubeRateLimit.note(
+                    response.code,
+                    url,
+                    response.header("Retry-After"),
+                )
+                response.close()
+                throw ReCaptchaException("Rate limited", url)
+            }
+
+            val responseBodyString = response.body?.string() ?: ""
+            
+            val responseHeaders = mutableMapOf<String, MutableList<String>>()
+            response.headers.forEach { (name, value) ->
+                responseHeaders.getOrPut(name) { mutableListOf() }.add(value)
+            }
+
+            return Response(
+                response.code,
+                response.message,
+                responseHeaders,
+                responseBodyString,
+                url
+            )
+        } catch (e: IOException) {
+            throw e
+        }
+    }
+}

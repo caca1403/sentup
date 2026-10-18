@@ -1,0 +1,40 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+
+    <!--
+        System-bar transparency is declared here, at window creation, not only
+        applied at runtime: enableEdgeToEdge() and the SideEffect in
+        SentupTheme still run, but several OEM skins (HyperOS/MIUI and
+        friends on API 30-34) decide their own status-bar scrim from the theme
+        attributes the window was created with and ignore the later runtime
+        setters - which is why the status bar was opaque on those devices and
+        transparent everywhere else. AOSP only ever scrims the navigation bar;
+        the status-bar scrim is OEM-added, hence enforceStatusBarContrast too.
+
+        `android:Theme.Material.NoActionBar` rather than the `Light` variant:
+        the window is created before any Compose code runs, so with a Light
+        parent a dark-theme launch painted the whole screen white for the
+        moment between the splash and the first frame. windowBackground below
+        closes the rest of that gap - it is the colour the window shows for as
+        long as it exists, which during startup is the splash handing over to
+        the app, and after it is simply never seen.
+    -->
+    <style name="Theme.Sentup" parent="android:Theme.Material.NoActionBar">
+        <item name="android:windowDrawsSystemBarBackgrounds">true</item>
+        <item name="android:statusBarColor">@android:color/transparent</item>
+        <item name="android:navigationBarColor">@android:color/transparent</item>
+        <item name="android:enforceStatusBarContrast">false</item>
+        <item name="android:enforceNavigationBarContrast">false</item>
+        <item name="android:windowBackground">@color/sentup_window</item>
+    </style>
+
+    <!-- Splash Screen Theme (Android 12+) -->
+    <style name="Theme.App.Starting" parent="Theme.SplashScreen">
+        <!-- The mark's own tile, so the splash is the app's first colour. -->
+        <item name="windowSplashScreenBackground">@color/sentup_window</item>
+        <item name="windowSplashScreenAnimatedIcon">@drawable/avd_splash</item>
+        <item name="windowSplashScreenAnimationDuration">800</item>
+        <!-- Post-splash theme (the actual app theme) -->
+        <item name="postSplashScreenTheme">@style/Theme.Sentup</item>
+    </style>
+</resources>

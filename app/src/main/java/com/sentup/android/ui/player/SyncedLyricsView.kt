@@ -1,0 +1,1272 @@
+package com.sentup.android.ui.player
+
+import android.database.ContentObserver
+import android.icu.text.BreakIterator
+import android.os.Handler
+import android.os.Looper
+import android.provider.Settings
+import androidx.compose.animation.animateColorAsState
+import androidx.compose.animation.core.CubicBezierEasing
+import androidx.compose.animation.core.FastOutSlowInEasing
+import androidx.compose.animation.core.tween
+import androidx.compose.animation.core.Spring
+import androidx.compose.animation.core.animateFloatAsState
+import androidx.compose.animation.core.spring
+import androidx.compose.foundation.Canvas
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.gestures.animateScrollBy
+import androidx.compose.foundation.gestures.scrollBy
+import androidx.compose.foundation.layout.*
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.itemsIndexed
+import androidx.compose.foundation.lazy.rememberLazyListState
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.rounded.MusicNote
+import androidx.compose.material.icons.rounded.MusicOff
+import androidx.compose.material.icons.rounded.Refresh
+import androidx.compose.material.icons.rounded.WifiOff
+import androidx.compose.material3.*
+import androidx.compose.runtime.*
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.alpha
+import androidx.compose.ui.draw.drawWithContent
+import androidx.compose.ui.geometry.Offset
+import androidx.compose.ui.graphics.BlendMode
+import androidx.compose.ui.graphics.Brush
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.res.stringResource
+import androidx.compose.ui.graphics.CompositingStrategy
+import androidx.compose.ui.graphics.Shadow
+import androidx.compose.ui.graphics.drawscope.withTransform
+import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.layout.Layout
+import androidx.compose.ui.layout.layout
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalDensity
+import androidx.compose.ui.semantics.clearAndSetSemantics
+import androidx.compose.ui.semantics.text
+import androidx.compose.ui.text.TextLayoutResult
+import androidx.compose.ui.text.TextMeasurer
+import androidx.compose.ui.text.drawText
+import androidx.compose.ui.text.TextStyle
+import androidx.compose.ui.text.font.FontFamily
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.rememberTextMeasurer
+import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.Constraints
+import com.sentup.android.data.LrcContentSpan
+import com.sentup.android.data.LrcLine
+import com.sentup.android.data.LyricVoice
+import com.sentup.android.data.LyricsResult
+import com.sentup.android.data.LyricsSyncType
+import com.sentup.android.ui.theme.MontserratFamily
+import com.sentup.android.util.lyricsFitDisplayFont
+import kotlinx.coroutines.isActive
+
+/**
+ * Set a lyric in the chosen family, or leave the style exactly as it was.
+ *
+ * Written as "leave it alone" rather than `copy(fontFamily = null)` on purpose:
+ * null in a [TextStyle] is the platform default, not "inherit", so a literal
+ * copy would quietly take every non-Latin song off the theme's font too.
+ */
+private fun TextStyle.withLyricsFont(family: FontFamily?): TextStyle =
+    if (family == null) this else copy(fontFamily = family)
+
+/**
+ * The one style every lyric line is set in, sung or not, word-timed or not.
+ *
+ * Emphasis is colour, alpha and glow only. Giving the current line a larger
+ * size or heavier weight re-wraps it the moment it becomes current, so a line
+ * that fit on one row jumped to two with nothing to animate between; and
+ * enlarging it after layout instead draws outside its bounds (the clipping
+ * scar in docs/playback-music.md).
+ */
+@Composable
+private fun lyricLineStyle(): TextStyle =
+    MaterialTheme.typography.headlineSmall.copy(fontWeight = FontWeight.ExtraBold)
+
+/**
+ * Synced Lyrics View - Material 3 Expressive
+ * 
+ * Features:
+ * - Auto-scrolling to current lyric line
+ * - Highlighted current line with distinct styling
+ * - Spring animations for smooth transitions
+ * - Tap to seek functionality
+ * - Lines fade out toward the top/bottom edges via an alpha mask, so the
+ *   effect works over any background (flat field or ambient mist) without
+ *   painting assumed background colors on top of it
+ */
+@OptIn(ExperimentalMaterial3ExpressiveApi::class)
+@Composable
+fun SyncedLyricsView(
+    lyricsResult: LyricsResult,
+    currentPositionMs: Long,
+    isPlaying: Boolean,
+    onSeekTo: (Long) -> Unit,
+    modifier: Modifier = Modifier,
+    primaryColor: Color = MaterialTheme.colorScheme.primary,
+    onSurfaceColor: Color = MaterialTheme.colorScheme.onSurface,
+    onSurfaceVariantColor: Color = MaterialTheme.colorScheme.onSurfaceVariant,
+    /**
+     * The side margin inside the lyrics, or null for the default, which
+     * narrows on small widths. A host that already lines the lyrics up with
+     * its own text (Standby, under the title) passes zero so left-aligned
+     * lines start on the same edge as the title.
+     */
+    horizontalGutter: androidx.compose.ui.unit.Dp? = null,
+    /**
+     * Where the sung line rests, as a fraction of the height from the top.
+     * A third of the way down by default, as Apple Music holds it: the
+     * centre left half the panel empty above the first line, and put more of
+     * what has been sung on screen than of what is coming.
+     */
+    anchorFraction: Float = LYRIC_ANCHOR,
+    /**
+     * Move to the next line as a cascade, each line below the sung one
+     * following a beat after the one above. False is the plain scroll, kept
+     * for Standby's small panel, which was tuned around it.
+     */
+    cascadeScroll: Boolean = true,
+    /**
+     * The one action offered when there is no lyric to show: try the sources
+     * again. Shown only on the states where a second attempt can change the
+     * answer - the services being unreachable, or no source having the song -
+     * never while lyrics are merely still loading.
+     */
+    onRetry: (() -> Unit)? = null
+) {
+    val hasWordTiming = lyricsResult is LyricsResult.Success &&
+        lyricsResult.syncType == LyricsSyncType.WORD
+    val lyricsMotionEnabled = rememberLyricsMotionEnabled()
+    // Read here rather than passed in, so every player style and Standby
+    // follow the one setting without each having to be wired to it.
+    val context = LocalContext.current
+    val centered by remember(context) { com.sentup.android.data.ThemePreferences(context) }
+        .lyricsCentered.collectAsState()
+    var renderedPositionMs by remember { mutableLongStateOf(currentPositionMs) }
+
+    // The player publishes coarse progress updates. Interpolate only while a
+    // word-timed lyric is visible so the sung color advances one grapheme at a
+    // time without increasing app-wide playback update frequency.
+    LaunchedEffect(currentPositionMs, isPlaying, hasWordTiming) {
+        renderedPositionMs = currentPositionMs
+        if (!isPlaying || !hasWordTiming) return@LaunchedEffect
+
+        val anchorPositionMs = currentPositionMs
+        val anchorFrameNanos = withFrameNanos { it }
+        while (isActive) {
+            withFrameNanos { frameNanos ->
+                val elapsedMs = ((frameNanos - anchorFrameNanos) / 1_000_000L)
+                    .coerceIn(0L, 1_250L)
+                renderedPositionMs = anchorPositionMs + elapsedMs
+            }
+        }
+    }
+
+    Box(
+        modifier = modifier.fillMaxSize(),
+        contentAlignment = Alignment.Center
+    ) {
+        when (lyricsResult) {
+            is LyricsResult.Loading -> {
+                LoadingState(primaryColor)
+            }
+            is LyricsResult.NotFound -> {
+                NoLyricsState(onSurfaceVariantColor, onRetry)
+            }
+            is LyricsResult.Error -> {
+                ErrorState(lyricsResult.message, onSurfaceVariantColor, onRetry)
+            }
+            is LyricsResult.Success -> {
+                if (lyricsResult.lines.isEmpty()) {
+                    NoLyricsState(onSurfaceVariantColor, onRetry)
+                } else {
+                    LyricsContent(
+                        lines = lyricsResult.lines,
+                        syncType = lyricsResult.syncType,
+                        currentPositionMs = renderedPositionMs,
+                        onSeekTo = onSeekTo,
+                        primaryColor = primaryColor,
+                        onSurfaceColor = onSurfaceColor,
+                        motionEnabled = lyricsMotionEnabled,
+                        centered = centered,
+                        horizontalGutter = horizontalGutter,
+                        anchorFraction = anchorFraction,
+                        cascadeScroll = cascadeScroll
+                    )
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun LyricsContent(
+    lines: List<LrcLine>,
+    syncType: LyricsSyncType,
+    currentPositionMs: Long,
+    onSeekTo: (Long) -> Unit,
+    primaryColor: Color,
+    onSurfaceColor: Color,
+    motionEnabled: Boolean,
+    centered: Boolean,
+    horizontalGutter: androidx.compose.ui.unit.Dp?,
+    anchorFraction: Float,
+    cascadeScroll: Boolean
+) {
+    val listState = rememberLazyListState()
+    val cascade = remember { LyricCascade() }
+    val cascading = cascadeScroll && motionEnabled
+    // A duet is drawn as a conversation, whatever the alignment setting:
+    // centring would throw away who is singing.
+    val duet = remember(lines) { lines.any { it.voice == LyricVoice.DUET } }
+    val isSynced = syncType != LyricsSyncType.PLAIN
+
+    // Montserrat for the lyric itself, where it can draw the song's script -
+    // see lyricsFitDisplayFont for why that is a question and why it is asked
+    // once per song. Null means "leave the theme's font alone", which is what
+    // the non-Latin case wants; it is never a silent box of tofu.
+    val lyricsFont: FontFamily? = remember(lines) {
+        if (lyricsFitDisplayFont(lines.map { it.text })) MontserratFamily else null
+    }
+
+    // Calculate current line index based on playback position. -1 while the
+    // intro plays, so the first line isn't falsely highlighted before its
+    // timestamp is reached.
+    val currentLineIndex by remember(currentPositionMs, lines, isSynced) {
+        derivedStateOf {
+            if (isSynced) lines.indexOfLast { it.timeMs <= currentPositionMs } else -1
+        }
+    }
+
+    // Auto-scroll the sung line to the anchor, using the item's measured
+    // height. A fixed scroll offset is wrong as soon as a line wraps or font
+    // scale grows.
+    LaunchedEffect(currentLineIndex, lines) {
+        if (isSynced && currentLineIndex >= 0 && lines.isNotEmpty()) {
+            try {
+                if (listState.layoutInfo.visibleItemsInfo.none { it.index == currentLineIndex }) {
+                    listState.scrollToItem(currentLineIndex)
+                    withFrameNanos { }
+                }
+                val layout = listState.layoutInfo
+                val item = layout.visibleItemsInfo.firstOrNull { it.index == currentLineIndex }
+                if (item != null) {
+                    val anchor = layout.viewportStartOffset +
+                        ((layout.viewportEndOffset - layout.viewportStartOffset) * anchorFraction).toInt()
+                    val itemCenter = item.offset + item.size / 2
+                    val delta = (itemCenter - anchor).toFloat()
+                    if (cascading) {
+                        // The list jumps at once and every line is drawn back
+                        // where it was, then each is let go in turn: the lines
+                        // move on their own clocks while the list itself is
+                        // already where it is going.
+                        //
+                        // [scar] The hold-back is set before the jump, in the
+                        // same frame. Set after it (on the next frame's clock),
+                        // one frame drew every line already jumped, then the
+                        // next pulled them all back: a flash of the whole
+                        // lyrics on each line change. System.nanoTime is the
+                        // frame clock's own timebase on Android.
+                        cascade.kick(delta, currentLineIndex, System.nanoTime())
+                        val moved = listState.scrollBy(delta)
+                        // The end of the list can stop the jump short.
+                        if (moved != delta) cascade.correctLast(moved)
+                    } else {
+                        listState.animateScrollBy(delta)
+                    }
+                }
+            } catch (cancelled: kotlinx.coroutines.CancellationException) {
+                throw cancelled
+            } catch (_: Exception) {
+                // A rapid song/line replacement can invalidate a measured row.
+            }
+        }
+    }
+    
+    BoxWithConstraints(modifier = Modifier.fillMaxSize()) {
+        // UI scale and system font scale both reduce the available dp width.
+        // Shrink the gutter before shrinking the lyric itself.
+        val horizontalPadding = horizontalGutter ?: when {
+            maxWidth < 280.dp -> 12.dp
+            maxWidth < 360.dp -> 16.dp
+            else -> 24.dp
+        }
+        // Room above the first line and below the last, so either can reach
+        // the anchor. At an anchor of one half these are the centring pads the
+        // view always had.
+        val topPadding = (maxHeight * anchorFraction - 36.dp).coerceAtLeast(12.dp)
+        val bottomPadding = (maxHeight * (1f - anchorFraction) - 36.dp).coerceAtLeast(12.dp)
+        val lineSpacing = if (maxHeight < 420.dp) 20.dp else 28.dp
+        // Each side of a duet stops short of the other, so a long line that
+        // wraps still reads as belonging to its side.
+        val duetInset = if (duet) maxWidth * DUET_INSET_FRACTION else 0.dp
+
+        // Drives the cascade: one frame clock for every line, running only
+        // while a line change is still settling.
+        LaunchedEffect(cascade.generation) {
+            while (cascade.isMoving(cascade.frameNanos)) {
+                withFrameNanos { cascade.frameNanos = it }
+            }
+            cascade.settle()
+        }
+        
+        LazyColumn(
+            state = listState,
+            modifier = Modifier
+                .fillMaxSize()
+                // Fade the lyrics themselves out toward the edges instead of
+                // painting background-colored scrims over whatever is behind.
+                .graphicsLayer { compositingStrategy = CompositingStrategy.Offscreen }
+                .drawWithContent {
+                    drawContent()
+                    drawRect(
+                        brush = Brush.verticalGradient(
+                            0f to Color.Transparent,
+                            0.18f to Color.Black,
+                            0.82f to Color.Black,
+                            1f to Color.Transparent
+                        ),
+                        blendMode = BlendMode.DstIn
+                    )
+                },
+            contentPadding = PaddingValues(
+                top = topPadding,
+                bottom = bottomPadding,
+                start = horizontalPadding,
+                end = horizontalPadding
+            ),
+            verticalArrangement = Arrangement.spacedBy(lineSpacing),
+            horizontalAlignment = if (centered) Alignment.CenterHorizontally else Alignment.Start
+        ) {
+            itemsIndexed(lines, key = { index, line -> "${index}_${line.timeMs}" }) { index, line ->
+                LyricLine(
+                    modifier = Modifier.graphicsLayer {
+                        translationY = cascade.offsetFor(index, cascade.frameNanos)
+                    },
+                    line = line,
+                    isCurrent = index == currentLineIndex,
+                    isSynced = isSynced,
+                    onTap = { onSeekTo(line.timeMs) },
+                    primaryColor = primaryColor,
+                    onSurfaceColor = onSurfaceColor,
+                    motionEnabled = motionEnabled,
+                    currentPositionMs = currentPositionMs,
+                    lyricsFont = lyricsFont,
+                    side = lineSide(line, duet, centered),
+                    duetInset = duetInset
+                )
+            }
+        }
+    }
+}
+
+/** Where the sung line rests by default; see [SyncedLyricsView]'s anchorFraction. */
+private const val LYRIC_ANCHOR = 0.32f
+
+/** How long a word-timed line takes to settle from its sung colours into a resting line. */
+private const val WORD_LINE_DISSOLVE_MS = 320
+
+/** The share of the width each side of a duet leaves to the other. */
+private const val DUET_INSET_FRACTION = 0.12f
+
+/** The edge a lyric line is set from. Start and end are mirrored in RTL. */
+internal enum class LyricSide(val boxAlignment: Alignment, val textAlign: TextAlign) {
+    START(Alignment.CenterStart, TextAlign.Start),
+    CENTER(Alignment.Center, TextAlign.Center),
+    END(Alignment.CenterEnd, TextAlign.End),
+}
+
+/**
+ * Where [line] sits. In a duet the second singer answers from the end
+ * edge and lines sung together stay with the first; otherwise the
+ * alignment setting decides.
+ */
+private fun lineSide(line: LrcLine, duet: Boolean, centered: Boolean): LyricSide = when {
+    duet -> if (line.voice == LyricVoice.DUET) LyricSide.END else LyricSide.START
+    centered -> LyricSide.CENTER
+    else -> LyricSide.START
+}
+
+/**
+ * Apple Music's line change, as a shared timeline rather than an animation per
+ * row.
+ *
+ * Each change ("kick") records how far the list jumped and which line is now
+ * sung. Every row is drawn displaced by that distance and released along a
+ * critically damped spring - it starts from rest and settles without
+ * overshoot, which is the ease-in-out a hand-picked curve only approximates -
+ * the rows below the sung line each a beat later than the one above, so the
+ * text ripples down into place instead of sliding as one slab. Rows that
+ * scroll into view mid-change read the same timeline, so they arrive in step
+ * with their neighbours. Overlapping changes add up, so a quick run of short
+ * lines never jumps.
+ *
+ * All of it is read in the draw phase through [frameNanos]: the lines move
+ * without recomposing.
+ */
+private class LyricCascade {
+    private class Kick(var distance: Float, val pivot: Int, val startNanos: Long)
+
+    private val kicks = mutableListOf<Kick>()
+
+    /** Bumped on each kick, to restart the frame loop. */
+    var generation by mutableIntStateOf(0)
+        private set
+
+    var frameNanos by mutableLongStateOf(0L)
+
+    fun kick(distance: Float, pivot: Int, nowNanos: Long) {
+        kicks += Kick(distance, pivot, nowNanos)
+        frameNanos = nowNanos
+        generation++
+    }
+
+    /** The last jump went [actual] rather than the distance it was kicked with. */
+    fun correctLast(actual: Float) {
+        val last = kicks.lastOrNull() ?: return
+        if (actual == 0f) kicks.removeAt(kicks.lastIndex) else last.distance = actual
+        // A fresh read for the layers, which drew the old distance.
+        frameNanos = frameNanos + 1
+    }
+
+    fun isMoving(nowNanos: Long): Boolean =
+        kicks.any { nowNanos - it.startNanos < CASCADE_TOTAL_NANOS }
+
+    fun settle() {
+        kicks.clear()
+    }
+
+    fun offsetFor(index: Int, nowNanos: Long): Float {
+        var offset = 0f
+        for (kick in kicks) {
+            // Lines above the sung one go first, together; each line from
+            // the sung one down waits one beat more than the line above it.
+            val beats = (index - kick.pivot + 1).coerceIn(0, CASCADE_MAX_BEATS)
+            val t = (nowNanos - kick.startNanos) / 1_000_000_000f - beats * CASCADE_BEAT_S
+            offset += kick.distance * (1f - criticallyDampedProgress(t))
+        }
+        return offset
+    }
+}
+
+/**
+ * The position of a unit-mass, critically damped spring released from rest:
+ * 1 - (1 + wt)e^(-wt), with w set by Apple's "response" (the spring's period).
+ * Zero velocity at the start and at the end, so it eases in and out.
+ */
+private fun criticallyDampedProgress(seconds: Float): Float {
+    if (seconds <= 0f) return 0f
+    val wt = CASCADE_OMEGA * seconds
+    return (1f - (1f + wt) * kotlin.math.exp(-wt)).coerceIn(0f, 1f)
+}
+
+/** How quickly a line gets there: Apple's response, in seconds. */
+private const val CASCADE_RESPONSE_S = 0.55f
+private const val CASCADE_OMEGA = (2f * Math.PI.toFloat()) / CASCADE_RESPONSE_S
+
+/** The wait between one line and the next, and how many lines are staggered. */
+private const val CASCADE_BEAT_S = 0.045f
+private const val CASCADE_MAX_BEATS = 8
+
+/** Long enough for the last staggered line to settle to well under a pixel. */
+private const val CASCADE_TOTAL_NANOS = 1_600_000_000L
+
+@Composable
+private fun LyricLine(
+    modifier: Modifier = Modifier,
+    line: LrcLine,
+    isCurrent: Boolean,
+    isSynced: Boolean,
+    onTap: () -> Unit,
+    primaryColor: Color,
+    onSurfaceColor: Color,
+    motionEnabled: Boolean,
+    currentPositionMs: Long = 0L,
+    /** Null leaves the theme's own font in place; see [lyricsFitDisplayFont]. */
+    lyricsFont: FontFamily? = null,
+    /** Which edge the line is set from; see [lineSide]. */
+    side: LyricSide = LyricSide.START,
+    /** Room kept free on the side away from this line's singer, in a duet. */
+    duetInset: androidx.compose.ui.unit.Dp = 0.dp
+) {
+    // Animate alpha for past/future lines
+    val alpha by animateFloatAsState(
+        targetValue = if (!isSynced || isCurrent) 1f else 0.35f,
+        animationSpec = spring(stiffness = Spring.StiffnessLow),
+        label = "LyricAlpha"
+    )
+
+    // Current and inactive lines share one style so a line wraps identically
+    // either way; only colour and glow change, and both fade. A size or
+    // weight change re-wrapped the line the moment it became current, jumping
+    // from one row to two.
+    //
+    // A word-timed line is never highlighted as a whole: its words light up
+    // in the karaoke view, and it dissolves from that straight into the
+    // resting line (below). [scar] It used to hand over to this plain text
+    // still wearing the sung colour and a full-line glow, to fade from the
+    // sung colour rather than snap - which lit the entire line, glow and all,
+    // the moment it ended, words the singer had not reached included.
+    val wordTimed = line.contentSpans.isNotEmpty()
+    val highlighted = isSynced && isCurrent && !wordTimed
+    val lineColor by animateColorAsState(
+        targetValue = if (highlighted) primaryColor else onSurfaceColor,
+        animationSpec = spring(stiffness = Spring.StiffnessLow),
+        label = "LyricColor"
+    )
+    val glow by animateFloatAsState(
+        targetValue = if (highlighted) 1f else 0f,
+        animationSpec = spring(stiffness = Spring.StiffnessLow),
+        label = "LyricGlow"
+    )
+
+    val interactionSource = remember { androidx.compose.foundation.interaction.MutableInteractionSource() }
+    val tapModifier = if (isSynced) {
+        Modifier.clickable(
+            interactionSource = interactionSource,
+            indication = null,
+            onClick = onTap
+        )
+    } else {
+        Modifier
+    }
+
+    Box(
+        modifier = modifier
+            .fillMaxWidth()
+            .alpha(alpha)
+            .then(tapModifier)
+            .padding(vertical = 8.dp)
+            .padding(
+                start = if (side == LyricSide.END) duetInset else 0.dp,
+                end = if (side == LyricSide.START) duetInset else 0.dp
+            ),
+        contentAlignment = side.boxAlignment
+    ) {
+        if (wordTimed) {
+            // The two views wrap a line identically (see KaraokeWordFlow), so
+            // a crossfade between them reads as the colour settling, not as
+            // one line replaced by another.
+            androidx.compose.animation.Crossfade(
+                targetState = isCurrent,
+                animationSpec = tween(WORD_LINE_DISSOLVE_MS, easing = FastOutSlowInEasing),
+                modifier = Modifier.fillMaxWidth(),
+                label = "WordLineDissolve"
+            ) { singing ->
+                if (singing) {
+                    KaraokeWordFlow(
+                        spans = line.contentSpans,
+                        lineText = line.text,
+                        currentPositionMs = currentPositionMs,
+                        primaryColor = primaryColor,
+                        unsungColor = onSurfaceColor.copy(alpha = 0.5f),
+                        motionEnabled = motionEnabled,
+                        lyricsFont = lyricsFont,
+                        side = side,
+                        modifier = Modifier.fillMaxWidth()
+                    )
+                } else {
+                    Text(
+                        text = line.text,
+                        style = lyricLineStyle().withLyricsFont(lyricsFont),
+                        color = onSurfaceColor,
+                        textAlign = side.textAlign,
+                        modifier = Modifier.fillMaxWidth()
+                    )
+                }
+            }
+        } else {
+            // Line-synced lyrics highlight the whole line - no invented
+            // per-word fill.
+            Text(
+                text = line.text,
+                style = lyricLineStyle().copy(
+                    shadow = if (glow > 0.01f) {
+                        Shadow(
+                            color = primaryColor.copy(alpha = 0.5f * glow),
+                            blurRadius = 24f * glow
+                        )
+                    } else {
+                        null
+                    }
+                ).withLyricsFont(lyricsFont),
+                color = lineColor,
+                textAlign = side.textAlign
+            )
+        }
+    }
+}
+
+/**
+ * The letter wave. Each letter starts rising as it is sung and takes far longer
+ * to settle than the gap to the next letter, so neighbours are always mid-rise
+ * together and the word swells as one slow ripple instead of letters popping
+ * one at a time. The rise is small and eased at both ends on purpose: the old
+ * 6dp, 220ms pop with a per-letter swell read as letters jumping around.
+ */
+private const val LETTER_RISE_MS = 650L
+private val LETTER_LIFT = 3.dp
+private val LetterRiseEasing = CubicBezierEasing(0.37f, 0f, 0.2f, 1f)
+
+/**
+ * Held notes only: a word sung over at least this long swells gently and
+ * glows while it lasts, reaching full strength by [SUSTAIN_FULL_MS].
+ */
+private const val SUSTAIN_START_MS = 900L
+private const val SUSTAIN_FULL_MS = 1_800L
+private const val SUSTAIN_SCALE = 0.035f
+
+private data class TimedLyricGrapheme(
+    val text: String,
+    val startMs: Long,
+    val durationMs: Long
+) {
+    val endMs: Long
+        get() = startMs + durationMs
+}
+
+private data class TimedLyricToken(
+    val graphemes: List<TimedLyricGrapheme>,
+    val spaceBefore: Boolean
+) {
+    val startMs: Long
+        get() = graphemes.minOfOrNull(TimedLyricGrapheme::startMs) ?: 0L
+
+    val endMs: Long
+        get() = graphemes.maxOfOrNull(TimedLyricGrapheme::endMs) ?: startMs
+}
+
+private data class MeasuredLyricGrapheme(
+    val timing: TimedLyricGrapheme,
+    val textLayout: TextLayoutResult,
+    val position: Offset
+)
+
+private data class MeasuredLyricWord(
+    val widthPx: Int,
+    val heightPx: Int,
+    val graphemes: List<MeasuredLyricGrapheme>
+)
+
+@Composable
+private fun KaraokeWordFlow(
+    spans: List<LrcContentSpan>,
+    lineText: String,
+    currentPositionMs: Long,
+    primaryColor: Color,
+    unsungColor: Color,
+    motionEnabled: Boolean,
+    lyricsFont: FontFamily? = null,
+    side: LyricSide = LyricSide.START,
+    modifier: Modifier = Modifier
+) {
+    val tokens = remember(spans, lineText) { buildTimedLyricTokens(spans, lineText) }
+    val currentPositionState = rememberUpdatedState(currentPositionMs)
+    val currentPositionProvider = remember {
+        { currentPositionState.value }
+    }
+    if (tokens.isEmpty()) {
+        Text(
+            text = lineText,
+            style = lyricLineStyle().withLyricsFont(lyricsFont),
+            color = primaryColor,
+            textAlign = side.textAlign
+        )
+        return
+    }
+
+    val textStyle = lyricLineStyle().withLyricsFont(lyricsFont)
+    val density = LocalDensity.current
+    // The font's real space advance, so this line wraps where the same line
+    // set as plain text does. Measured as the difference between "a a" and
+    // "aa", because a lone space can be trimmed as trailing whitespace.
+    val spaceMeasurer = rememberTextMeasurer(cacheSize = 2)
+    val wordSpacing = remember(textStyle, spaceMeasurer, density) {
+        runCatching {
+            val spaced = spaceMeasurer.measure("a a", textStyle).size.width
+            val joined = spaceMeasurer.measure("aa", textStyle).size.width
+            with(density) { (spaced - joined).coerceAtLeast(1).toDp() }
+        }.getOrDefault(6.dp)
+    }
+
+    BoxWithConstraints(modifier = modifier) {
+        val maxWordWidthPx = with(density) { maxWidth.roundToPx() }.coerceAtLeast(1)
+        CenteredLyricFlow(
+            tokens = tokens,
+            side = side,
+            horizontalSpacing = wordSpacing,
+            // The style's line height already carries the leading, so rows sit
+            // as close as the same line drawn as plain text would.
+            verticalSpacing = 0.dp,
+            modifier = Modifier
+                .fillMaxWidth()
+                .clearAndSetSemantics {
+                    text = androidx.compose.ui.text.AnnotatedString(lineText)
+                }
+        ) { token ->
+            KaraokeWord(
+                token = token,
+                currentPositionProvider = currentPositionProvider,
+                primaryColor = primaryColor,
+                unsungColor = unsungColor,
+                motionEnabled = motionEnabled,
+                textStyle = textStyle,
+                maxWidthPx = maxWordWidthPx
+            )
+        }
+    }
+}
+
+@Composable
+private fun KaraokeWord(
+    token: TimedLyricToken,
+    currentPositionProvider: () -> Long,
+    primaryColor: Color,
+    unsungColor: Color,
+    motionEnabled: Boolean,
+    textStyle: androidx.compose.ui.text.TextStyle,
+    maxWidthPx: Int
+) {
+    val density = LocalDensity.current
+    val textMeasurer = rememberTextMeasurer(cacheSize = token.graphemes.size + 1)
+    val liftPx = with(density) { LETTER_LIFT.toPx() }
+    val topInsetPx = with(density) { 10.dp.toPx() }
+    val sideInsetPx = with(density) { 6.dp.toPx() }
+    val measuredWord = remember(
+        token,
+        textStyle,
+        textMeasurer,
+        topInsetPx,
+        sideInsetPx,
+        maxWidthPx
+    ) {
+        measureLyricWord(
+            token = token,
+            textStyle = textStyle,
+            textMeasurer = textMeasurer,
+            topInsetPx = topInsetPx,
+            sideInsetPx = sideInsetPx,
+            maxWidthPx = maxWidthPx
+        )
+    }
+    val canvasWidth = with(density) { measuredWord.widthPx.toDp() }
+    val canvasHeight = with(density) { measuredWord.heightPx.toDp() }
+
+    // The reference renderer measures a complete word once, then draws each
+    // glyph at its original bound inside one fixed Canvas. Playback therefore
+    // invalidates drawing only: kerning, wrapping, and line placement never
+    // change while the letter wave moves.
+    // The insets are drawing room for the rise, the held-note swell and glyph
+    // bearings, not spacing: the word reports only its text's size to the flow
+    // and lets the canvas overhang by the insets. Counting them made a short
+    // line read as loose, widely spaced words with tall gaps between rows.
+    val sideInsetRoundedPx = sideInsetPx.toInt()
+    val topInsetRoundedPx = topInsetPx.toInt()
+    Canvas(
+        modifier = Modifier
+            .layout { measurable, constraints ->
+                val placeable = measurable.measure(
+                    constraints.copy(minWidth = 0, minHeight = 0, maxWidth = Constraints.Infinity)
+                )
+                val width = (placeable.width - sideInsetRoundedPx * 2).coerceAtLeast(1)
+                val height = (placeable.height - topInsetRoundedPx * 2).coerceAtLeast(1)
+                layout(width, height) {
+                    placeable.place(-sideInsetRoundedPx, -topInsetRoundedPx)
+                }
+            }
+            .size(width = canvasWidth, height = canvasHeight)
+    ) {
+        val currentPositionMs = currentPositionProvider()
+
+        // Held notes swell and glow as a whole word, rising and falling over
+        // the note itself; short words never do, so ordinary lines stay calm.
+        val wordDurationMs = (token.endMs - token.startMs).coerceAtLeast(1L)
+        val sustainStrength = if (motionEnabled) {
+            ((wordDurationMs - SUSTAIN_START_MS).toFloat() /
+                (SUSTAIN_FULL_MS - SUSTAIN_START_MS)).coerceIn(0f, 1f)
+        } else {
+            0f
+        }
+        val sustain = if (sustainStrength > 0f) {
+            val wordProgress = (
+                (currentPositionMs - token.startMs).toFloat() / wordDurationMs
+            ).coerceIn(0f, 1f)
+            sustainStrength * kotlin.math.sin(Math.PI.toFloat() * wordProgress)
+        } else {
+            0f
+        }
+        val wordScale = 1f + SUSTAIN_SCALE * sustain
+        val wordPivot = Offset(size.width / 2f, size.height - topInsetPx)
+        val glowShadow = if (sustain > 0.01f) {
+            Shadow(
+                color = primaryColor.copy(alpha = 0.35f * sustain),
+                blurRadius = 16f * sustain
+            )
+        } else {
+            null
+        }
+
+        withTransform({ scale(wordScale, wordScale, pivot = wordPivot) }) {
+            measuredWord.graphemes.forEach { glyph ->
+                val grapheme = glyph.timing
+                val highlightProgress = (
+                    (currentPositionMs - grapheme.startMs).toFloat() / grapheme.durationMs
+                ).coerceIn(0f, 1f)
+                // Rises from the letter's own start but settles long after the
+                // next letter has begun, so the word moves as one ripple.
+                val riseProgress = (
+                    (currentPositionMs - grapheme.startMs).toFloat() / LETTER_RISE_MS
+                ).coerceIn(0f, 1f)
+                val lift = if (motionEnabled) LetterRiseEasing.transform(riseProgress) else 0f
+                val drawPosition = glyph.position.copy(y = glyph.position.y - liftPx * lift)
+
+                // The sung colour fades in over the unsung one rather than
+                // blending into it. The unsung colour is translucent, so a blend
+                // (or a gradient edge between the two) passes through a paler
+                // shade than either end, which read as a light band flickering
+                // across each letter just before it lit up.
+                if (highlightProgress < 1f) {
+                    drawText(
+                        textLayoutResult = glyph.textLayout,
+                        color = unsungColor,
+                        topLeft = drawPosition,
+                        shadow = if (highlightProgress <= 0f) glowShadow else null
+                    )
+                }
+                if (highlightProgress > 0f) {
+                    drawText(
+                        textLayoutResult = glyph.textLayout,
+                        color = primaryColor,
+                        topLeft = drawPosition,
+                        alpha = highlightProgress,
+                        shadow = glowShadow
+                    )
+                }
+            }
+        }
+    }
+}
+
+private fun measureLyricWord(
+    token: TimedLyricToken,
+    textStyle: androidx.compose.ui.text.TextStyle,
+    textMeasurer: TextMeasurer,
+    topInsetPx: Float,
+    sideInsetPx: Float,
+    maxWidthPx: Int
+): MeasuredLyricWord {
+    val wordText = token.graphemes.joinToString(separator = "") { it.text }
+    val horizontalInsets = (sideInsetPx * 2f).toInt()
+    val wordLayout = textMeasurer.measure(
+        text = wordText,
+        style = textStyle.copy(textAlign = TextAlign.Center),
+        softWrap = true,
+        constraints = Constraints(
+            maxWidth = (maxWidthPx - horizontalInsets).coerceAtLeast(1)
+        )
+    )
+    var textOffset = 0
+    val measuredGraphemes = token.graphemes.map { grapheme ->
+        val graphemeLayout = textMeasurer.measure(
+            text = grapheme.text,
+            style = textStyle,
+            maxLines = 1,
+            softWrap = false
+        )
+        val endOffset = (textOffset + grapheme.text.length).coerceAtMost(wordText.length)
+        val boxes = (textOffset until endOffset).mapNotNull { offset ->
+            runCatching { wordLayout.getBoundingBox(offset) }.getOrNull()
+        }
+        val left = boxes.minOfOrNull { it.left } ?: 0f
+        val right = boxes.maxOfOrNull { it.right }
+            ?: (left + graphemeLayout.size.width)
+        val top = boxes.minOfOrNull { it.top } ?: 0f
+        val bottom = boxes.maxOfOrNull { it.bottom }
+            ?: (top + graphemeLayout.size.height)
+        val originalWidth = (right - left).coerceAtLeast(0f)
+        val originalHeight = (bottom - top).coerceAtLeast(0f)
+        val x = sideInsetPx + left + (originalWidth - graphemeLayout.size.width) / 2f
+        val y = topInsetPx + top + (originalHeight - graphemeLayout.size.height) / 2f
+        val position = Offset(x = x, y = y)
+        textOffset = endOffset
+        MeasuredLyricGrapheme(
+            timing = grapheme,
+            textLayout = graphemeLayout,
+            position = position
+        )
+    }
+
+    return MeasuredLyricWord(
+        widthPx = (wordLayout.size.width + horizontalInsets).coerceIn(1, maxWidthPx),
+        heightPx = ((wordLayout.size.height + topInsetPx * 2f).toInt() + 1).coerceAtLeast(1),
+        graphemes = measuredGraphemes
+    )
+}
+
+private data class FlowPlacement(
+    val index: Int,
+    val gapBeforePx: Int
+)
+
+private data class FlowLine(
+    val placements: List<FlowPlacement>,
+    val width: Int,
+    val height: Int
+)
+
+@Composable
+private fun CenteredLyricFlow(
+    tokens: List<TimedLyricToken>,
+    /** Which edge each row is set from; RTL is mirrored by placeRelative. */
+    side: LyricSide,
+    horizontalSpacing: androidx.compose.ui.unit.Dp,
+    verticalSpacing: androidx.compose.ui.unit.Dp,
+    modifier: Modifier = Modifier,
+    content: @Composable (TimedLyricToken) -> Unit
+) {
+    Layout(
+        modifier = modifier,
+        content = {
+            tokens.forEachIndexed { index, token ->
+                key(index, token.startMs, token.endMs) { content(token) }
+            }
+        }
+    ) { measurables, constraints ->
+        val childConstraints = constraints.copy(minWidth = 0, minHeight = 0)
+        val placeables = measurables.map { it.measure(childConstraints) }
+        val horizontalSpacingPx = horizontalSpacing.roundToPx()
+        val verticalSpacingPx = verticalSpacing.roundToPx()
+        val availableWidth = if (constraints.hasBoundedWidth) {
+            constraints.maxWidth
+        } else {
+            placeables.sumOf { it.width } + horizontalSpacingPx * (placeables.size - 1).coerceAtLeast(0)
+        }
+
+        val lines = mutableListOf<FlowLine>()
+        var currentPlacements = mutableListOf<FlowPlacement>()
+        var currentWidth = 0
+        var currentHeight = 0
+
+        fun commitLine() {
+            if (currentPlacements.isEmpty()) return
+            lines += FlowLine(currentPlacements.toList(), currentWidth, currentHeight)
+            currentPlacements = mutableListOf()
+            currentWidth = 0
+            currentHeight = 0
+        }
+
+        placeables.forEachIndexed { index, placeable ->
+            var gapBefore = if (currentPlacements.isNotEmpty() && tokens[index].spaceBefore) {
+                horizontalSpacingPx
+            } else {
+                0
+            }
+            if (currentPlacements.isNotEmpty() && currentWidth + gapBefore + placeable.width > availableWidth) {
+                commitLine()
+                gapBefore = 0
+            }
+            currentPlacements += FlowPlacement(index, gapBefore)
+            currentWidth += gapBefore + placeable.width
+            currentHeight = maxOf(currentHeight, placeable.height)
+        }
+        commitLine()
+
+        val contentHeight = lines.sumOf(FlowLine::height) +
+            verticalSpacingPx * (lines.size - 1).coerceAtLeast(0)
+        val layoutWidth = availableWidth.coerceIn(constraints.minWidth, constraints.maxWidth)
+        val layoutHeight = contentHeight.coerceIn(constraints.minHeight, constraints.maxHeight)
+
+        layout(layoutWidth, layoutHeight) {
+            var y = 0
+            lines.forEach { line ->
+                var x = when (side) {
+                    LyricSide.START -> 0
+                    LyricSide.CENTER -> ((layoutWidth - line.width) / 2).coerceAtLeast(0)
+                    LyricSide.END -> (layoutWidth - line.width).coerceAtLeast(0)
+                }
+                line.placements.forEach { placement ->
+                    val placeable = placeables[placement.index]
+                    x += placement.gapBeforePx
+                    placeable.placeRelative(
+                        x = x,
+                        y = y + (line.height - placeable.height) / 2
+                    )
+                    x += placeable.width
+                }
+                y += line.height + verticalSpacingPx
+            }
+        }
+    }
+}
+
+private fun buildTimedLyricTokens(
+    spans: List<LrcContentSpan>,
+    lineText: String
+): List<TimedLyricToken> {
+    val timedGraphemes = mutableListOf<TimedLyricGrapheme>()
+    spans.forEach { span ->
+        val graphemes = splitIntoGraphemes(span.text)
+        val visibleGraphemes = graphemes.filter { it.isNotBlank() }
+        val visibleCount = visibleGraphemes.size.coerceAtLeast(1)
+        val spanDurationMs = span.durationMs.coerceAtLeast(1L)
+        visibleGraphemes.forEachIndexed { index, text ->
+            val startMs = span.timeMs + spanDurationMs * index.toLong() / visibleCount.toLong()
+            val endMs = span.timeMs + spanDurationMs * (index + 1L) / visibleCount.toLong()
+            timedGraphemes += TimedLyricGrapheme(
+                text = text,
+                startMs = startMs,
+                durationMs = (endMs - startMs).coerceAtLeast(1L)
+            )
+        }
+    }
+    if (timedGraphemes.isEmpty()) return emptyList()
+
+    // The displayed line is authoritative. Providers occasionally omit final
+    // punctuation from timed spans; falling back to span text dropped the last
+    // visible characters entirely. When counts differ, map the available
+    // timings proportionally so every grapheme remains present and highlighted.
+    val layoutGraphemes = splitIntoGraphemes(lineText)
+        .takeIf { graphemes -> graphemes.any { it.isNotBlank() } }
+        ?: spans.flatMap { splitIntoGraphemes(it.text) }
+    val visibleLayoutCount = layoutGraphemes.count { it.isNotBlank() }.coerceAtLeast(1)
+
+    val tokens = mutableListOf<TimedLyricToken>()
+    var current = mutableListOf<TimedLyricGrapheme>()
+    var currentHasSpaceBefore = false
+    var pendingSpace = false
+    var timedIndex = 0
+
+    fun commitToken() {
+        if (current.isEmpty()) return
+        tokens += TimedLyricToken(current.toList(), currentHasSpaceBefore)
+        current = mutableListOf()
+        currentHasSpaceBefore = false
+    }
+
+    layoutGraphemes.forEach { text ->
+        if (text.isBlank()) {
+            commitToken()
+            pendingSpace = true
+            return@forEach
+        }
+
+        val timingIndex = lyricTimingIndex(
+            displayIndex = timedIndex,
+            displayCount = visibleLayoutCount,
+            timingCount = timedGraphemes.size
+        )
+        val timing = timedGraphemes[timingIndex]
+        timedIndex++
+        val grapheme = timing.copy(text = text)
+        if (isCjkGrapheme(text)) {
+            commitToken()
+            tokens += TimedLyricToken(listOf(grapheme), pendingSpace)
+            pendingSpace = false
+        } else {
+            if (current.isEmpty()) currentHasSpaceBefore = pendingSpace
+            current += grapheme
+            pendingSpace = false
+        }
+    }
+    commitToken()
+    return tokens
+}
+
+internal fun lyricTimingIndex(
+    displayIndex: Int,
+    displayCount: Int,
+    timingCount: Int
+): Int {
+    if (displayCount <= 1 || timingCount <= 1) return 0
+    return (displayIndex.toLong() * (timingCount - 1) / (displayCount - 1))
+        .toInt()
+        .coerceIn(0, timingCount - 1)
+}
+
+private fun isCjkGrapheme(text: String): Boolean {
+    if (text.isEmpty()) return false
+    return Character.UnicodeScript.of(text.codePointAt(0)) in setOf(
+        Character.UnicodeScript.HAN,
+        Character.UnicodeScript.HIRAGANA,
+        Character.UnicodeScript.KATAKANA,
+        Character.UnicodeScript.HANGUL
+    )
+}
+
+@Composable
+private fun rememberLyricsMotionEnabled(): Boolean {
+    val context = LocalContext.current
+    var enabled by remember(context) { mutableStateOf(true) }
+
+    DisposableEffect(context) {
+        val resolver = context.contentResolver
+        fun updateMotionPreference() {
+            enabled = runCatching {
+                Settings.Global.getFloat(
+                    resolver,
+                    Settings.Global.ANIMATOR_DURATION_SCALE,
+                    1f
+                ) > 0f
+            }.getOrDefault(true)
+        }
+
+        val observer = object : ContentObserver(Handler(Looper.getMainLooper())) {
+            override fun onChange(selfChange: Boolean) {
+                updateMotionPreference()
+            }
+        }
+
+        updateMotionPreference()
+        val registered = runCatching {
+            resolver.registerContentObserver(
+                Settings.Global.getUriFor(Settings.Global.ANIMATOR_DURATION_SCALE),
+                false,
+                observer
+            )
+        }.isSuccess
+
+        onDispose {
+            if (registered) runCatching { resolver.unregisterContentObserver(observer) }
+        }
+    }
+
+    return enabled
+}
+
+private fun splitIntoGraphemes(text: String): List<String> {
+    if (text.isEmpty()) return emptyList()
+    val iterator = BreakIterator.getCharacterInstance().apply { setText(text) }
+    val graphemes = mutableListOf<String>()
+    var start = iterator.first()
+    var end = iterator.next()
+    while (end != BreakIterator.DONE) {
+        graphemes += text.substring(start, end)
+        start = end
+        end = iterator.next()
+    }
+    return graphemes
+}
+
+@OptIn(ExperimentalMaterial3ExpressiveApi::class)
+@Composable
+private fun LoadingState(primaryColor: Color) {
+    Column(
+        horizontalAlignment = Alignment.CenterHorizontally,
+        verticalArrangement = Arrangement.Center
+    ) {
+        LoadingIndicator(
+            modifier = Modifier.size(48.dp),
+            color = primaryColor,
+            polygons = listOf(
+                MaterialShapes.Cookie9Sided,
+                MaterialShapes.Pill,
+                MaterialShapes.Sunny
+            )
+        )
+        Spacer(modifier = Modifier.height(16.dp))
+        Text(
+            text = stringResource(com.sentup.android.R.string.lyrics_loading),
+            style = MaterialTheme.typography.bodyLarge,
+            color = MaterialTheme.colorScheme.onSurfaceVariant
+        )
+    }
+}
+
+@Composable
+private fun NoLyricsState(onSurfaceVariantColor: Color, onRetry: (() -> Unit)?) {
+    Column(
+        horizontalAlignment = Alignment.CenterHorizontally,
+        verticalArrangement = Arrangement.Center,
+        modifier = Modifier.padding(32.dp)
+    ) {
+        Icon(
+            imageVector = Icons.Rounded.MusicOff,
+            contentDescription = null,
+            modifier = Modifier.size(64.dp),
+            tint = onSurfaceVariantColor.copy(alpha = 0.5f)
+        )
+        Spacer(modifier = Modifier.height(16.dp))
+        Text(
+            text = stringResource(com.sentup.android.R.string.lyrics_none_title),
+            style = MaterialTheme.typography.titleMedium,
+            color = onSurfaceVariantColor
+        )
+        Spacer(modifier = Modifier.height(8.dp))
+        Text(
+            text = stringResource(com.sentup.android.R.string.lyrics_none_body),
+            style = MaterialTheme.typography.bodyMedium,
+            color = onSurfaceVariantColor.copy(alpha = 0.7f),
+            textAlign = TextAlign.Center
+        )
+        if (onRetry != null) {
+            Spacer(modifier = Modifier.height(20.dp))
+            TextButton(
+                onClick = onRetry,
+                modifier = Modifier.heightIn(min = 48.dp)
+            ) {
+                Icon(
+                    Icons.Rounded.Refresh,
+                    contentDescription = null,
+                    modifier = Modifier.size(18.dp)
+                )
+                Spacer(modifier = Modifier.width(8.dp))
+                Text(
+                    text = stringResource(com.sentup.android.R.string.lyrics_retry),
+                    style = MaterialTheme.typography.labelLarge
+                )
+            }
+        }
+    }
+}
+
+@Composable
+private fun ErrorState(message: String, onSurfaceVariantColor: Color, onRetry: (() -> Unit)?) {
+    Column(
+        horizontalAlignment = Alignment.CenterHorizontally,
+        verticalArrangement = Arrangement.Center,
+        modifier = Modifier.padding(32.dp)
+    ) {
+        Icon(
+            imageVector = Icons.Rounded.WifiOff,
+            contentDescription = null,
+            modifier = Modifier.size(64.dp),
+            tint = onSurfaceVariantColor.copy(alpha = 0.5f)
+        )
+        Spacer(modifier = Modifier.height(16.dp))
+        Text(
+            text = stringResource(com.sentup.android.R.string.lyrics_error_title),
+            style = MaterialTheme.typography.titleMedium,
+            color = onSurfaceVariantColor
+        )
+        Spacer(modifier = Modifier.height(8.dp))
+        Text(
+            text = stringResource(com.sentup.android.R.string.lyrics_error_body),
+            style = MaterialTheme.typography.bodyMedium,
+            color = onSurfaceVariantColor.copy(alpha = 0.7f),
+            textAlign = TextAlign.Center
+        )
+        if (onRetry != null) {
+            Spacer(modifier = Modifier.height(20.dp))
+            TextButton(
+                onClick = onRetry,
+                modifier = Modifier.heightIn(min = 48.dp)
+            ) {
+                Icon(
+                    Icons.Rounded.Refresh,
+                    contentDescription = null,
+                    modifier = Modifier.size(18.dp)
+                )
+                Spacer(modifier = Modifier.width(8.dp))
+                Text(
+                    text = stringResource(com.sentup.android.R.string.lyrics_retry),
+                    style = MaterialTheme.typography.labelLarge
+                )
+            }
+        }
+    }
+}

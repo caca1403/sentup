@@ -1,0 +1,3509 @@
+package com.sentup.android.ui.settings
+import androidx.compose.ui.res.stringResource
+import com.sentup.android.R
+
+import android.content.Intent
+import android.net.Uri
+import androidx.activity.BackEventCompat
+import androidx.activity.compose.PredictiveBackHandler
+import androidx.compose.animation.AnimatedContent
+import androidx.compose.animation.AnimatedVisibility
+import androidx.compose.animation.EnterTransition
+import androidx.compose.animation.ExitTransition
+import androidx.compose.animation.SizeTransform
+import androidx.compose.animation.slideInHorizontally
+import androidx.compose.animation.slideOutHorizontally
+import androidx.compose.animation.togetherWith
+import androidx.compose.animation.core.Animatable
+import androidx.compose.animation.core.Spring
+import androidx.compose.animation.core.snap
+import androidx.compose.animation.animateColorAsState
+import androidx.compose.animation.core.animateFloatAsState
+import androidx.compose.animation.core.spring
+import androidx.compose.animation.core.tween
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
+import androidx.compose.animation.scaleIn
+import androidx.compose.animation.scaleOut
+import androidx.compose.animation.slideInVertically
+import androidx.compose.foundation.background
+import androidx.annotation.StringRes
+import androidx.compose.foundation.clickable
+import androidx.compose.foundation.interaction.MutableInteractionSource
+import androidx.compose.foundation.interaction.collectIsPressedAsState
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.ExperimentalLayoutApi
+import androidx.compose.foundation.layout.FlowRow
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.BoxWithConstraints
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.PaddingValues
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.WindowInsets
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxHeight
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.heightIn
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.statusBars
+import androidx.compose.foundation.layout.safeDrawing
+import androidx.compose.foundation.layout.only
+import androidx.compose.foundation.layout.WindowInsetsSides
+import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.layout.windowInsetsPadding
+import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.rememberScrollState
+import androidx.compose.foundation.verticalScroll
+import androidx.compose.foundation.lazy.itemsIndexed
+import androidx.compose.foundation.shape.CircleShape
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.rounded.ArrowBack
+import androidx.compose.material.icons.automirrored.rounded.Comment
+import androidx.compose.material.icons.automirrored.rounded.Logout
+import androidx.compose.material.icons.automirrored.rounded.QueueMusic
+import androidx.compose.material.icons.rounded.Animation
+import androidx.compose.material.icons.rounded.AccountCircle
+import androidx.compose.material.icons.rounded.Bolt
+import androidx.compose.material.icons.rounded.BookmarkAdd
+import androidx.compose.material.icons.rounded.FilterList
+import androidx.compose.material.icons.rounded.Subscriptions
+import androidx.compose.material.icons.rounded.Add
+import androidx.compose.material.icons.rounded.Animation
+import androidx.compose.material.icons.rounded.CheckCircle
+import androidx.compose.material.icons.rounded.ChevronRight
+import androidx.compose.material.icons.rounded.Close
+import androidx.compose.material.icons.rounded.Contrast
+import androidx.compose.material.icons.rounded.Cookie
+import androidx.compose.material.icons.rounded.DarkMode
+import androidx.compose.material.icons.rounded.DirectionsCar
+import androidx.compose.material.icons.rounded.Download
+import androidx.compose.material.icons.rounded.SystemUpdate
+import androidx.compose.material.icons.rounded.Folder
+import androidx.compose.material.icons.rounded.FolderOff
+import androidx.compose.material.icons.rounded.GraphicEq
+import androidx.compose.material.icons.rounded.GridView
+import androidx.compose.material.icons.rounded.Info
+import androidx.compose.material.icons.rounded.Interests
+import androidx.compose.material.icons.rounded.LightMode
+import androidx.compose.material.icons.rounded.MusicNote
+import androidx.compose.material.icons.rounded.Newspaper
+import androidx.compose.material.icons.rounded.NotInterested
+import androidx.compose.material.icons.rounded.AutoAwesome
+import androidx.compose.material.icons.rounded.Palette
+import androidx.compose.material.icons.rounded.PlayCircle
+import androidx.compose.material.icons.rounded.RadioButtonChecked
+import androidx.compose.material.icons.rounded.Save
+import androidx.compose.material.icons.rounded.Security
+import androidx.compose.material.icons.rounded.SettingsBackupRestore
+import androidx.compose.material.icons.rounded.FlashOn
+import androidx.compose.material.icons.rounded.HighQuality
+import androidx.compose.material.icons.rounded.SignalCellularAlt
+import androidx.compose.material.icons.rounded.SwipeRight
+import androidx.compose.material.icons.rounded.Wallpaper
+import androidx.compose.material.icons.rounded.Wifi
+import androidx.compose.material.icons.rounded.ThumbDown
+import androidx.compose.material.icons.rounded.ThumbUp
+import androidx.compose.material.icons.rounded.ToggleOn
+import androidx.compose.material.icons.rounded.TouchApp
+import androidx.compose.material.icons.rounded.ChatBubble
+import androidx.compose.material.icons.rounded.CloudOff
+import androidx.compose.material.icons.rounded.BugReport
+import androidx.compose.material.icons.rounded.Code
+import androidx.compose.material.icons.rounded.Gavel
+import androidx.compose.material.icons.rounded.OpenInNew
+import androidx.compose.material.icons.rounded.Person
+import androidx.compose.material.icons.rounded.Share
+import androidx.compose.material.icons.rounded.Visibility
+import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.Button
+import androidx.compose.material3.ButtonDefaults
+import androidx.compose.material3.Checkbox
+import androidx.compose.material3.CheckboxDefaults
+import androidx.compose.material3.CircularProgressIndicator
+import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.ExperimentalMaterial3ExpressiveApi
+import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
+import androidx.compose.material3.IconButtonDefaults
+import androidx.compose.foundation.shape.CornerSize
+import androidx.compose.material3.ButtonGroupDefaults
+import androidx.compose.material3.ToggleButton
+import androidx.compose.material3.ToggleButtonDefaults
+import androidx.compose.material3.MaterialShapes
+import androidx.compose.material.icons.rounded.VideoLibrary
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.OutlinedButton
+import androidx.compose.material3.RadioButton
+import androidx.compose.material3.FilterChip
+import androidx.compose.material3.Surface
+import androidx.compose.material3.Switch
+import androidx.compose.material3.SwitchDefaults
+import androidx.compose.material3.Text
+import androidx.compose.material3.TopAppBar
+import androidx.compose.material3.TopAppBarDefaults
+import androidx.compose.material3.toShape
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.DisposableEffect
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.runtime.collectAsState
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.key
+import androidx.compose.runtime.mutableFloatStateOf
+import androidx.compose.runtime.CompositionLocalProvider
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
+import androidx.compose.runtime.setValue
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.draw.drawWithCache
+import androidx.compose.ui.draw.scale
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.graphics.Outline
+import androidx.compose.ui.graphics.Shape
+import androidx.compose.ui.graphics.asComposePath
+import androidx.compose.ui.graphics.graphicsLayer
+import androidx.compose.ui.graphics.vector.ImageVector
+import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.layout.onSizeChanged
+import androidx.compose.ui.util.lerp
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.platform.LocalFocusManager
+import androidx.compose.ui.res.painterResource
+import androidx.compose.ui.text.font.FontWeight
+import androidx.compose.ui.text.style.TextAlign
+import androidx.compose.ui.text.style.TextDecoration
+import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.Density
+import androidx.compose.ui.unit.IntOffset
+import androidx.compose.ui.unit.LayoutDirection
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.unit.sp
+import androidx.graphics.shapes.RoundedPolygon
+import androidx.graphics.shapes.toPath
+import coil.compose.AsyncImage
+import coil.request.CachePolicy
+import coil.request.ImageRequest
+import com.sentup.android.BuildConfig
+import androidx.lifecycle.Lifecycle
+import androidx.lifecycle.LifecycleEventObserver
+import com.sentup.android.data.DownloadNotificationHelper
+import com.sentup.android.data.FolderInfo
+import com.sentup.android.data.BackupRepository
+import com.sentup.android.data.SessionManager
+import com.sentup.android.data.UI_SCALE_DEFAULT
+import com.sentup.android.data.SegmentAction
+import com.sentup.android.data.SponsorCategory
+import androidx.compose.material.icons.rounded.MoneyOff
+import androidx.compose.ui.res.pluralStringResource
+import kotlin.math.roundToInt
+import com.sentup.android.data.ThemePreferences
+import com.sentup.android.data.YouTubeAuthUtils
+
+import com.sentup.android.ui.auth.YouTubeAuthDialog
+import com.sentup.android.ui.components.coveredBy
+import com.sentup.android.ui.components.SegmentedGroup
+import androidx.compose.material3.ListItemDefaults
+import androidx.compose.material3.SegmentedListItem
+import androidx.compose.material.icons.automirrored.rounded.LibraryBooks
+import androidx.compose.material.icons.rounded.Check
+import com.sentup.android.data.MotionArtworkQuality
+import com.sentup.android.data.PlayerStyle
+import com.sentup.android.ui.theme.ThemeMode
+import kotlinx.coroutines.CancellationException
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.launch
+import androidx.compose.ui.window.Dialog
+import androidx.compose.ui.window.DialogProperties
+
+// Helper to convert Expressive Polygons to a Compose Shape
+// Based on official Android Shapes snippets
+private class PolygonShape(private val polygon: RoundedPolygon) : Shape {
+    override fun createOutline(
+        size: androidx.compose.ui.geometry.Size,
+        layoutDirection: LayoutDirection,
+        density: Density
+    ): Outline {
+        val path = polygon.toPath().asComposePath()
+        val matrix = androidx.compose.ui.graphics.Matrix()
+        
+        // Calculate bounds of the polygon
+        // calculateBounds() returns float array [left, top, right, bottom]
+        val bounds = polygon.calculateBounds()
+        val boundsWidth = bounds[2] - bounds[0]
+        val boundsHeight = bounds[3] - bounds[1]
+        
+        // Android Compose Matrix operations are applied in reverse order to the point
+        // We want: Scale * Translate * Point
+        // So we call scale() then translate()
+        
+        // Scale to fit component size
+        // We scale width/boundsWidth and height/boundsHeight to stretch/fit exactly
+        val scaleX = size.width / boundsWidth
+        val scaleY = size.height / boundsHeight
+        matrix.scale(scaleX, scaleY)
+        
+        // Translate to origin (0,0) based on bounds top-left
+        matrix.translate(-bounds[0], -bounds[1])
+        
+        path.transform(matrix)
+        return Outline.Generic(path)
+    }
+}
+
+/**
+ * One page of the settings screen. These are not nav routes on purpose: the
+ * screen takes ~60 parameters, and threading those into a NavHost destination
+ * per category would mean repeating the whole list eleven times. The Home tab
+ * system solves the same problem the same way.
+ */
+internal enum class SettingsPage {
+    HUB,
+    ACCOUNT,
+    APPEARANCE,
+    PLAYER,
+    PLAYBACK,
+    CONTENT,
+    VIDEO_HOME,
+    SUBSCRIPTIONS,
+    STORAGE,
+    NOTIFICATIONS,
+    LOCAL_LIBRARY,
+    ADVANCED,
+    DISPLAY_SIZE,
+    LYRICS,
+    LASTFM,
+    SPONSORBLOCK,
+    APP_ICON,
+    BACKUP,
+    MINI_PLAYER,
+    CUSTOMIZATION,
+    HOME_NAVIGATION,
+    GESTURES,
+    VIDEO_PLAYER,
+    VIDEO_FEED,
+    VIDEO_SHADERS,
+    STANDBY,
+    INSIGHTS;
+
+    /**
+     * Where back goes from this page. Most pages are opened from the hub;
+     * a nested one returns to the page that opened it, because what it holds
+     * is usually adjusted more than once before it is right.
+     */
+    val parent: SettingsPage
+        get() = when (this) {
+            APPEARANCE, APP_ICON, DISPLAY_SIZE, PLAYER, MINI_PLAYER,
+            HOME_NAVIGATION, GESTURES, VIDEO_PLAYER, VIDEO_FEED, VIDEO_SHADERS, STANDBY -> CUSTOMIZATION
+            VIDEO_HOME -> CONTENT
+            else -> HUB
+        }
+
+    /** The hub row this page lives under: itself, or the top of its chain of parents. */
+    val root: SettingsPage
+        get() = if (this == HUB || parent == HUB) this else parent.root
+}
+
+@OptIn(ExperimentalMaterial3Api::class, ExperimentalMaterial3ExpressiveApi::class)
+@Composable
+fun SettingsScreen(
+    currentThemeMode: ThemeMode,
+    onThemeModeChange: (ThemeMode) -> Unit,
+    amoledTheme: Boolean,
+    onAmoledThemeToggle: (Boolean) -> Unit,
+    colorPalette: String = ThemePreferences.DEFAULT_COLOR_PALETTE,
+    onNavigateToColorPalette: () -> Unit = {},
+    paletteStyle: com.sentup.android.ui.theme.PaletteStyle = com.sentup.android.ui.theme.PaletteStyle.TONAL_SPOT,
+    appIcon: String = ThemePreferences.DEFAULT_APP_ICON,
+    loadLocalSongs: Boolean,
+    onLoadLocalSongsToggle: (Boolean) -> Unit,
+    ambientBackground: Boolean,
+    onAmbientBackgroundToggle: (Boolean) -> Unit,
+    playerArtworkColors: Boolean = true,
+    onPlayerArtworkColorsToggle: (Boolean) -> Unit = {},
+    motionArtwork: Boolean,
+    onMotionArtworkToggle: (Boolean) -> Unit,
+    motionArtworkWifiOnly: Boolean,
+    onMotionArtworkWifiOnlyToggle: (Boolean) -> Unit,
+    motionArtworkQuality: MotionArtworkQuality,
+    onMotionArtworkQualityChange: (MotionArtworkQuality) -> Unit,
+    waveformSeekBar: Boolean,
+    onWaveformSeekBarToggle: (Boolean) -> Unit,
+    videoMode: Boolean,
+    onVideoModeToggle: (Boolean) -> Unit,
+    homeModeToggleEnabled: Boolean = true,
+    onHomeModeToggleChange: (Boolean) -> Unit = {},
+    videoHomeConfiguration: com.sentup.android.data.VideoHomeConfiguration =
+        com.sentup.android.data.VideoHomeConfiguration(),
+    onVideoRecommendationsEnabledChange: (Boolean) -> Unit = {},
+    onVideoHomeDestinationVisibleChange: (
+        com.sentup.android.data.VideoHomeDestination,
+        Boolean,
+    ) -> Unit = { _, _ -> },
+    onMoveVideoHomeDestination: (com.sentup.android.data.VideoHomeDestination, Int) -> Unit = { _, _ -> },
+    spotlightHome: Boolean = false,
+    onSpotlightHomeToggle: (Boolean) -> Unit = {},
+    nonExpressiveNavigationBar: Boolean = false,
+    onNonExpressiveNavigationBarToggle: (Boolean) -> Unit = {},
+    playerStyle: PlayerStyle,
+    onPlayerStyleChange: (PlayerStyle) -> Unit,
+    saveVideoHistory: Boolean,
+    onSaveVideoHistoryToggle: (Boolean) -> Unit,
+    saveMusicHistory: Boolean,
+    onSaveMusicHistoryToggle: (Boolean) -> Unit,
+    liveDownloadUpdates: Boolean,
+    onLiveDownloadUpdatesToggle: (Boolean) -> Unit,
+    livePlaybackUpdates: Boolean,
+    onLivePlaybackUpdatesToggle: (Boolean) -> Unit,
+    timedCommentsEnabled: Boolean,
+    showRecentSearches: Boolean,
+    onShowRecentSearchesToggle: (Boolean) -> Unit,
+    showRelatedVideos: Boolean,
+    onShowRelatedVideosToggle: (Boolean) -> Unit,
+    inlinePreviews: Boolean,
+    onInlinePreviewsToggle: (Boolean) -> Unit,
+    compactVideoHome: Boolean,
+    onCompactVideoHomeToggle: (Boolean) -> Unit,
+    playlistSwipeEnabled: Boolean,
+    onPlaylistSwipeEnabledToggle: (Boolean) -> Unit,
+    playlistSwipeStartAction: String,
+    onPlaylistSwipeStartActionChange: (String) -> Unit,
+    playlistSwipeEndAction: String,
+    onPlaylistSwipeEndActionChange: (String) -> Unit,
+    onTimedCommentsToggle: (Boolean) -> Unit,
+    shortsEnabled: Boolean,
+    onShortsEnabledToggle: (Boolean) -> Unit,
+    shortsHiddenActions: Set<String> = emptySet(),
+    onShortsHiddenActionsChange: (Set<String>) -> Unit = {},
+    shortsHardBlock: Boolean,
+    onShortsHardBlockToggle: (Boolean) -> Unit,
+    returnDislike: Boolean,
+    onReturnDislikeToggle: (Boolean) -> Unit,
+    contentRegion: String,
+    onContentRegionChange: (String) -> Unit,
+    videoQualityWifi: String,
+    onVideoQualityWifiChange: (String) -> Unit,
+    videoQualityMobile: String,
+    onVideoQualityMobileChange: (String) -> Unit,
+    preferHdr: Boolean = false,
+    onPreferHdrToggle: (Boolean) -> Unit = {},
+    frameInterpolation: Boolean,
+    onFrameInterpolationToggle: (Boolean) -> Unit,
+    frameInterpolationMaxFps: Int,
+    onFrameInterpolationMaxFpsChange: (Int) -> Unit,
+    musicQualityWifi: String,
+    onMusicQualityWifiChange: (String) -> Unit,
+    musicQualityMobile: String,
+    onMusicQualityMobileChange: (String) -> Unit,
+    subscriptionSource: String = ThemePreferences.SUBSCRIPTIONS_AUTO,
+    onSubscriptionSourceChange: (String) -> Unit = {},
+    subscribeTarget: String = ThemePreferences.SUBSCRIPTIONS_AUTO,
+    onSubscribeTargetChange: (String) -> Unit = {},
+    fastSubscriptionFeed: Boolean = true,
+    onFastSubscriptionFeedToggle: (Boolean) -> Unit = {},
+    subscriptionRefresh: Int,
+    onSubscriptionRefreshChange: (Int) -> Unit,
+    onNavigateToSubscriptions: () -> Unit = {},
+    onNavigateToNotInterested: () -> Unit = {},
+    onNavigateToBackup: () -> Unit = {},
+    onNavigateToReportBug: () -> Unit = {},
+    onNavigateToTimeLimit: () -> Unit = {},
+    excludedFolders: Set<String>,
+    onAddExcludedFolder: (String) -> Unit,
+    onRemoveExcludedFolder: (String) -> Unit,
+    homeViewModel: com.sentup.android.ui.home.HomeViewModel,
+    onLogoutClick: () -> Unit,
+    onBackClick: () -> Unit,
+    cacheEnabled: Boolean,
+    onCacheEnabledToggle: (Boolean) -> Unit,
+    videoCacheEnabled: Boolean,
+    onVideoCacheEnabledToggle: (Boolean) -> Unit,
+    shortsCacheEnabled: Boolean,
+    onShortsCacheEnabledToggle: (Boolean) -> Unit,
+    playbackPreloadEnabled: Boolean,
+    onPlaybackPreloadEnabledToggle: (Boolean) -> Unit,
+    maxCacheSizeMb: Long,
+    onMaxCacheSizeMbChange: (Long) -> Unit,
+    currentCacheSize: Long,
+    onClearCacheClick: () -> Unit,
+    onClearVideoCacheClick: () -> Unit,
+    onClearShortsCacheClick: () -> Unit,
+    autoLoadQueue: Boolean,
+    onAutoLoadQueueToggle: (Boolean) -> Unit,
+    crossfadeEnabled: Boolean,
+    onCrossfadeEnabledToggle: (Boolean) -> Unit,
+    crossfadeAuto: Boolean,
+    onCrossfadeAutoChange: (Boolean) -> Unit,
+    crossfadeDurationMs: Int,
+    onCrossfadeDurationChange: (Int) -> Unit,
+    normalizeVolume: Boolean,
+    onNormalizeVolumeToggle: (Boolean) -> Unit,
+    discordPresence: Boolean,
+    onDiscordPresenceToggle: (Boolean) -> Unit,
+    rememberVideoBrightness: Boolean,
+    onRememberVideoBrightnessToggle: (Boolean) -> Unit,
+    pipButtons: String,
+    onPipButtonsChange: (String) -> Unit,
+    hapticsLevel: String,
+    onHapticsLevelChange: (String) -> Unit,
+    uploadNotificationsEnabled: Boolean,
+    onUploadNotificationsToggle: (Boolean) -> Unit,
+    oemFixEnabled: Boolean,
+    onOemFixEnabledToggle: (Boolean) -> Unit,
+    manualScanEnabled: Boolean,
+    onManualScanEnabledToggle: (Boolean) -> Unit,
+    privateDownloadsEnabled: Boolean,
+    onPrivateDownloadsEnabledToggle: (Boolean) -> Unit,
+    onNavigateToUpdate: () -> Unit = {},
+    localOnlyMode: Boolean = false,
+    onLocalOnlyModeToggle: (Boolean) -> Unit = {},
+    uiScale: Float = UI_SCALE_DEFAULT,
+    onUiScaleChange: (Float) -> Unit = {},
+    lyricsConfiguration: com.sentup.android.data.LyricsConfiguration,
+    onLyricsConfigurationChange: (com.sentup.android.data.LyricsConfiguration) -> Unit,
+    sponsorBlockEnabled: Boolean = false,
+    onSponsorBlockEnabledToggle: (Boolean) -> Unit = {},
+    sponsorBlockActions: Map<SponsorCategory, SegmentAction> = emptyMap(),
+    onSponsorBlockActionChange: (SponsorCategory, SegmentAction) -> Unit = { _, _ -> },
+    onResetSponsorBlockActions: () -> Unit = {},
+    sponsorBlockShowOnSeekBar: Boolean = true,
+    onSponsorBlockShowOnSeekBarToggle: (Boolean) -> Unit = {},
+    sponsorBlockNotice: Boolean = true,
+    onSponsorBlockNoticeToggle: (Boolean) -> Unit = {},
+    sponsorBlockMinDurationMs: Long = 0L,
+    onSponsorBlockMinDurationChange: (Long) -> Unit = {},
+    contentPadding: PaddingValues = PaddingValues(),
+    /** Opens the open-source licences screen, from the About dialog. */
+    onNavigateToLicenses: () -> Unit = {},
+    rotateWithDevice: Boolean = false,
+    onRotateWithDeviceToggle: (Boolean) -> Unit = {},
+    /** Opens taste setup to review or change the saved picks. */
+    onNavigateToTaste: () -> Unit = {},
+    /**
+     * Activity-scoped players, passed so the Insights page's saved auto-mixes
+     * are actually playable from Settings. Left null the "Play" row stays a
+     * no-op, which is why both were threaded through from MainActivity.
+     */
+    playerViewModel: com.sentup.android.ui.player.PlayerViewModel? = null,
+    videoPlayerViewModel: com.sentup.android.ui.video.VideoPlayerViewModel? = null
+) {
+    val context = LocalContext.current
+    val sessionManager = remember { SessionManager(context) }
+    val coroutineScope = rememberCoroutineScope()
+
+    // The upload-notification channel list reads the stores directly (no DI
+    // house style): the mute toggles write through the same instances.
+    val localSubscriptionsRepository = remember {
+        com.sentup.android.data.LocalSubscriptionsRepository(context)
+    }
+    val uploadCheckRepository = remember {
+        com.sentup.android.data.UploadCheckRepository(context)
+    }
+    val followedChannels by localSubscriptionsRepository.subscriptions.collectAsState()
+    val mutedChannelIds by uploadCheckRepository.mutedChannelIds.collectAsState()
+
+    // Check actual login status
+    var isLoggedIn by remember { mutableStateOf(sessionManager.isLoggedIn()) }
+
+    // Whether the OS currently lets Sentüp post promoted (Live Update)
+    // notifications. Re-read on resume, because the only way to change it is to
+    // leave for system settings and come back.
+    val notificationHelper = remember { DownloadNotificationHelper(context) }
+    var canPostPromoted by remember { mutableStateOf(notificationHelper.canPostLiveUpdates()) }
+    // Same idea for plain notifications: the upload bell can be on while the
+    // system drops every post, and the page has to say so.
+    var canPostNotifications by remember {
+        mutableStateOf(com.sentup.android.work.UploadCheckWorker.canPostNotifications(context))
+    }
+    val settingsActivity = context as? androidx.activity.ComponentActivity
+    DisposableEffect(settingsActivity) {
+        val lifecycle = settingsActivity?.lifecycle
+        val observer = LifecycleEventObserver { _, event ->
+            if (event == Lifecycle.Event.ON_RESUME) {
+                canPostPromoted = notificationHelper.canPostLiveUpdates()
+                canPostNotifications =
+                    com.sentup.android.work.UploadCheckWorker.canPostNotifications(context)
+            }
+        }
+        lifecycle?.addObserver(observer)
+        onDispose { lifecycle?.removeObserver(observer) }
+    }
+    val notificationPermissionLauncher = androidx.activity.compose.rememberLauncherForActivityResult(
+        androidx.activity.result.contract.ActivityResultContracts.RequestPermission()
+    ) {
+        canPostNotifications = com.sentup.android.work.UploadCheckWorker.canPostNotifications(context)
+    }
+
+    // Which category page is open, and what is typed in the hub's search box.
+    var page by remember { mutableStateOf(SettingsPage.HUB) }
+    var searchQuery by remember { mutableStateOf("") }
+
+    // Backup and restore is a page like the others, so on a wide window it
+    // opens beside the hub instead of taking the whole screen. Its work runs
+    // in the page's own scope, and beside the hub another category is one tap
+    // away - which would cancel a backup half written or a restore half
+    // applied. While it is busy the page stays where it is.
+    var backupBusy by remember { mutableStateOf(false) }
+    val openPage: (SettingsPage) -> Unit = { target -> if (!backupBusy) page = target }
+
+    // List-detail on a window wide enough for both: the hub stays on the
+    // start side and the open category fills the rest, rather than a phone's
+    // one-screen-at-a-time stack stretched across a tablet. The hub is still
+    // the same composable and the pages the same pages; only where they sit
+    // changes. "No page open" means the first category is shown, because an
+    // empty detail pane is a hole in the screen rather than a state.
+    val settingsWindow = com.sentup.android.ui.theme.currentWindowLayout()
+    val twoPane = settingsWindow.supportsTwoPanes
+    val detailPage = if (page == SettingsPage.HUB) SettingsPage.ACCOUNT else page
+    val nestedPage = page != SettingsPage.HUB && page.parent != SettingsPage.HUB
+
+    /**
+     * Back unwinds one step at a time: an open page returns to the hub, then a
+     * live query clears, and only then does Settings close. The query survives
+     * opening a result on purpose, so coming back lands on the same list.
+     *
+     * The first of those steps is previewed while the finger is still down.
+     * The manifest has opted into the modern back API for a long time, so a
+     * plain `BackHandler` here was not neutral: it swallowed the gesture and
+     * left the platform with nothing to draw, which is worse than never having
+     * opted in.
+     *
+     * `peel` runs 0..2 and is deliberately one continuous value rather than a
+     * preview animation plus a separate exit. 0..1 is the drag, 1..2 carries
+     * the page the rest of the way off after the user commits, so releasing
+     * continues the movement instead of snapping home to replay it.
+     *
+     * Clearing the query is not previewed. Nothing leaves the screen for that
+     * step - the hub restates itself - so there is nothing to draw behind, and
+     * a page-shaped animation over a list that is staying put would be a lie
+     * about what is happening.
+     */
+    val peel = remember { Animatable(0f) }
+    var isPeeling by remember { mutableStateOf(false) }
+    var peelCommitted by remember { mutableStateOf(false) }
+    // +1 when the finger came from the left edge, so the page leaves the way
+    // the hand is already moving. Physical, so it needs no RTL adjustment.
+    var peelSign by remember { mutableFloatStateOf(1f) }
+    var containerWidth by remember { mutableFloatStateOf(0f) }
+
+    // Side by side, back only unwinds what is stacked: a nested page returns to
+    // its parent and a query clears. A top-level category is not "on top" of
+    // anything there, so back leaves Settings as it would from the hub.
+    PredictiveBackHandler(
+        enabled = if (twoPane) nestedPage || searchQuery.isNotEmpty()
+        else page != SettingsPage.HUB || searchQuery.isNotEmpty()
+    ) { events ->
+        if (twoPane) {
+            try {
+                events.collect { }
+                if (nestedPage) page = page.parent else searchQuery = ""
+            } catch (cancelled: CancellationException) {
+                // Nothing moved, so there is nothing to spring back.
+            }
+            return@PredictiveBackHandler
+        }
+        val hasPage = page != SettingsPage.HUB
+        var dragged = false
+        try {
+            events.collect { event ->
+                if (!hasPage) return@collect
+                dragged = true
+                isPeeling = true
+                peelSign = if (event.swipeEdge == BackEventCompat.EDGE_LEFT) 1f else -1f
+                peel.snapTo(event.progress.coerceIn(0f, 1f))
+            }
+            when {
+                // Committed a real drag: finish the move it started.
+                hasPage && dragged -> {
+                    peelCommitted = true
+                    peel.animateTo(
+                        targetValue = 2f,
+                        animationSpec = spring(
+                            dampingRatio = Spring.DampingRatioNoBouncy,
+                            stiffness = Spring.StiffnessMedium
+                        )
+                    )
+                    page = page.parent
+                }
+                // A button press, or three-button navigation: no gesture to
+                // continue from, so the ordinary transition is still the right
+                // one and the peel stays out of it entirely.
+                hasPage -> page = page.parent
+                else -> searchQuery = ""
+            }
+        } catch (cancelled: CancellationException) {
+            // The user changed their mind, and this is the case the feature
+            // lives or dies on: a preview of leaving that does not come back
+            // cleanly is worse than no preview at all.
+            //
+            // The spring has to be launched from the screen's own scope. This
+            // coroutine is the one the system has just cancelled, so an
+            // animation started here would be dead on arrival and the page
+            // would stay stranded mid-peel.
+            // Cleared here as well as after a swap: a second gesture can start
+            // while the first is still finishing, and a commit flag left set on
+            // a page that came back would make the next ordinary back vanish it
+            // with no animation at all.
+            peelCommitted = false
+            if (dragged) {
+                coroutineScope.launch {
+                    peel.animateTo(
+                        targetValue = 0f,
+                        animationSpec = spring(
+                            dampingRatio = Spring.DampingRatioNoBouncy,
+                            stiffness = Spring.StiffnessMediumLow
+                        )
+                    )
+                    isPeeling = false
+                }
+            } else {
+                isPeeling = false
+            }
+        }
+    }
+
+    // Put the peel away once the page layer has gone, ready for the next
+    // gesture.
+    //
+    // The flags come down before the value, and that order is the whole point:
+    // `snapTo` suspends, so clearing `isPeeling` after it leaves a frame where
+    // the peel reads 0 while the hub is still wearing its peel layer, and the
+    // hub jumps to 0.94 scale for exactly one frame. With the flag cleared
+    // first there is no layer left for the value to feed.
+    // A window that became two panes mid-peel (a foldable opening) must not
+    // carry a committed peel into the next single-pane transition.
+    LaunchedEffect(twoPane) {
+        if (twoPane && (peelCommitted || isPeeling)) {
+            peelCommitted = false
+            isPeeling = false
+            peel.snapTo(0f)
+        }
+    }
+
+    // Any landing, not only the hub: a page under Customization goes back to
+    // Customization, and a peel left committed there would hold that page in
+    // the shrunken layer the gesture drew.
+    LaunchedEffect(page) {
+        if (peelCommitted) {
+            peelCommitted = false
+            isPeeling = false
+            peel.snapTo(0f)
+        }
+    }
+
+    // Dialog state for YouTube auth
+    var showAuthDialog by remember { mutableStateOf(false) }
+    // Whether that sign-in becomes a new profile or lands on the active one.
+    var authAsNewProfile by remember { mutableStateOf(false) }
+
+    // Dialog state for pasting a session cookie header by hand
+    var showCookiePasteSheet by remember { mutableStateOf(false) }
+    // Bumped after a session change so the account row re-reads name/avatar,
+    // which SessionManager exposes as plain getters rather than a flow.
+    var accountRefreshKey by remember { mutableStateOf(0) }
+    // The Account page can switch profiles, and the hub's "signed in" line
+    // would otherwise keep describing the profile that was left.
+    LaunchedEffect(Unit) {
+        com.sentup.android.data.ProfileManager(context).activeProfileId.collect {
+            isLoggedIn = sessionManager.isLoggedIn()
+            accountRefreshKey++
+        }
+    }
+
+    // Dialog state for About
+    var showAboutDialog by remember { mutableStateOf(false) }
+
+    // The one dialog behind every hold-to-explain gesture. Rows hand their
+    // request up through LocalSettingsInfoSink because a dialog owned by a
+    // page dies with the page transition.
+    var settingsInfo by remember { mutableStateOf<SettingsInfoData?>(null) }
+
+    // Which per-network quality picker is open, if any
+    var qualityDialogTarget by remember { mutableStateOf<QualityDialogTarget?>(null) }
+
+    // Smooth motion is only ever turned on through its warning.
+    var showFrameInterpolationWarning by remember { mutableStateOf(false) }
+
+    // Which subscription-routing picker is open, if any
+    var subscriptionDialogTarget by remember { mutableStateOf<SubscriptionDialogTarget?>(null) }
+
+    // Dialog state for Folder Exclusion
+    var showFolderExclusionDialog by remember { mutableStateOf(false) }
+    var showShortsButtonsDialog by remember { mutableStateOf(false) }
+    var showContentRegionSheet by remember { mutableStateOf(false) }
+    var showAutoHelpDialog by remember { mutableStateOf(false) }
+    var availableFolders by remember { mutableStateOf<List<FolderInfo>>(emptyList()) }
+    var isFoldersLoading by remember { mutableStateOf(false) }
+
+    val openFolderExclusion: () -> Unit = {
+        // Load available folders when opening dialog
+        isFoldersLoading = true
+        coroutineScope.launch {
+            availableFolders = homeViewModel.getAvailableFolders()
+            isFoldersLoading = false
+        }
+        showFolderExclusionDialog = true
+    }
+
+    // Not remembered: the closures capture callbacks that arrive as parameters,
+    // and ~38 small objects per recomposition is cheaper than a stale index.
+    val searchEntries = buildSettingsSearchIndex(
+        onOpenPage = openPage,
+        onOpenQualityPicker = { qualityDialogTarget = it },
+        onOpenRoutingPicker = { subscriptionDialogTarget = it },
+        onShowAbout = { showAboutDialog = true },
+        onShowShortsButtons = { showShortsButtonsDialog = true },
+        onShowContentRegion = { showContentRegionSheet = true },
+        onOpenFolderExclusion = openFolderExclusion,
+        onNavigateToColorPalette = onNavigateToColorPalette,
+        onNavigateToSubscriptions = onNavigateToSubscriptions,
+        onNavigateToNotInterested = onNavigateToNotInterested,
+        onNavigateToTaste = onNavigateToTaste,
+        onNavigateToBackup = { openPage(SettingsPage.BACKUP) },
+        onNavigateToReportBug = onNavigateToReportBug,
+        onNavigateToTimeLimit = onNavigateToTimeLimit,
+        supportsLiveUpdates = ThemePreferences.SUPPORTS_LIVE_UPDATES
+    )
+
+    val pageContent: @Composable (SettingsPage) -> Unit = { currentPage ->
+        when (currentPage) {
+            // Nothing on top: the hub below is the screen. Full size
+            // rather than empty so this layer measures the same in
+            // both states, and takes no touches so the hub underneath
+            // still gets them.
+            SettingsPage.HUB -> Spacer(Modifier.fillMaxSize())
+
+            SettingsPage.ACCOUNT -> AccountSettingsPage(
+            isLoggedIn = isLoggedIn,
+            accountRefreshKey = accountRefreshKey,
+            sessionManager = sessionManager,
+            saveVideoHistory = saveVideoHistory,
+            onSaveVideoHistoryToggle = onSaveVideoHistoryToggle,
+            onShowAuthDialog = {
+                authAsNewProfile = false
+                showAuthDialog = true
+            },
+            onShowCookieSheet = { showCookiePasteSheet = true },
+            onSignOut = {
+                sessionManager.clearSession()
+                isLoggedIn = false
+                onLogoutClick()
+            },
+            // Google's login page auto-continues as whoever the WebView jar
+            // already holds, so both paths clear it first - and wait for the
+            // asynchronous clear, or the page recaptures the old account. Stored
+            // sessions live in EncryptedSharedPreferences and are untouched.
+            onAddYouTubeAccount = {
+                val cookieManager = android.webkit.CookieManager.getInstance()
+                cookieManager.removeAllCookies {
+                    cookieManager.flush()
+                    authAsNewProfile = true
+                    showAuthDialog = true
+                }
+            },
+            // Not as a new profile: the profile exists and is active, so the
+            // session has to land on it (docs/identity.md).
+            onReconnectProfile = {
+                val cookieManager = android.webkit.CookieManager.getInstance()
+                cookieManager.removeAllCookies {
+                    cookieManager.flush()
+                    authAsNewProfile = false
+                    showAuthDialog = true
+                }
+            },
+            onOpenPage = { page = it },
+            onBack = { page = SettingsPage.HUB }
+        )
+
+        SettingsPage.CUSTOMIZATION -> CustomizationSettingsPage(
+            currentThemeMode = currentThemeMode,
+            colorPalette = colorPalette,
+            appIcon = appIcon,
+            uiScale = uiScale,
+            playerStyle = playerStyle,
+            spotlightHome = spotlightHome,
+            nonExpressiveNavigationBar = nonExpressiveNavigationBar,
+            hapticsLevel = hapticsLevel,
+            onOpenPage = { page = it },
+            onBack = { page = SettingsPage.HUB }
+        )
+
+        SettingsPage.APPEARANCE -> AppearanceSettingsPage(
+            paletteStyle = paletteStyle,
+            currentThemeMode = currentThemeMode,
+            onThemeModeChange = onThemeModeChange,
+            colorPalette = colorPalette,
+            onNavigateToColorPalette = onNavigateToColorPalette,
+            amoledTheme = amoledTheme,
+            onAmoledThemeToggle = onAmoledThemeToggle,
+            onBack = { page = SettingsPage.CUSTOMIZATION }
+        )
+
+        SettingsPage.HOME_NAVIGATION -> HomeNavigationSettingsPage(
+            spotlightHome = spotlightHome,
+            onSpotlightHomeToggle = onSpotlightHomeToggle,
+            nonExpressiveNavigationBar = nonExpressiveNavigationBar,
+            onNonExpressiveNavigationBarToggle =
+                onNonExpressiveNavigationBarToggle,
+            rotateWithDevice = rotateWithDevice,
+            onRotateWithDeviceToggle = onRotateWithDeviceToggle,
+            onBack = { page = SettingsPage.CUSTOMIZATION }
+        )
+
+        SettingsPage.GESTURES -> GesturesSettingsPage(
+            hapticsLevel = hapticsLevel,
+            onHapticsLevelChange = onHapticsLevelChange,
+            playlistSwipeEnabled = playlistSwipeEnabled,
+            onPlaylistSwipeEnabledToggle = onPlaylistSwipeEnabledToggle,
+            playlistSwipeStartAction = playlistSwipeStartAction,
+            onPlaylistSwipeStartActionChange = onPlaylistSwipeStartActionChange,
+            playlistSwipeEndAction = playlistSwipeEndAction,
+            onPlaylistSwipeEndActionChange = onPlaylistSwipeEndActionChange,
+            onBack = { page = SettingsPage.CUSTOMIZATION }
+        )
+
+        SettingsPage.LASTFM -> LastFmSettingsPage(onBack = { page = SettingsPage.HUB })
+        SettingsPage.LYRICS -> LyricsSettingsPage(
+            configuration = lyricsConfiguration,
+            onChange = onLyricsConfigurationChange,
+            onBack = { page = SettingsPage.HUB }
+        )
+        SettingsPage.SPONSORBLOCK -> SponsorBlockSettingsPage(
+            enabled = sponsorBlockEnabled,
+            onEnabledToggle = onSponsorBlockEnabledToggle,
+            actions = sponsorBlockActions,
+            onActionChange = onSponsorBlockActionChange,
+            onResetCategories = onResetSponsorBlockActions,
+            showOnSeekBar = sponsorBlockShowOnSeekBar,
+            onShowOnSeekBarToggle = onSponsorBlockShowOnSeekBarToggle,
+            showNotice = sponsorBlockNotice,
+            onShowNoticeToggle = onSponsorBlockNoticeToggle,
+            minDurationMs = sponsorBlockMinDurationMs,
+            onMinDurationChange = onSponsorBlockMinDurationChange,
+            onBack = { page = SettingsPage.HUB }
+        )
+
+        // Back lands on Customization rather than the hub: this page is
+        // opened from there, and the scale is usually adjusted more
+        // than once before it is right.
+        SettingsPage.DISPLAY_SIZE -> DisplaySizeSettingsPage(
+            uiScale = uiScale,
+            onUiScaleChange = onUiScaleChange,
+            onBack = { page = SettingsPage.CUSTOMIZATION }
+        )
+
+        SettingsPage.APP_ICON -> AppIconSettingsPage(
+            onBack = { page = SettingsPage.CUSTOMIZATION }
+        )
+
+        SettingsPage.PLAYER -> PlayerSettingsPage(
+            playerStyle = playerStyle,
+            onPlayerStyleChange = onPlayerStyleChange,
+            playerArtworkColors = playerArtworkColors,
+            onPlayerArtworkColorsToggle = onPlayerArtworkColorsToggle,
+            motionArtwork = motionArtwork,
+            onMotionArtworkToggle = onMotionArtworkToggle,
+            motionArtworkWifiOnly = motionArtworkWifiOnly,
+            onMotionArtworkWifiOnlyToggle = onMotionArtworkWifiOnlyToggle,
+            motionArtworkQuality = motionArtworkQuality,
+            onMotionArtworkQualityChange = onMotionArtworkQualityChange,
+            waveformSeekBar = waveformSeekBar,
+            onWaveformSeekBarToggle = onWaveformSeekBarToggle,
+            ambientBackground = ambientBackground,
+            onAmbientBackgroundToggle = onAmbientBackgroundToggle,
+            onBack = { page = SettingsPage.CUSTOMIZATION }
+        )
+
+        SettingsPage.VIDEO_PLAYER -> VideoPlayerSettingsPage(
+            onBack = { page = SettingsPage.VIDEO_PLAYER.parent }
+        )
+
+        SettingsPage.VIDEO_SHADERS -> VideoShaderSettingsPage(
+            onBack = { page = SettingsPage.VIDEO_SHADERS.parent }
+        )
+
+        SettingsPage.STANDBY -> StandbySettingsPage(
+            onBack = { page = SettingsPage.STANDBY.parent }
+        )
+
+        SettingsPage.INSIGHTS -> com.sentup.android.ui.ai.InsightsScreen(
+            onBack = { page = SettingsPage.INSIGHTS.parent },
+            // A saved mix is only a list of ids, so playing it means resolving
+            // each id against the stored histories first. Both lookups hit
+            // disk, hence the IO hop; the hand-off to the players runs back on
+            // the main thread. Whichever half the mix actually contains is the
+            // half that starts: music opens the audio queue, video the watch
+            // player - a recipe can hold either or both.
+            onPlayMix = { mix ->
+                coroutineScope.launch {
+                    val videos = if (videoPlayerViewModel != null && mix.videoIds.isNotEmpty()) {
+                        kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+                            val history = com.sentup.android.data.VideoHistoryRepository(context).getHistory()
+                            mix.videoIds.mapNotNull { id -> history.firstOrNull { v -> v.videoId == id } }
+                        }
+                    } else emptyList()
+                    val songs = if (playerViewModel != null && mix.songIds.isNotEmpty()) {
+                        kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+                            val plays = com.sentup.android.data.StatsRepository(context).loadHistory()
+                            mix.songIds.mapNotNull { id ->
+                                plays.firstOrNull { it.songId == id }?.let { p ->
+                                    com.sentup.android.data.Song.fromYouTube(
+                                        p.songId, p.title, p.artist, p.album, p.duration, p.thumbnailUrl
+                                    )
+                                }
+                            }
+                        }
+                    } else emptyList()
+                    if (videos.isNotEmpty()) {
+                        videoPlayerViewModel?.playQueue(
+                            com.sentup.android.data.VideoQueue(videos, 0, mix.title)
+                        )
+                    }
+                    if (songs.isNotEmpty()) {
+                        playerViewModel?.playQueue(songs, songs.first())
+                    }
+                }
+            }
+        )
+
+        SettingsPage.VIDEO_FEED -> VideoFeedSettingsPage(
+            onBack = { page = SettingsPage.VIDEO_FEED.parent }
+        )
+
+        SettingsPage.MINI_PLAYER -> MiniPlayerSettingsPage(
+            onBack = { page = SettingsPage.MINI_PLAYER.parent }
+        )
+
+        SettingsPage.PLAYBACK -> PlaybackSettingsPage(
+            crossfadeEnabled = crossfadeEnabled,
+            onCrossfadeEnabledToggle = onCrossfadeEnabledToggle,
+            crossfadeAuto = crossfadeAuto,
+            onCrossfadeAutoChange = onCrossfadeAutoChange,
+            crossfadeDurationMs = crossfadeDurationMs,
+            onCrossfadeDurationChange = onCrossfadeDurationChange,
+            normalizeVolume = normalizeVolume,
+            onNormalizeVolumeToggle = onNormalizeVolumeToggle,
+            discordPresence = discordPresence,
+            onDiscordPresenceToggle = onDiscordPresenceToggle,
+            rememberVideoBrightness = rememberVideoBrightness,
+            onRememberVideoBrightnessToggle = onRememberVideoBrightnessToggle,
+            pipButtons = pipButtons,
+            onPipButtonsChange = onPipButtonsChange,
+            autoLoadQueue = autoLoadQueue,
+            onAutoLoadQueueToggle = onAutoLoadQueueToggle,
+            saveMusicHistory = saveMusicHistory,
+            onSaveMusicHistoryToggle = onSaveMusicHistoryToggle,
+            musicQualityWifi = musicQualityWifi,
+            musicQualityMobile = musicQualityMobile,
+            videoQualityWifi = videoQualityWifi,
+            videoQualityMobile = videoQualityMobile,
+            preferHdr = preferHdr,
+            onPreferHdrToggle = onPreferHdrToggle,
+            frameInterpolation = frameInterpolation,
+            onFrameInterpolationToggle = { enabled ->
+                if (enabled) showFrameInterpolationWarning = true
+                else onFrameInterpolationToggle(false)
+            },
+            frameInterpolationMaxFps = frameInterpolationMaxFps,
+            onFrameInterpolationMaxFpsChange = onFrameInterpolationMaxFpsChange,
+            onOpenQualityPicker = { qualityDialogTarget = it },
+            onBack = { page = SettingsPage.HUB }
+        )
+
+        SettingsPage.CONTENT -> ContentSettingsPage(
+            localOnlyMode = localOnlyMode,
+            onLocalOnlyModeToggle = onLocalOnlyModeToggle,
+            videoMode = videoMode,
+            onVideoModeToggle = onVideoModeToggle,
+            homeModeToggleEnabled = homeModeToggleEnabled,
+            onHomeModeToggleChange = onHomeModeToggleChange,
+            timedCommentsEnabled = timedCommentsEnabled,
+            showRecentSearches = showRecentSearches,
+            onShowRecentSearchesToggle = onShowRecentSearchesToggle,
+            showRelatedVideos = showRelatedVideos,
+            onShowRelatedVideosToggle = onShowRelatedVideosToggle,
+            inlinePreviews = inlinePreviews,
+            onInlinePreviewsToggle = onInlinePreviewsToggle,
+            compactVideoHome = compactVideoHome,
+            onCompactVideoHomeToggle = onCompactVideoHomeToggle,
+            onTimedCommentsToggle = onTimedCommentsToggle,
+            shortsEnabled = shortsEnabled,
+            onShortsEnabledToggle = onShortsEnabledToggle,
+            shortsHardBlock = shortsHardBlock,
+            onShortsHardBlockToggle = onShortsHardBlockToggle,
+            returnDislike = returnDislike,
+            onReturnDislikeToggle = onReturnDislikeToggle,
+            contentRegion = contentRegion,
+            onShowContentRegion = { showContentRegionSheet = true },
+            shortsHiddenActions = shortsHiddenActions,
+            onShowShortsButtons = { showShortsButtonsDialog = true },
+            onNavigateToNotInterested = onNavigateToNotInterested,
+            onNavigateToTaste = onNavigateToTaste,
+            onNavigateToVideoHome = { page = SettingsPage.VIDEO_HOME },
+            onBack = { page = SettingsPage.HUB }
+        )
+
+        SettingsPage.VIDEO_HOME -> VideoHomeSettingsPage(
+            configuration = videoHomeConfiguration,
+            onRecommendationsEnabledChange =
+                onVideoRecommendationsEnabledChange,
+            onDestinationVisibleChange =
+                onVideoHomeDestinationVisibleChange,
+            onMoveDestination = onMoveVideoHomeDestination,
+            onBack = { page = SettingsPage.CONTENT },
+        )
+
+        SettingsPage.SUBSCRIPTIONS -> SubscriptionsSettingsPage(
+            subscriptionSource = subscriptionSource,
+            subscribeTarget = subscribeTarget,
+            fastSubscriptionFeed = fastSubscriptionFeed,
+            onFastSubscriptionFeedToggle = onFastSubscriptionFeedToggle,
+            subscriptionRefresh = subscriptionRefresh,
+            onSubscriptionRefreshChange = onSubscriptionRefreshChange,
+            onNavigateToSubscriptions = onNavigateToSubscriptions,
+            onOpenRoutingPicker = { subscriptionDialogTarget = it },
+            onBack = { page = SettingsPage.HUB }
+        )
+
+        SettingsPage.STORAGE -> StorageSettingsPage(
+            privateDownloadsEnabled = privateDownloadsEnabled,
+            onPrivateDownloadsEnabledToggle = onPrivateDownloadsEnabledToggle,
+            cacheEnabled = cacheEnabled,
+            onCacheEnabledToggle = onCacheEnabledToggle,
+            videoCacheEnabled = videoCacheEnabled,
+            onVideoCacheEnabledToggle = onVideoCacheEnabledToggle,
+            shortsCacheEnabled = shortsCacheEnabled,
+            onShortsCacheEnabledToggle = onShortsCacheEnabledToggle,
+            playbackPreloadEnabled = playbackPreloadEnabled,
+            onPlaybackPreloadEnabledToggle = onPlaybackPreloadEnabledToggle,
+            maxCacheSizeMb = maxCacheSizeMb,
+            onMaxCacheSizeMbChange = onMaxCacheSizeMbChange,
+            currentCacheSize = currentCacheSize,
+            onClearCacheClick = onClearCacheClick,
+            onClearVideoCacheClick = onClearVideoCacheClick,
+            onClearShortsCacheClick = onClearShortsCacheClick,
+            onBack = { page = SettingsPage.HUB }
+        )
+
+        SettingsPage.NOTIFICATIONS -> NotificationsSettingsPage(
+            liveDownloadUpdates = liveDownloadUpdates,
+            onLiveDownloadUpdatesToggle = onLiveDownloadUpdatesToggle,
+            livePlaybackUpdates = livePlaybackUpdates,
+            onLivePlaybackUpdatesToggle = onLivePlaybackUpdatesToggle,
+            canPostPromoted = canPostPromoted,
+            uploadNotificationsEnabled = uploadNotificationsEnabled,
+            onUploadNotificationsToggle = { enabled ->
+                onUploadNotificationsToggle(enabled)
+                // Turning the bell on is the moment the permission
+                // means something; onboarding may have been skipped.
+                // A permanent denial returns at once without a
+                // dialog, which the blocked row below then covers.
+                if (enabled &&
+                    android.os.Build.VERSION.SDK_INT >= android.os.Build.VERSION_CODES.TIRAMISU &&
+                    !canPostNotifications
+                ) {
+                    notificationPermissionLauncher.launch(
+                        android.Manifest.permission.POST_NOTIFICATIONS
+                    )
+                }
+            },
+            canPostNotifications = canPostNotifications,
+            onOpenAppNotificationSettings = {
+                val intent = Intent(android.provider.Settings.ACTION_APP_NOTIFICATION_SETTINGS)
+                    .putExtra(android.provider.Settings.EXTRA_APP_PACKAGE, context.packageName)
+                runCatching { context.startActivity(intent) }
+            },
+            followedChannels = followedChannels,
+            mutedChannelIds = mutedChannelIds,
+            onChannelMutedChange = { channelId, muted ->
+                uploadCheckRepository.setMuted(channelId, muted)
+            },
+            onOpenSystemSettings = {
+                notificationHelper
+                    .promotedNotificationSettingsIntent()
+                    ?.let { runCatching { context.startActivity(it) } }
+            },
+            onBack = { page = SettingsPage.HUB }
+        )
+
+        SettingsPage.LOCAL_LIBRARY -> LocalLibrarySettingsPage(
+            loadLocalSongs = loadLocalSongs,
+            onLoadLocalSongsToggle = onLoadLocalSongsToggle,
+            excludedFolderCount = excludedFolders.size,
+            onOpenFolderExclusion = openFolderExclusion,
+            onBack = { page = SettingsPage.HUB }
+        )
+
+            SettingsPage.ADVANCED -> AdvancedSettingsPage(
+                manualScanEnabled = manualScanEnabled,
+                onManualScanEnabledToggle = onManualScanEnabledToggle,
+                onReportBug = onNavigateToReportBug,
+                onOpenTimeLimit = onNavigateToTimeLimit,
+                onOpenAutoHelp = { showAutoHelpDialog = true },
+                onBack = { page = SettingsPage.HUB }
+            )
+
+            SettingsPage.BACKUP -> {
+                // Leaving composition mid-work must not leave the hub locked.
+                DisposableEffect(Unit) { onDispose { backupBusy = false } }
+                BackupScreen(
+                    onBack = { page = SettingsPage.HUB },
+                    contentPadding = PaddingValues(bottom = SettingsMiniPlayerClearance),
+                    onBusyChange = { backupBusy = it }
+                )
+            }
+        }
+    }
+
+    val hubContent: @Composable (selectedPage: SettingsPage?) -> Unit = { selectedPage ->
+        SettingsHub(
+            searchQuery = searchQuery,
+            onSearchQueryChange = { searchQuery = it },
+            searchEntries = searchEntries,
+            isLoggedIn = isLoggedIn,
+            accountRefreshKey = accountRefreshKey,
+            sessionManager = sessionManager,
+            currentThemeMode = currentThemeMode,
+            colorPalette = colorPalette,
+            spotlightHome = spotlightHome,
+            uiScale = uiScale,
+            lyricsConfiguration = lyricsConfiguration,
+            sponsorBlockEnabled = sponsorBlockEnabled,
+            sponsorBlockActions = sponsorBlockActions,
+            playerStyle = playerStyle,
+            musicQualityWifi = musicQualityWifi,
+            videoQualityWifi = videoQualityWifi,
+            localOnlyMode = localOnlyMode,
+            videoMode = videoMode,
+            subscriptionSource = subscriptionSource,
+            privateDownloadsEnabled = privateDownloadsEnabled,
+            cacheEnabled = cacheEnabled,
+            currentCacheSize = currentCacheSize,
+            liveDownloadUpdates = liveDownloadUpdates,
+            livePlaybackUpdates = livePlaybackUpdates,
+            canPostPromoted = canPostPromoted,
+            loadLocalSongs = loadLocalSongs,
+            excludedFolderCount = excludedFolders.size,
+            onOpenPage = openPage,
+            onNavigateToBackup = { openPage(SettingsPage.BACKUP) },
+            onShowAbout = { showAboutDialog = true },
+            onBackClick = onBackClick,
+            selectedPage = selectedPage
+        )
+    }
+
+    CompositionLocalProvider(LocalSettingsInfoSink provides { settingsInfo = it }) {
+    if (twoPane) {
+        Row(
+            modifier = Modifier
+                .fillMaxSize()
+                .background(MaterialTheme.colorScheme.background)
+                .padding(contentPadding)
+                .windowInsetsPadding(
+                    WindowInsets.safeDrawing.only(WindowInsetsSides.Horizontal)
+                )
+        ) {
+            Box(
+                modifier = Modifier
+                    .width((settingsWindow.width * 0.38f).coerceIn(320.dp, 420.dp))
+                    .fillMaxHeight()
+                    // Its rows also lead out of Settings altogether, which
+                    // would end a backup or restore in progress the same way.
+                    .coveredBy(backupBusy)
+            ) {
+                hubContent(detailPage)
+            }
+            // The page sits on a raised pane of the same palette, so the two
+            // read as list and detail rather than two screens pushed together.
+            // Consuming the status-bar inset here keeps each page's own top
+            // bar from padding for it a second time inside the pane.
+            Box(
+                modifier = Modifier
+                    .weight(1f)
+                    .fillMaxHeight()
+                    .windowInsetsPadding(WindowInsets.statusBars)
+                    .padding(top = 8.dp, end = 12.dp, bottom = 12.dp)
+                    .clip(RoundedCornerShape(28.dp))
+            ) {
+                MaterialTheme(
+                    colorScheme = MaterialTheme.colorScheme.copy(
+                        background = MaterialTheme.colorScheme.surfaceContainerLow
+                    )
+                ) {
+                    CompositionLocalProvider(LocalSettingsDetailShowsBack provides nestedPage) {
+                        AnimatedContent(
+                            targetState = detailPage,
+                            transitionSpec = {
+                                (fadeIn(tween(220)) + slideInVertically(
+                                    spring(
+                                        dampingRatio = Spring.DampingRatioNoBouncy,
+                                        stiffness = Spring.StiffnessMediumLow
+                                    )
+                                ) { it / 24 }) togetherWith fadeOut(tween(120))
+                            },
+                            label = "settingsDetailPane"
+                        ) { shown ->
+                            pageContent(shown)
+                        }
+                    }
+                }
+            }
+        }
+    } else
+    Box(
+        modifier = Modifier
+            .fillMaxSize()
+            .background(MaterialTheme.colorScheme.background)
+            .padding(contentPadding)
+            .onSizeChanged { containerWidth = it.width.toFloat() }
+    ) {
+        val dragFraction = peel.value.coerceIn(0f, 1f)
+        val leavingFraction = (peel.value - 1f).coerceIn(0f, 1f)
+
+        // The hub is composed underneath whatever page is open, rather than
+        // being one branch of the AnimatedContent below. That is what makes a
+        // preview possible at all - a page cannot peel away to reveal
+        // something that is not composed - and it settles a smaller annoyance
+        // on the way past: the hub's scroll position used to be discarded
+        // every time a page was opened, because the hub left composition.
+        Box(
+            modifier = Modifier
+                .fillMaxSize()
+                .then(
+                    if (isPeeling) {
+                        Modifier.graphicsLayer {
+                            // Comes forward as the page leaves, so the two read
+                            // as one stack rather than two slides.
+                            val scale = lerp(0.94f, 1f, dragFraction)
+                            scaleX = scale
+                            scaleY = scale
+                            translationX =
+                                -peelSign * containerWidth * 0.08f * (1f - dragFraction)
+                        }
+                    } else {
+                        Modifier
+                    }
+                )
+                // A composed hub behind a page is one whose rows are still
+                // tappable through it and still read out by TalkBack.
+                .coveredBy(page != SettingsPage.HUB)
+        ) {
+            hubContent(null)
+
+        }
+
+        // The open page, riding on top of the hub.
+        Box(
+            modifier = Modifier
+                .fillMaxSize()
+                .then(
+                    if (isPeeling) {
+                        Modifier.graphicsLayer {
+                            val scale = lerp(1f, 0.90f, dragFraction)
+                            scaleX = scale
+                            scaleY = scale
+                            translationX = peelSign * containerWidth *
+                                (0.10f * dragFraction + 0.95f * leavingFraction)
+                            alpha = 1f - leavingFraction
+                            // Lifts off the hub as a card rather than a slab.
+                            // Driven by a value the system clamps to 0..1, so
+                            // it cannot undershoot into a negative corner.
+                            shape = RoundedCornerShape(lerp(0f, 28f, dragFraction).dp)
+                            clip = true
+                        }
+                    } else {
+                        Modifier
+                    }
+                )
+        ) {
+            AnimatedContent(
+                targetState = page,
+                transitionSpec = {
+                    val slide = spring<IntOffset>(
+                        dampingRatio = Spring.DampingRatioNoBouncy,
+                        stiffness = Spring.StiffnessMediumLow
+                    )
+                    val content = when {
+                        // The finger already performed this exit. Animating it
+                        // again would snap the page back to full size to replay
+                        // the move it just made.
+                        peelCommitted -> EnterTransition.None togetherWith ExitTransition.None
+                        // Going deeper slides in from the trailing edge; coming
+                        // back reverses it, so the hierarchy stays legible.
+                        targetState != SettingsPage.HUB ->
+                            (slideInHorizontally(slide) { it / 5 } + fadeIn(tween(200))) togetherWith
+                                (fadeOut(tween(130)) + slideOutHorizontally(slide) { -it / 12 })
+                        // Returning by button. The page now carries the whole
+                        // movement, where it used to share it with a hub that
+                        // slid in from the leading edge - the hub is underneath
+                        // and staying put, so a token 1/12 nudge would read as
+                        // the page dissolving rather than leaving.
+                        else -> fadeIn(tween(200)) togetherWith
+                            (fadeOut(tween(180)) + slideOutHorizontally(slide) { it / 3 })
+                    }
+                    // No size animation, and no clipping to one. The hub state
+                    // of this layer is empty, so the default SizeTransform
+                    // animates the container between nothing and full screen
+                    // and clips the page to it on the way - which is a page
+                    // unfolding out of a growing rectangle rather than sliding
+                    // in, and a clipped snap on the way out.
+                    content using SizeTransform(clip = false) { _, _ -> snap() }
+                },
+                label = "settingsPage"
+            ) { currentPage ->
+                pageContent(currentPage)
+            }
+        }
+    }
+    }
+
+    // Hold-to-explain host, one for every row on every page.
+    settingsInfo?.let { info ->
+        SettingsInfoDialog(info = info, onDismiss = { settingsInfo = null })
+    }
+
+    // YouTube Auth Dialog
+    if (showAuthDialog) {
+        YouTubeAuthDialog(
+            onDismiss = {
+                showAuthDialog = false
+                authAsNewProfile = false
+            },
+            onAuthSuccess = {
+                showAuthDialog = false
+                authAsNewProfile = false
+                isLoggedIn = true
+                accountRefreshKey++
+            },
+            addAsNewProfile = authAsNewProfile
+        )
+    }
+
+    // Manual cookie paste (escape hatch when the WebView login fails, or to
+    // refresh a session that has gone stale without signing in again)
+    if (showCookiePasteSheet) {
+        CookiePasteSheet(
+            onDismiss = { showCookiePasteSheet = false },
+            onSave = { cookies ->
+                sessionManager.startSession(cookies)
+                isLoggedIn = true
+                showCookiePasteSheet = false
+                coroutineScope.launch {
+                    // Populates name/avatar for the account row, and doubles as
+                    // a live check that the pasted session is actually accepted.
+                    com.sentup.android.data.YouTubeRepository(context).fetchAccountInfo()
+                    accountRefreshKey++
+                }
+            }
+        )
+    }
+
+    // About Dialog with expressive styling
+    if (showAboutDialog) {
+        ExpressiveAboutDialog(
+            onDismiss = { showAboutDialog = false },
+            onNavigateToUpdate = onNavigateToUpdate,
+            onNavigateToLicenses = onNavigateToLicenses
+        )
+    }
+
+    // Per-network stream quality pickers (video + music, Wi-Fi + mobile data)
+    qualityDialogTarget?.let { target ->
+        val currentQuality = when (target) {
+            QualityDialogTarget.VIDEO_WIFI -> videoQualityWifi
+            QualityDialogTarget.VIDEO_MOBILE -> videoQualityMobile
+            QualityDialogTarget.MUSIC_WIFI -> musicQualityWifi
+            QualityDialogTarget.MUSIC_MOBILE -> musicQualityMobile
+        }
+        val onQualitySelected: (String) -> Unit = when (target) {
+            QualityDialogTarget.VIDEO_WIFI -> onVideoQualityWifiChange
+            QualityDialogTarget.VIDEO_MOBILE -> onVideoQualityMobileChange
+            QualityDialogTarget.MUSIC_WIFI -> onMusicQualityWifiChange
+            QualityDialogTarget.MUSIC_MOBILE -> onMusicQualityMobileChange
+        }
+        StreamQualityDialog(
+            target = target,
+            currentQuality = currentQuality,
+            onQualitySelected = {
+                onQualitySelected(it)
+                qualityDialogTarget = null
+            },
+            onDismiss = { qualityDialogTarget = null }
+        )
+    }
+
+    // Where subscriptions are read from / written to
+    subscriptionDialogTarget?.let { target ->
+        val current = when (target) {
+            SubscriptionDialogTarget.SOURCE -> subscriptionSource
+            SubscriptionDialogTarget.TARGET -> subscribeTarget
+        }
+        val onSelected: (String) -> Unit = when (target) {
+            SubscriptionDialogTarget.SOURCE -> onSubscriptionSourceChange
+            SubscriptionDialogTarget.TARGET -> onSubscribeTargetChange
+        }
+        SubscriptionRoutingDialog(
+            target = target,
+            currentValue = current,
+            onValueSelected = {
+                onSelected(it)
+                subscriptionDialogTarget = null
+            },
+            onDismiss = { subscriptionDialogTarget = null }
+        )
+    }
+
+    // Folder Exclusion Dialog
+    if (showFolderExclusionDialog) {
+        FolderExclusionDialog(
+            availableFolders = availableFolders,
+            excludedFolders = excludedFolders,
+            isLoading = isFoldersLoading,
+            onAddExcludedFolder = onAddExcludedFolder,
+            onRemoveExcludedFolder = onRemoveExcludedFolder,
+            onDismiss = { showFolderExclusionDialog = false }
+        )
+    }
+
+    if (showContentRegionSheet) {
+        ContentRegionSheet(
+            selected = contentRegion,
+            onSelect = onContentRegionChange,
+            onDismiss = { showContentRegionSheet = false }
+        )
+    }
+
+    if (showShortsButtonsDialog) {
+        ShortsButtonsDialog(
+            hiddenActions = shortsHiddenActions,
+            onHiddenActionsChange = onShortsHiddenActionsChange,
+            onDismiss = { showShortsButtonsDialog = false }
+        )
+    }
+
+    // Android Auto help dialog
+    if (showAutoHelpDialog) {
+        AndroidAutoHelpDialog(
+            onDismiss = { showAutoHelpDialog = false }
+        )
+    }
+
+    if (showFrameInterpolationWarning) {
+        FrameInterpolationWarningDialog(
+            onConfirm = {
+                showFrameInterpolationWarning = false
+                onFrameInterpolationToggle(true)
+            },
+            onDismiss = { showFrameInterpolationWarning = false }
+        )
+    }
+}
+
+/**
+ * The category list. Every row carries the live value of what is inside it, so
+ * the common "what is this set to?" question is answered without opening
+ * anything.
+ */
+@OptIn(ExperimentalMaterial3Api::class, ExperimentalMaterial3ExpressiveApi::class)
+@Composable
+private fun SettingsHub(
+    searchQuery: String,
+    onSearchQueryChange: (String) -> Unit,
+    searchEntries: List<SettingsSearchEntry>,
+    isLoggedIn: Boolean,
+    accountRefreshKey: Int,
+    sessionManager: SessionManager,
+    currentThemeMode: ThemeMode,
+    colorPalette: String,
+    spotlightHome: Boolean,
+    uiScale: Float,
+    lyricsConfiguration: com.sentup.android.data.LyricsConfiguration,
+    sponsorBlockEnabled: Boolean,
+    sponsorBlockActions: Map<SponsorCategory, SegmentAction>,
+    playerStyle: PlayerStyle,
+    musicQualityWifi: String,
+    videoQualityWifi: String,
+    localOnlyMode: Boolean,
+    videoMode: Boolean,
+    subscriptionSource: String,
+    privateDownloadsEnabled: Boolean,
+    cacheEnabled: Boolean,
+    currentCacheSize: Long,
+    liveDownloadUpdates: Boolean,
+    livePlaybackUpdates: Boolean,
+    canPostPromoted: Boolean,
+    loadLocalSongs: Boolean,
+    excludedFolderCount: Int,
+    onOpenPage: (SettingsPage) -> Unit,
+    onNavigateToBackup: () -> Unit,
+    onShowAbout: () -> Unit,
+    onBackClick: () -> Unit,
+    /** The category shown beside the hub in two-pane mode; null on a phone. */
+    selectedPage: SettingsPage? = null
+) {
+    // Animation states for staggered entry
+    var isVisible by remember { mutableStateOf(false) }
+    LaunchedEffect(Unit) {
+        delay(100)
+        isVisible = true
+    }
+
+    // Opening a result should put the keyboard away before the page slides in.
+    val focusManager = LocalFocusManager.current
+
+    val accountValue = key(accountRefreshKey) {
+        when {
+            !isLoggedIn -> "Not signed in"
+            else -> sessionManager.getUserName() ?: "Signed in"
+        }
+    }
+
+    val themeLabel = when (currentThemeMode) {
+        ThemeMode.SYSTEM -> stringResource(R.string.theme_system)
+        ThemeMode.LIGHT -> stringResource(R.string.theme_light)
+        ThemeMode.DARK -> stringResource(R.string.theme_dark)
+    }
+    val paletteName = if (colorPalette == ThemePreferences.DEFAULT_COLOR_PALETTE) {
+        stringResource(R.string.theme_palette_dynamic)
+    } else {
+        com.sentup.android.ui.theme.findPalette(colorPalette)?.name
+            ?: stringResource(R.string.theme_palette_dynamic)
+    }
+    val playerStyleLabel = com.sentup.android.ui.player.playerStyleInfo(playerStyle).label
+
+    val contentValue = when {
+        localOnlyMode -> "Local only, offline"
+        videoMode -> "Video mode"
+        else -> "Music mode"
+    }
+
+    val storageValue = buildString {
+        append(if (privateDownloadsEnabled) "Private downloads" else "Downloads/Sentüp")
+        append(" · ")
+        append(
+            if (cacheEnabled) {
+                "${com.sentup.android.data.CacheManager.formatSize(currentCacheSize)} cached"
+            } else {
+                "Caching off"
+            }
+        )
+    }
+
+    val notificationsValue = when {
+        !canPostPromoted && (liveDownloadUpdates || livePlaybackUpdates) -> "Blocked by system"
+        liveDownloadUpdates && livePlaybackUpdates -> "Downloads and playback"
+        liveDownloadUpdates -> "Downloads only"
+        livePlaybackUpdates -> "Playback only"
+        else -> "Off"
+    }
+
+    // Read on entry rather than held in a flow: Navigation Compose disposes
+    // this destination while the backup screen is on top, so returning from
+    // one re-runs this and the row is current without any plumbing.
+    val backupContext = LocalContext.current
+    val backupValue = remember { lastBackupLine(BackupRepository.lastBackupAt(backupContext)) }
+
+    val localLibraryValue = when {
+        !loadLocalSongs -> "Off"
+        excludedFolderCount > 0 -> "On, $excludedFolderCount folder${if (excludedFolderCount == 1) "" else "s"} excluded"
+        else -> "On"
+    }
+
+    Column(modifier = Modifier.fillMaxSize()) {
+        TopAppBar(
+            title = {
+                AnimatedVisibility(
+                    visible = isVisible,
+                    enter = fadeIn(tween(400)) + slideInVertically(
+                        initialOffsetY = { -it / 2 },
+                        animationSpec = spring(dampingRatio = Spring.DampingRatioMediumBouncy)
+                    )
+                ) {
+                    Text(
+                        text = stringResource(R.string.settings_title),
+                        color = MaterialTheme.colorScheme.onBackground,
+                        fontWeight = FontWeight.Bold,
+                        style = MaterialTheme.typography.headlineMedium
+                    )
+                }
+            },
+            navigationIcon = {
+                IconButton(
+                    onClick = onBackClick,
+                    shapes = IconButtonDefaults.shapes(),
+                    colors = IconButtonDefaults.iconButtonColors(
+                        containerColor = MaterialTheme.colorScheme.surfaceContainerHigh,
+                        contentColor = MaterialTheme.colorScheme.onBackground
+                    ),
+                    modifier = Modifier
+                        .padding(start = 8.dp)
+                        .size(44.dp)
+                ) {
+                    Icon(
+                        imageVector = Icons.AutoMirrored.Rounded.ArrowBack,
+                        contentDescription = stringResource(R.string.cd_back)
+                    )
+                }
+            },
+            colors = TopAppBarDefaults.topAppBarColors(containerColor = Color.Transparent),
+            modifier = Modifier.windowInsetsPadding(WindowInsets.statusBars)
+        )
+
+        LazyColumn(
+            modifier = Modifier.fillMaxSize(),
+            contentPadding = PaddingValues(
+                start = 16.dp,
+                end = 16.dp,
+                top = 8.dp,
+                bottom = SettingsMiniPlayerClearance
+            ),
+            verticalArrangement = Arrangement.spacedBy(20.dp)
+        ) {
+            item {
+                SettingsSearchField(
+                    query = searchQuery,
+                    onQueryChange = onSearchQueryChange
+                )
+            }
+
+            // Teaches the hold-to-explain gesture once, where every row that
+            // supports it lives. Quiet on purpose: a tip, not a banner.
+            if (searchQuery.isBlank()) {
+                item {
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(horizontal = 8.dp),
+                        verticalAlignment = Alignment.CenterVertically
+                    ) {
+                        Icon(
+                            imageVector = Icons.Rounded.TouchApp,
+                            contentDescription = null,
+                            tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                            modifier = Modifier.size(16.dp)
+                        )
+                        Spacer(modifier = Modifier.width(8.dp))
+                        Text(
+                            text = stringResource(R.string.settings_hold_hint),
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                            style = MaterialTheme.typography.bodySmall
+                        )
+                    }
+                }
+            }
+
+            val results = searchSettings(searchQuery, searchEntries)
+
+            if (searchQuery.isNotBlank()) {
+                if (results.isEmpty()) {
+                    item { SettingsSearchEmptyState(query = searchQuery) }
+                } else {
+                    item {
+                        SettingsCard {
+                            results.forEachIndexed { index, entry ->
+                                if (index > 0) SettingsDivider()
+                                SettingsSearchResultRow(
+                                    entry = entry,
+                                    onClick = {
+                                        focusManager.clearFocus()
+                                        entry.action()
+                                    }
+                                )
+                            }
+                        }
+                    }
+                }
+            } else {
+
+            item {
+                SettingsSection(title = stringResource(R.string.settings_section_you)) {
+                    SettingsCard {
+                        SettingsHubRow(
+                            icon = Icons.Rounded.AccountCircle,
+                            title = stringResource(R.string.settings_account),
+                            value = accountValue,
+                            onClick = { onOpenPage(SettingsPage.ACCOUNT) },
+                            selected = selectedPage == SettingsPage.ACCOUNT,
+                            iconShape = MaterialShapes.Sunny.toShape(),
+                            explanation = stringResource(R.string.si_hub_account)
+                        )
+                    }
+                }
+            }
+
+            item {
+                SettingsSection(title = stringResource(R.string.settings_section_look_and_feel)) {
+                    SettingsCard {
+                        // One way in to everything about how Sentüp looks
+                        // and behaves. The page behind it is categorised
+                        // by surface; this row names the two choices most
+                        // people make there.
+                        SettingsHubRow(
+                            icon = Icons.Rounded.Palette,
+                            title = stringResource(R.string.settings_customization),
+                            value = buildString {
+                                append(themeLabel)
+                                append(", ")
+                                append(paletteName)
+                                append(" \u00B7 ")
+                                append(playerStyleLabel)
+                                // Only when it is doing something: a "100%"
+                                // on every install is noise, not a live value.
+                                if (uiScale != UI_SCALE_DEFAULT) {
+                                    append(", ${(uiScale * 100).roundToInt()}%")
+                                }
+                            },
+                            onClick = { onOpenPage(SettingsPage.CUSTOMIZATION) },
+                            selected = selectedPage?.root == SettingsPage.CUSTOMIZATION,
+                            tint = MaterialTheme.colorScheme.tertiary,
+                            iconShape = MaterialShapes.Cookie9Sided.toShape(),
+                            explanation = stringResource(R.string.si_hub_customization)
+                        )
+                    }
+                }
+            }
+
+            item {
+                SettingsSection(title = stringResource(R.string.settings_section_playback_and_content)) {
+                    SettingsCard {
+                        // The intelligence page: the generated mixes and the taste
+                        // profile. Under content rather than look-and-feel because
+                        // none of it is a setting - it is what the app worked out.
+                        SettingsHubRow(
+                            icon = Icons.Rounded.AutoAwesome,
+                            title = stringResource(R.string.ai_title),
+                            value = stringResource(R.string.ai_hub_sub),
+                            onClick = { onOpenPage(SettingsPage.INSIGHTS) },
+                            selected = selectedPage == SettingsPage.INSIGHTS
+                        )
+
+                        SettingsHubRow(
+                            icon = Icons.Rounded.GraphicEq,
+                            title = stringResource(R.string.settings_playback_and_quality),
+                            value = "${musicQualityLabel(musicQualityWifi)} music, " +
+                                "${videoQualityLabel(videoQualityWifi)} video on Wi-Fi",
+                            onClick = { onOpenPage(SettingsPage.PLAYBACK) },
+                            selected = selectedPage == SettingsPage.PLAYBACK,
+                            tint = MaterialTheme.colorScheme.secondary,
+                            iconShape = MaterialShapes.SoftBurst.toShape(),
+                            explanation = stringResource(R.string.si_hub_playback)
+                        )
+                        SettingsDivider()
+                        SettingsHubRow(
+                            icon = Icons.Rounded.VideoLibrary,
+                            title = stringResource(R.string.settings_content_and_feeds),
+                            value = contentValue,
+                            onClick = { onOpenPage(SettingsPage.CONTENT) },
+                            selected = selectedPage == SettingsPage.CONTENT,
+                            tint = MaterialTheme.colorScheme.secondary,
+                            iconShape = MaterialShapes.Gem.toShape(),
+                            explanation = stringResource(R.string.si_hub_content)
+                        )
+                        SettingsDivider()
+                        SettingsHubRow(
+                            icon = Icons.Rounded.Subscriptions,
+                            title = stringResource(R.string.settings_subscriptions),
+                            value = subscriptionSourceLabel(subscriptionSource),
+                            onClick = { onOpenPage(SettingsPage.SUBSCRIPTIONS) },
+                            selected = selectedPage == SettingsPage.SUBSCRIPTIONS,
+                            tint = MaterialTheme.colorScheme.secondary,
+                            iconShape = MaterialShapes.Cookie6Sided.toShape(),
+                            explanation = stringResource(R.string.si_hub_subscriptions)
+                        )
+                        SettingsDivider()
+                        SettingsHubRow(
+                            icon = Icons.Rounded.MusicNote,
+                            title = stringResource(R.string.lyrics_settings_title),
+                            value = if (lyricsConfiguration.remoteEnabled && lyricsConfiguration.enabledProviders.isNotEmpty())
+                                stringResource(R.string.lyrics_provider_summary, lyricsConfiguration.enabledProviders.size, lyricsConfiguration.enabledProviders.first())
+                            else stringResource(R.string.lyrics_local_only),
+                            onClick = { onOpenPage(SettingsPage.LYRICS) },
+                            selected = selectedPage == SettingsPage.LYRICS,
+                            tint = MaterialTheme.colorScheme.tertiary,
+                            iconShape = MaterialShapes.Cookie6Sided.toShape(),
+                            explanation = stringResource(R.string.lyrics_settings_intro)
+                        )
+                        SettingsDivider()
+                        LastFmHubRow(
+                            onClick = { onOpenPage(SettingsPage.LASTFM) },
+                            selected = selectedPage == SettingsPage.LASTFM
+                        )
+                        SettingsDivider()
+                        SettingsHubRow(
+                            icon = Icons.Rounded.MoneyOff,
+                            title = stringResource(R.string.sb_title),
+                            // The live value is how many categories will
+                            // actually act, which is the thing that varies
+                            // once it is on - "On" alone says nothing.
+                            value = if (!sponsorBlockEnabled) {
+                                stringResource(R.string.haptic_level_off)
+                            } else {
+                                val active = sponsorBlockActions.count {
+                                    it.value != SegmentAction.IGNORE
+                                }
+                                pluralStringResource(
+                                    R.plurals.sb_active_categories, active, active
+                                )
+                            },
+                            onClick = { onOpenPage(SettingsPage.SPONSORBLOCK) },
+                            selected = selectedPage == SettingsPage.SPONSORBLOCK,
+                            tint = MaterialTheme.colorScheme.secondary,
+                            iconShape = MaterialShapes.Boom.toShape(),
+                            explanation = stringResource(R.string.si_hub_sponsorblock)
+                        )
+                    }
+                }
+            }
+
+            item {
+                SettingsSection(title = stringResource(R.string.settings_section_system)) {
+                    SettingsCard {
+                        SettingsHubRow(
+                            icon = Icons.Rounded.Folder,
+                            title = stringResource(R.string.settings_storage_and_cache),
+                            value = storageValue,
+                            onClick = { onOpenPage(SettingsPage.STORAGE) },
+                            selected = selectedPage == SettingsPage.STORAGE,
+                            iconShape = MaterialShapes.Arch.toShape(),
+                            explanation = stringResource(R.string.si_hub_storage)
+                        )
+                        if (ThemePreferences.SUPPORTS_LIVE_UPDATES) {
+                            SettingsDivider()
+                            SettingsHubRow(
+                                icon = Icons.Rounded.Bolt,
+                                title = stringResource(R.string.settings_notifications),
+                                value = notificationsValue,
+                                onClick = { onOpenPage(SettingsPage.NOTIFICATIONS) },
+                                selected = selectedPage == SettingsPage.NOTIFICATIONS,
+                                tint = if (!canPostPromoted && (liveDownloadUpdates || livePlaybackUpdates)) {
+                                    SettingsRowDefaults.destructiveTint
+                                } else {
+                                    MaterialTheme.colorScheme.primary
+                                },
+                                iconShape = MaterialShapes.Bun.toShape(),
+                                explanation = stringResource(R.string.si_hub_notifications)
+                            )
+                        }
+                        SettingsDivider()
+                        SettingsHubRow(
+                            icon = Icons.Rounded.MusicNote,
+                            title = stringResource(R.string.settings_local_library),
+                            value = localLibraryValue,
+                            onClick = { onOpenPage(SettingsPage.LOCAL_LIBRARY) },
+                            selected = selectedPage == SettingsPage.LOCAL_LIBRARY,
+                            iconShape = MaterialShapes.Pentagon.toShape(),
+                            explanation = stringResource(R.string.si_hub_local_library)
+                        )
+                        SettingsDivider()
+                        SettingsHubRow(
+                            icon = Icons.Rounded.SettingsBackupRestore,
+                            title = stringResource(R.string.settings_backup_and_restore),
+                            value = backupValue,
+                            onClick = onNavigateToBackup,
+                            selected = selectedPage == SettingsPage.BACKUP,
+                            iconShape = MaterialShapes.Clover8Leaf.toShape(),
+                            explanation = stringResource(R.string.si_hub_backup)
+                        )
+                        SettingsDivider()
+                        SettingsHubRow(
+                            icon = Icons.Rounded.Security,
+                            title = stringResource(R.string.settings_advanced),
+                            value = if (isXiaomiDevice()) {
+                                stringResource(R.string.settings_advanced_value_xiaomi)
+                            } else {
+                                stringResource(R.string.settings_advanced_value_other)
+                            },
+                            onClick = { onOpenPage(SettingsPage.ADVANCED) },
+                            selected = selectedPage == SettingsPage.ADVANCED,
+                            tint = if (isXiaomiDevice()) {
+                                MaterialTheme.colorScheme.tertiary
+                            } else {
+                                MaterialTheme.colorScheme.primary
+                            },
+                            iconShape = MaterialShapes.Cookie12Sided.toShape(),
+                            explanation = stringResource(R.string.si_hub_advanced)
+                        )
+                    }
+                }
+            }
+
+            item {
+                SettingsSection(title = stringResource(R.string.settings_section_about)) {
+                    SettingsCard {
+                        SettingsRow(
+                            icon = Icons.Rounded.Info,
+                            title = stringResource(R.string.app_name),
+                            subtitle = stringResource(R.string.settings_version_subtitle, BuildConfig.VERSION_NAME, BuildConfig.VERSION_CODE),
+                            onClick = onShowAbout,
+                            showChevron = true
+                        )
+                    }
+                }
+            }
+
+            }
+
+            item { Spacer(modifier = Modifier.height(32.dp)) }
+        }
+    }
+}
+
+@OptIn(ExperimentalMaterial3ExpressiveApi::class)
+@Composable
+internal fun ExpressiveThemeSelectGroup(
+    currentMode: ThemeMode,
+    onModeSelected: (ThemeMode) -> Unit,
+    textColor: Color,
+    accentColor: Color
+) {
+    Column(
+        modifier = Modifier.padding(horizontal = 16.dp, vertical = 12.dp)
+    ) {
+        Text(
+            text = stringResource(R.string.sp_theme),
+            color = textColor,
+            fontSize = 16.sp,
+            fontWeight = FontWeight.SemiBold,
+            modifier = Modifier.padding(bottom = 12.dp)
+        )
+        
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.spacedBy(ButtonGroupDefaults.ConnectedSpaceBetween)
+        ) {
+            val options = ThemeMode.values()
+            
+            options.forEachIndexed { index, mode ->
+                // Determine shape based on position
+                val shapes = when (index) {
+                    0 -> ButtonGroupDefaults.connectedLeadingButtonShapes()
+                    options.lastIndex -> ButtonGroupDefaults.connectedTrailingButtonShapes()
+                    else -> ButtonGroupDefaults.connectedMiddleButtonShapes()
+                }
+                
+                ToggleButton(
+                    checked = currentMode == mode,
+                    onCheckedChange = { onModeSelected(mode) },
+                    modifier = Modifier.weight(1f),
+                    shapes = shapes,
+                    colors = ToggleButtonDefaults.colors(
+                        containerColor = accentColor.copy(alpha = 0.1f),
+                        checkedContainerColor = accentColor,
+                        contentColor = textColor,
+                        checkedContentColor = MaterialTheme.colorScheme.onPrimary
+                    )
+                ) {
+                    // Content
+                    Text(
+                        text = when(mode) {
+                            ThemeMode.SYSTEM -> "System"
+                            ThemeMode.LIGHT -> "Light"
+                            ThemeMode.DARK -> "Dark"
+                        },
+                        fontSize = 14.sp,
+                        fontWeight = if (currentMode == mode) FontWeight.Bold else FontWeight.Medium
+                    )
+                }
+            }
+        }
+    }
+}
+
+@Composable
+internal fun ExpressiveAccountItem(
+    sessionManager: SessionManager,
+    textColor: Color,
+    secondaryTextColor: Color
+) {
+    val userAvatar = sessionManager.getUserAvatar()
+    val userName = sessionManager.getUserName()
+    val connectedColor = MaterialTheme.colorScheme.primary
+
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(18.dp))
+            .padding(horizontal = 16.dp, vertical = 14.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        // Profile Picture
+        Box(
+            modifier = Modifier
+                .size(52.dp)
+                .clip(CircleShape)
+                .background(connectedColor.copy(alpha = 0.12f)),
+            contentAlignment = Alignment.Center
+        ) {
+            if (!userAvatar.isNullOrEmpty()) {
+                AsyncImage(
+                    model = userAvatar,
+                    contentDescription = stringResource(R.string.cd_profile_picture),
+                    modifier = Modifier
+                        .fillMaxSize()
+                        .clip(CircleShape),
+                    contentScale = ContentScale.Crop
+                )
+            } else {
+                Icon(
+                    imageVector = Icons.Rounded.AccountCircle,
+                    contentDescription = null,
+                    tint = connectedColor,
+                    modifier = Modifier.size(32.dp)
+                )
+            }
+        }
+
+        Spacer(modifier = Modifier.width(16.dp))
+
+        // User Info
+        Column(modifier = Modifier.weight(1f)) {
+            Text(
+                text = userName ?: "YouTube Account",
+                color = textColor,
+                fontSize = 16.sp,
+                fontWeight = FontWeight.SemiBold,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis
+            )
+            Spacer(modifier = Modifier.height(2.dp))
+            Row(
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(4.dp)
+            ) {
+                Icon(
+                    imageVector = Icons.Rounded.CheckCircle,
+                    contentDescription = null,
+                    tint = connectedColor,
+                    modifier = Modifier.size(14.dp)
+                )
+                Text(
+                    text = stringResource(R.string.sp_connected),
+                    color = connectedColor,
+                    fontSize = 13.sp,
+                    fontWeight = FontWeight.Medium
+                )
+            }
+        }
+    }
+}
+
+@OptIn(ExperimentalMaterial3ExpressiveApi::class, ExperimentalMaterial3Api::class)
+@Composable
+internal fun ExpressiveVideoModeToggleItem(
+    enabled: Boolean,
+    onToggle: (Boolean) -> Unit,
+    textColor: Color,
+    secondaryTextColor: Color,
+    accentColor: Color
+) {
+    val options = listOf(stringResource(R.string.sp_mode_music), stringResource(R.string.sp_mode_video))
+    val selectedIndex = if (enabled) 1 else 0
+    
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(horizontal = 16.dp, vertical = 14.dp)
+    ) {
+        // Header Row
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            // Icon
+            Box(
+                modifier = Modifier
+                    .size(48.dp)
+                    .clip(RoundedCornerShape(14.dp))
+                    .background(accentColor.copy(alpha = 0.12f)),
+                contentAlignment = Alignment.Center
+            ) {
+                Icon(
+                    imageVector = if (enabled) Icons.Rounded.VideoLibrary else Icons.Rounded.MusicNote,
+                    contentDescription = null,
+                    tint = accentColor,
+                    modifier = Modifier.size(26.dp)
+                )
+            }
+
+            Spacer(modifier = Modifier.width(16.dp))
+
+            // Text
+            Column(modifier = Modifier.weight(1f)) {
+                Text(
+                    text = stringResource(R.string.sp_content_mode),
+                    color = textColor,
+                    fontSize = 16.sp,
+                    fontWeight = FontWeight.SemiBold
+                )
+                Spacer(modifier = Modifier.height(2.dp))
+                Text(
+                    text = if (enabled) {
+                        stringResource(R.string.sp_content_mode_video)
+                    } else {
+                        stringResource(R.string.sp_content_mode_music)
+                    },
+                    color = secondaryTextColor,
+                    fontSize = 13.sp
+                )
+            }
+        }
+        
+        Spacer(modifier = Modifier.height(16.dp))
+        
+        Row(
+            modifier = Modifier.fillMaxWidth(),
+            horizontalArrangement = Arrangement.spacedBy(
+                ButtonGroupDefaults.ConnectedSpaceBetween
+            ),
+        ) {
+            options.forEachIndexed { index, label ->
+                ToggleButton(
+                    checked = selectedIndex == index,
+                    onCheckedChange = { onToggle(index == 1) },
+                    modifier = Modifier.weight(1f),
+                    shapes = when (index) {
+                        0 -> ButtonGroupDefaults.connectedLeadingButtonShapes()
+                        options.lastIndex ->
+                            ButtonGroupDefaults.connectedTrailingButtonShapes()
+                        else -> ButtonGroupDefaults.connectedMiddleButtonShapes()
+                    },
+                    colors = ToggleButtonDefaults.colors(
+                        containerColor = accentColor.copy(alpha = 0.1f),
+                        checkedContainerColor = accentColor,
+                        contentColor = textColor,
+                        checkedContentColor = MaterialTheme.colorScheme.onPrimary,
+                    ),
+                ) {
+                    Icon(
+                        imageVector = if (index == 0) Icons.Rounded.MusicNote
+                        else Icons.Rounded.VideoLibrary,
+                        contentDescription = null,
+                        modifier = Modifier.size(18.dp),
+                    )
+                    Text(label)
+                }
+            }
+        }
+    }
+}
+
+/** Human-readable label for a stored default video quality value. */
+internal fun videoQualityLabel(value: String): String =
+    if (value == ThemePreferences.VIDEO_QUALITY_AUTO) "Auto (Highest)" else value
+
+/** Human-readable label for a stored music quality value. */
+internal fun musicQualityLabel(value: String): String = when (value) {
+    ThemePreferences.MUSIC_QUALITY_LOW -> "Data Saver"
+    ThemePreferences.MUSIC_QUALITY_NORMAL -> "Normal"
+    else -> "High"
+}
+
+/** Longer picker-row label carrying the approximate bitrate. */
+private fun musicQualityOptionLabel(value: String): String = when (value) {
+    ThemePreferences.MUSIC_QUALITY_LOW -> "Data Saver (~48 kbps)"
+    ThemePreferences.MUSIC_QUALITY_NORMAL -> "Normal (~128 kbps)"
+    else -> "High (best available)"
+}
+
+/** Short label for the stored "which subscriptions to show" value. */
+internal fun subscriptionSourceLabel(value: String): String = when (value) {
+    ThemePreferences.SUBSCRIPTIONS_LOCAL -> "On this device"
+    ThemePreferences.SUBSCRIPTIONS_YOUTUBE -> "YouTube account"
+    else -> "Everything you follow"
+}
+
+/** Short label for the stored "where Subscribe writes" value. */
+internal fun subscribeTargetLabel(value: String): String = when (value) {
+    ThemePreferences.SUBSCRIPTIONS_LOCAL -> "This device only"
+    ThemePreferences.SUBSCRIPTIONS_YOUTUBE -> "YouTube account"
+    ThemePreferences.SUBSCRIPTIONS_BOTH -> "Device and YouTube"
+    else -> "YouTube when signed in"
+}
+
+/** Longer picker-row description for a subscription source option. */
+private fun subscriptionSourceOptionLabel(value: String): Pair<String, String> = when (value) {
+    ThemePreferences.SUBSCRIPTIONS_LOCAL ->
+        "On this device" to "Only channels you follow inside Sentüp"
+    ThemePreferences.SUBSCRIPTIONS_YOUTUBE ->
+        "YouTube account" to "Only channels your Google account is subscribed to"
+    else ->
+        "Everything you follow" to "Both lists merged, whichever of them exist"
+}
+
+/** Longer picker-row description for a subscribe target option. */
+private fun subscribeTargetOptionLabel(value: String): Pair<String, String> = when (value) {
+    ThemePreferences.SUBSCRIPTIONS_LOCAL ->
+        "This device only" to "Never touches your Google account"
+    ThemePreferences.SUBSCRIPTIONS_YOUTUBE ->
+        "YouTube account" to "Needs you to be signed in"
+    ThemePreferences.SUBSCRIPTIONS_BOTH ->
+        "Device and YouTube" to "Keeps a local copy that survives signing out"
+    else ->
+        "YouTube when signed in" to "Falls back to this device when signed out"
+}
+
+/** One subscription-routing picker the Settings screen can open. */
+internal enum class SubscriptionDialogTarget(
+    @StringRes val titleRes: Int,
+    @StringRes val descriptionRes: Int
+) {
+    SOURCE(
+        titleRes = R.string.sp_subscriptions_shown,
+        descriptionRes = R.string.sp_subs_source_desc
+    ),
+    TARGET(
+        titleRes = R.string.sp_subscribe_saves_to,
+        descriptionRes = R.string.sp_subs_target_desc
+    )
+}
+
+@OptIn(ExperimentalMaterial3ExpressiveApi::class)
+@Composable
+private fun SubscriptionRoutingDialog(
+    target: SubscriptionDialogTarget,
+    currentValue: String,
+    onValueSelected: (String) -> Unit,
+    onDismiss: () -> Unit
+) {
+    val primaryColor = MaterialTheme.colorScheme.primary
+    val backgroundColor = MaterialTheme.colorScheme.surfaceContainerHigh
+    val textColor = MaterialTheme.colorScheme.onSurface
+    val secondaryTextColor = MaterialTheme.colorScheme.onSurfaceVariant
+
+    var dialogVisible by remember { mutableStateOf(false) }
+    LaunchedEffect(Unit) { dialogVisible = true }
+
+    AnimatedVisibility(
+        visible = dialogVisible,
+        enter = scaleIn(
+            initialScale = 0.8f,
+            animationSpec = spring(dampingRatio = Spring.DampingRatioMediumBouncy)
+        ) + fadeIn(tween(200)),
+        exit = scaleOut(targetScale = 0.8f) + fadeOut(tween(150))
+    ) {
+        AlertDialog(
+            onDismissRequest = onDismiss,
+            containerColor = backgroundColor,
+            shape = RoundedCornerShape(32.dp),
+            icon = {
+                Box(
+                    modifier = Modifier
+                        .size(64.dp)
+                        .clip(RoundedCornerShape(20.dp))
+                        .background(primaryColor.copy(alpha = 0.15f)),
+                    contentAlignment = Alignment.Center
+                ) {
+                    Icon(
+                        imageVector = Icons.Rounded.Subscriptions,
+                        contentDescription = null,
+                        tint = primaryColor,
+                        modifier = Modifier.size(32.dp)
+                    )
+                }
+            },
+            title = {
+                Text(
+                    text = stringResource(target.titleRes),
+                    color = textColor,
+                    fontSize = 20.sp,
+                    fontWeight = FontWeight.Bold,
+                    textAlign = TextAlign.Center,
+                    modifier = Modifier.fillMaxWidth()
+                )
+            },
+            text = {
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .verticalScroll(rememberScrollState())
+                ) {
+                    Text(
+                        text = stringResource(target.descriptionRes),
+                        color = secondaryTextColor,
+                        fontSize = 13.sp,
+                        lineHeight = 18.sp,
+                        modifier = Modifier.padding(bottom = 12.dp)
+                    )
+                    val options = when (target) {
+                        SubscriptionDialogTarget.SOURCE -> ThemePreferences.SUBSCRIPTION_SOURCE_OPTIONS
+                        SubscriptionDialogTarget.TARGET -> ThemePreferences.SUBSCRIBE_TARGET_OPTIONS
+                    }
+                    SegmentedGroup(options) { index, count, option ->
+                        val (label, description) = when (target) {
+                            SubscriptionDialogTarget.SOURCE -> subscriptionSourceOptionLabel(option)
+                            SubscriptionDialogTarget.TARGET -> subscribeTargetOptionLabel(option)
+                        }
+                        SegmentedChoiceRow(
+                            selected = option == currentValue,
+                            onClick = { onValueSelected(option) },
+                            index = index,
+                            count = count,
+                            label = label,
+                            description = description
+                        )
+                    }
+                }
+            },
+            confirmButton = {
+                OutlinedButton(
+                    onClick = onDismiss,
+                    shape = RoundedCornerShape(16.dp),
+                    modifier = Modifier.height(48.dp)
+                ) {
+                    Text(text = stringResource(R.string.action_close), fontWeight = FontWeight.SemiBold)
+                }
+            }
+        )
+    }
+}
+
+/**
+ * One option of a single-choice picker: a selectable Material 3 Expressive
+ * segmented row, the chosen one filled and ticked. Shared by the pickers in
+ * these dialogs so they cannot drift into different treatments again.
+ */
+@OptIn(ExperimentalMaterial3ExpressiveApi::class)
+@Composable
+internal fun SegmentedChoiceRow(
+    selected: Boolean,
+    onClick: () -> Unit,
+    index: Int,
+    count: Int,
+    label: String,
+    description: String? = null
+) {
+    SegmentedListItem(
+        selected = selected,
+        onClick = onClick,
+        shapes = ListItemDefaults.segmentedShapes(index, count),
+        colors = com.sentup.android.ui.components.segmentedColorsOver(MaterialTheme.colorScheme.surfaceContainerHigh),
+        supportingContent = description?.let { { Text(it) } },
+        trailingContent = if (selected) {
+            { Icon(Icons.Rounded.Check, contentDescription = null) }
+        } else null
+    ) {
+        Text(label, fontWeight = if (selected) FontWeight.SemiBold else FontWeight.Medium)
+    }
+}
+
+/** One per-network quality picker the Settings screen can open. */
+internal enum class QualityDialogTarget(
+    @StringRes val titleRes: Int,
+    @StringRes val descriptionRes: Int,
+    val isMusic: Boolean
+) {
+    VIDEO_WIFI(
+        titleRes = R.string.qd_video_wifi,
+        descriptionRes = R.string.qd_video_wifi_desc,
+        isMusic = false
+    ),
+    VIDEO_MOBILE(
+        titleRes = R.string.qd_video_mobile,
+        descriptionRes = R.string.qd_video_mobile_desc,
+        isMusic = false
+    ),
+    MUSIC_WIFI(
+        titleRes = R.string.qd_music_wifi,
+        descriptionRes = R.string.qd_music_wifi_desc,
+        isMusic = true
+    ),
+    MUSIC_MOBILE(
+        titleRes = R.string.qd_music_mobile,
+        descriptionRes = R.string.qd_music_mobile_desc,
+        isMusic = true
+    )
+}
+
+@OptIn(ExperimentalMaterial3ExpressiveApi::class)
+@Composable
+private fun StreamQualityDialog(
+    target: QualityDialogTarget,
+    currentQuality: String,
+    onQualitySelected: (String) -> Unit,
+    onDismiss: () -> Unit
+) {
+    val primaryColor = MaterialTheme.colorScheme.primary
+    val backgroundColor = MaterialTheme.colorScheme.surfaceContainerHigh
+    val textColor = MaterialTheme.colorScheme.onSurface
+    val secondaryTextColor = MaterialTheme.colorScheme.onSurfaceVariant
+
+    // Dialog entry animation
+    var dialogVisible by remember { mutableStateOf(false) }
+    LaunchedEffect(Unit) {
+        dialogVisible = true
+    }
+
+    AnimatedVisibility(
+        visible = dialogVisible,
+        enter = scaleIn(
+            initialScale = 0.8f,
+            animationSpec = spring(dampingRatio = Spring.DampingRatioMediumBouncy)
+        ) + fadeIn(tween(200)),
+        exit = scaleOut(targetScale = 0.8f) + fadeOut(tween(150))
+    ) {
+        AlertDialog(
+            onDismissRequest = onDismiss,
+            containerColor = backgroundColor,
+            shape = RoundedCornerShape(32.dp),
+            icon = {
+                Box(
+                    modifier = Modifier
+                        .size(64.dp)
+                        .clip(RoundedCornerShape(20.dp))
+                        .background(primaryColor.copy(alpha = 0.15f)),
+                    contentAlignment = Alignment.Center
+                ) {
+                    Icon(
+                        imageVector = if (target.isMusic) Icons.Rounded.MusicNote else Icons.Rounded.HighQuality,
+                        contentDescription = null,
+                        tint = primaryColor,
+                        modifier = Modifier.size(32.dp)
+                    )
+                }
+            },
+            title = {
+                Text(
+                    text = stringResource(target.titleRes),
+                    color = textColor,
+                    fontSize = 20.sp,
+                    fontWeight = FontWeight.Bold,
+                    textAlign = TextAlign.Center,
+                    modifier = Modifier.fillMaxWidth()
+                )
+            },
+            text = {
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .verticalScroll(rememberScrollState())
+                ) {
+                    Text(
+                        text = stringResource(target.descriptionRes),
+                        color = secondaryTextColor,
+                        fontSize = 13.sp,
+                        lineHeight = 18.sp,
+                        modifier = Modifier.padding(bottom = 12.dp)
+                    )
+                    val options = if (target.isMusic) ThemePreferences.MUSIC_QUALITY_OPTIONS
+                        else ThemePreferences.VIDEO_QUALITY_OPTIONS
+                    SegmentedGroup(options) { index, count, option ->
+                        SegmentedChoiceRow(
+                            selected = option == currentQuality,
+                            onClick = { onQualitySelected(option) },
+                            index = index,
+                            count = count,
+                            label = if (target.isMusic) musicQualityOptionLabel(option)
+                                else videoQualityLabel(option)
+                        )
+                    }
+                }
+            },
+            confirmButton = {
+                OutlinedButton(
+                    onClick = onDismiss,
+                    shape = RoundedCornerShape(16.dp),
+                    modifier = Modifier.height(48.dp)
+                ) {
+                    Text(
+                        text = stringResource(R.string.action_close),
+                        fontWeight = FontWeight.SemiBold
+                    )
+                }
+            }
+        )
+    }
+}
+
+@OptIn(ExperimentalMaterial3ExpressiveApi::class)
+@Composable
+private fun ExpressiveAboutDialog(
+    onDismiss: () -> Unit,
+    onNavigateToUpdate: () -> Unit,
+    onNavigateToLicenses: () -> Unit
+) {
+    val context = LocalContext.current
+
+    Dialog(
+        onDismissRequest = onDismiss,
+        properties = DialogProperties(usePlatformDefaultWidth = false),
+    ) {
+        Surface(
+            modifier = Modifier
+                .padding(16.dp)
+                .fillMaxWidth()
+                .fillMaxHeight(0.92f),
+            shape = RoundedCornerShape(36.dp),
+            color = MaterialTheme.colorScheme.surfaceContainerHigh,
+            tonalElevation = 6.dp,
+        ) {
+            Column {
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(start = 24.dp, top = 16.dp, end = 12.dp),
+                    verticalAlignment = Alignment.CenterVertically,
+                ) {
+                    Text(
+                        text = stringResource(R.string.about_title),
+                        style = MaterialTheme.typography.titleLarge,
+                        fontWeight = FontWeight.Bold,
+                        modifier = Modifier.weight(1f),
+                    )
+                    IconButton(onClick = onDismiss, shapes = IconButtonDefaults.shapes()) {
+                        Icon(Icons.Rounded.Close, contentDescription = stringResource(R.string.action_close))
+                    }
+                }
+
+                LazyColumn(
+                    modifier = Modifier.fillMaxWidth().weight(1f),
+                    contentPadding = PaddingValues(20.dp, 12.dp, 20.dp, 24.dp),
+                    verticalArrangement = Arrangement.spacedBy(20.dp),
+                ) {
+                    item {
+                        Column(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalAlignment = Alignment.CenterHorizontally,
+                        ) {
+                            Box(
+                                modifier = Modifier
+                                    .size(112.dp)
+                                    .clip(MaterialShapes.SoftBurst.toShape())
+                                    .background(MaterialTheme.colorScheme.primaryContainer),
+                                contentAlignment = Alignment.Center,
+                            ) {
+                                // A saved style has no drawable behind it -
+                                // it is colours, not a resource - so the one
+                                // place Sentüp draws its own mark at size gets
+                                // the live renderer when one is active, and
+                                // the preset's artwork otherwise. Without this
+                                // a style someone saved would change nothing
+                                // they could ever see.
+                                val themePrefs = remember { ThemePreferences(context) }
+                                val styleStore = remember {
+                                    com.sentup.android.data.AppIconStyleStore(context)
+                                }
+                                val currentAppIconId by themePrefs.appIcon.collectAsState()
+                                val activeStyleId by styleStore.activeStyleId.collectAsState()
+                                val savedStyles by styleStore.styles.collectAsState()
+                                val currentAppIcon = remember(currentAppIconId) {
+                                    AppIcon.fromId(currentAppIconId)
+                                }
+                                val activeStyle = remember(activeStyleId, savedStyles) {
+                                    savedStyles.firstOrNull { it.id == activeStyleId }
+                                }
+                                if (activeStyle != null) {
+                                    SentupAppIcon(
+                                        style = activeStyle.toIconStyle(),
+                                        shape = androidx.compose.foundation.shape
+                                            .RoundedCornerShape(20.dp),
+                                        animateColors = false,
+                                        modifier = Modifier.fillMaxSize(),
+                                    )
+                                } else {
+                                    androidx.compose.foundation.Image(
+                                        painter = painterResource(
+                                            currentAppIcon.previewForegroundRes
+                                        ),
+                                        contentDescription = stringResource(R.string.app_name),
+                                        modifier = Modifier.fillMaxSize(),
+                                    )
+                                }
+                            }
+                            Spacer(modifier = Modifier.height(14.dp))
+                            Text(
+                                text = stringResource(R.string.app_name),
+                                style = MaterialTheme.typography.headlineMedium,
+                                fontWeight = FontWeight.Bold,
+                            )
+                            Text(
+                                text = stringResource(R.string.about_tagline),
+                                style = MaterialTheme.typography.bodyLarge,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                textAlign = TextAlign.Center,
+                                modifier = Modifier.padding(top = 6.dp, start = 8.dp, end = 8.dp),
+                            )
+                            Surface(
+                                shape = RoundedCornerShape(100),
+                                color = MaterialTheme.colorScheme.primaryContainer,
+                                contentColor = MaterialTheme.colorScheme.onPrimaryContainer,
+                                modifier = Modifier.padding(top = 12.dp),
+                            ) {
+                                Text(
+                                    text = stringResource(
+                                        R.string.settings_version_subtitle,
+                                        BuildConfig.VERSION_NAME,
+                                        BuildConfig.VERSION_CODE,
+                                    ),
+                                    style = MaterialTheme.typography.labelLarge,
+                                    fontWeight = FontWeight.SemiBold,
+                                    modifier = Modifier.padding(horizontal = 14.dp, vertical = 7.dp),
+                                )
+                            }
+                        }
+                    }
+
+                    item {
+                        SettingsSection(title = stringResource(R.string.about_build_details)) {
+                            SettingsCard {
+                                AboutDetailRow(stringResource(R.string.about_version), BuildConfig.VERSION_NAME)
+                                SettingsDivider()
+                                AboutDetailRow(stringResource(R.string.about_build), BuildConfig.VERSION_CODE.toString())
+                                SettingsDivider()
+                                AboutDetailRow(
+                                    stringResource(R.string.about_build_type),
+                                    if (BuildConfig.DEBUG) stringResource(R.string.about_debug)
+                                    else stringResource(R.string.about_release),
+                                )
+                                SettingsDivider()
+                                AboutDetailRow(stringResource(R.string.about_package), BuildConfig.APPLICATION_ID)
+                                SettingsDivider()
+                                AboutDetailRow(
+                                    stringResource(R.string.about_device),
+                                    "Android ${android.os.Build.VERSION.RELEASE} · API ${android.os.Build.VERSION.SDK_INT}",
+                                )
+                            }
+                        }
+                    }
+
+                    item {
+                        SettingsSection(title = stringResource(R.string.about_project)) {
+                            SettingsCard {
+                                SettingsRow(
+                                    icon = Icons.AutoMirrored.Rounded.LibraryBooks,
+                                    title = stringResource(R.string.about_licenses),
+                                    subtitle = stringResource(R.string.about_licenses_subtitle),
+                                    onClick = {
+                                        onDismiss()
+                                        onNavigateToLicenses()
+                                    },
+                                    showChevron = true,
+                                )
+                            }
+                        }
+                    }
+
+                    item {
+                        Surface(
+                            shape = RoundedCornerShape(24.dp),
+                            color = MaterialTheme.colorScheme.tertiaryContainer,
+                            contentColor = MaterialTheme.colorScheme.onTertiaryContainer,
+                        ) {
+                            Row(
+                                modifier = Modifier.padding(18.dp),
+                                verticalAlignment = Alignment.Top,
+                                horizontalArrangement = Arrangement.spacedBy(14.dp),
+                            ) {
+                                Icon(Icons.Rounded.Info, contentDescription = null)
+                                Text(
+                                    text = stringResource(R.string.about_open_source_note),
+                                    style = MaterialTheme.typography.bodyMedium,
+                                    modifier = Modifier.weight(1f),
+                                )
+                            }
+                        }
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun AboutDetailRow(
+    label: String,
+    value: String,
+) {
+    BoxWithConstraints(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(horizontal = 12.dp, vertical = 10.dp)
+    ) {
+        if (maxWidth < 300.dp) {
+            Column(verticalArrangement = Arrangement.spacedBy(3.dp)) {
+                Text(
+                    text = label,
+                    style = MaterialTheme.typography.labelLarge,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                Text(text = value, style = MaterialTheme.typography.bodyMedium, fontWeight = FontWeight.SemiBold)
+            }
+        } else {
+            Row(horizontalArrangement = Arrangement.spacedBy(16.dp), verticalAlignment = Alignment.Top) {
+                Text(
+                    text = label,
+                    style = MaterialTheme.typography.bodyMedium,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                    modifier = Modifier.weight(0.4f),
+                )
+                Text(
+                    text = value,
+                    style = MaterialTheme.typography.bodyMedium,
+                    fontWeight = FontWeight.SemiBold,
+                    textAlign = TextAlign.End,
+                    modifier = Modifier.weight(0.6f),
+                )
+            }
+        }
+    }
+}
+
+private fun android.content.Context.openAboutLink(url: String) {
+    runCatching { startActivity(Intent(Intent.ACTION_VIEW, Uri.parse(url))) }
+}
+
+@OptIn(ExperimentalMaterial3ExpressiveApi::class)
+@Composable
+private fun AndroidAutoHelpDialog(
+    onDismiss: () -> Unit
+) {
+    val primaryColor = MaterialTheme.colorScheme.primary
+    val backgroundColor = MaterialTheme.colorScheme.surfaceContainerHigh
+    val textColor = MaterialTheme.colorScheme.onSurface
+    val secondaryTextColor = MaterialTheme.colorScheme.onSurfaceVariant
+
+    var dialogVisible by remember { mutableStateOf(false) }
+    LaunchedEffect(Unit) {
+        dialogVisible = true
+    }
+
+    AnimatedVisibility(
+        visible = dialogVisible,
+        enter = scaleIn(
+            initialScale = 0.8f,
+            animationSpec = spring(dampingRatio = Spring.DampingRatioMediumBouncy)
+        ) + fadeIn(tween(200)),
+        exit = scaleOut(targetScale = 0.8f) + fadeOut(tween(150))
+    ) {
+        AlertDialog(
+            onDismissRequest = onDismiss,
+            containerColor = backgroundColor,
+            shape = RoundedCornerShape(32.dp),
+            icon = {
+                Box(
+                    modifier = Modifier
+                        .size(64.dp)
+                        .clip(RoundedCornerShape(20.dp))
+                        .background(primaryColor.copy(alpha = 0.15f)),
+                    contentAlignment = Alignment.Center
+                ) {
+                    Icon(
+                        imageVector = Icons.Rounded.DirectionsCar,
+                        contentDescription = null,
+                        tint = primaryColor,
+                        modifier = Modifier.size(32.dp)
+                    )
+                }
+            },
+            title = {
+                Column(
+                    horizontalAlignment = Alignment.CenterHorizontally,
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Text(
+                        text = stringResource(R.string.sp_android_auto),
+                        color = textColor,
+                        fontSize = 22.sp,
+                        fontWeight = FontWeight.Bold,
+                        textAlign = TextAlign.Center
+                    )
+                    Spacer(modifier = Modifier.height(4.dp))
+                    Text(
+                        text = stringResource(R.string.auto_help_subtitle),
+                        color = secondaryTextColor,
+                        fontSize = 13.sp,
+                        textAlign = TextAlign.Center
+                    )
+                }
+            },
+            text = {
+                Column(modifier = Modifier.fillMaxWidth()) {
+                    Text(
+                        text = stringResource(R.string.auto_help_intro),
+                        color = textColor,
+                        fontSize = 14.sp
+                    )
+                    Spacer(modifier = Modifier.height(12.dp))
+                    val steps = listOf(
+                        stringResource(R.string.auto_help_step1),
+                        stringResource(R.string.auto_help_step2),
+                        stringResource(R.string.auto_help_step3),
+                        stringResource(R.string.auto_help_step4)
+                    )
+                    steps.forEachIndexed { index, step ->
+                        Row(verticalAlignment = Alignment.Top) {
+                            Surface(
+                                shape = RoundedCornerShape(50),
+                                color = primaryColor.copy(alpha = 0.15f)
+                            ) {
+                                Text(
+                                    text = "${index + 1}",
+                                    color = primaryColor,
+                                    fontSize = 12.sp,
+                                    fontWeight = FontWeight.Bold,
+                                    modifier = Modifier.padding(horizontal = 8.dp, vertical = 2.dp)
+                                )
+                            }
+                            Spacer(modifier = Modifier.width(10.dp))
+                            Text(
+                                text = step,
+                                color = secondaryTextColor,
+                                fontSize = 13.sp
+                            )
+                        }
+                        if (index < steps.lastIndex) {
+                            Spacer(modifier = Modifier.height(8.dp))
+                        }
+                    }
+                    Spacer(modifier = Modifier.height(12.dp))
+                    Text(
+                        text = stringResource(R.string.auto_help_note),
+                        color = secondaryTextColor,
+                        fontSize = 12.sp
+                    )
+                }
+            },
+            confirmButton = {
+                Button(
+                    onClick = onDismiss,
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = primaryColor
+                    ),
+                    shape = RoundedCornerShape(16.dp),
+                    modifier = Modifier.height(48.dp)
+                ) {
+                    Text(
+                        text = stringResource(R.string.action_got_it),
+                        fontWeight = FontWeight.SemiBold
+                    )
+                }
+            }
+        )
+    }
+}
+
+/**
+ * The only way Smooth motion turns on. It costs battery and heat for as long
+ * as a video plays and can visibly warp motion, so the switch alone is not
+ * consent; dismissing leaves it off.
+ */
+@Composable
+private fun FrameInterpolationWarningDialog(
+    onConfirm: () -> Unit,
+    onDismiss: () -> Unit
+) {
+    val primaryColor = MaterialTheme.colorScheme.primary
+    val backgroundColor = MaterialTheme.colorScheme.surfaceContainerHigh
+    val textColor = MaterialTheme.colorScheme.onSurface
+    val secondaryTextColor = MaterialTheme.colorScheme.onSurfaceVariant
+
+    var dialogVisible by remember { mutableStateOf(false) }
+    LaunchedEffect(Unit) { dialogVisible = true }
+
+    AnimatedVisibility(
+        visible = dialogVisible,
+        enter = scaleIn(
+            initialScale = 0.8f,
+            animationSpec = spring(dampingRatio = Spring.DampingRatioMediumBouncy)
+        ) + fadeIn(tween(200)),
+        exit = scaleOut(targetScale = 0.8f) + fadeOut(tween(150))
+    ) {
+        AlertDialog(
+            onDismissRequest = onDismiss,
+            containerColor = backgroundColor,
+            shape = RoundedCornerShape(32.dp),
+            icon = {
+                Box(
+                    modifier = Modifier
+                        .size(64.dp)
+                        .clip(RoundedCornerShape(20.dp))
+                        .background(primaryColor.copy(alpha = 0.15f)),
+                    contentAlignment = Alignment.Center
+                ) {
+                    Icon(
+                        imageVector = Icons.Rounded.Animation,
+                        contentDescription = null,
+                        tint = primaryColor,
+                        modifier = Modifier.size(32.dp)
+                    )
+                }
+            },
+            title = {
+                Column(
+                    horizontalAlignment = Alignment.CenterHorizontally,
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Text(
+                        text = stringResource(R.string.fi_warning_title),
+                        color = textColor,
+                        fontSize = 22.sp,
+                        fontWeight = FontWeight.Bold,
+                        textAlign = TextAlign.Center
+                    )
+                    Spacer(modifier = Modifier.height(4.dp))
+                    Text(
+                        text = stringResource(R.string.fi_warning_subtitle),
+                        color = secondaryTextColor,
+                        fontSize = 13.sp,
+                        textAlign = TextAlign.Center
+                    )
+                }
+            },
+            text = {
+                // Scrolls: at a large font or display size the points outgrow
+                // a landscape phone's height.
+                Column(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .verticalScroll(rememberScrollState())
+                ) {
+                    Text(
+                        text = stringResource(R.string.fi_warning_intro),
+                        color = textColor,
+                        fontSize = 14.sp
+                    )
+                    Spacer(modifier = Modifier.height(12.dp))
+                    val points = listOf(
+                        stringResource(R.string.fi_warning_battery),
+                        stringResource(R.string.fi_warning_artifacts),
+                        stringResource(R.string.fi_warning_hdr),
+                        stringResource(R.string.fi_warning_auto)
+                    )
+                    points.forEachIndexed { index, point ->
+                        Row(verticalAlignment = Alignment.Top) {
+                            Surface(
+                                shape = RoundedCornerShape(50),
+                                color = primaryColor.copy(alpha = 0.15f)
+                            ) {
+                                Text(
+                                    text = "${index + 1}",
+                                    color = primaryColor,
+                                    fontSize = 12.sp,
+                                    fontWeight = FontWeight.Bold,
+                                    modifier = Modifier.padding(horizontal = 8.dp, vertical = 2.dp)
+                                )
+                            }
+                            Spacer(modifier = Modifier.width(10.dp))
+                            Text(
+                                text = point,
+                                color = secondaryTextColor,
+                                fontSize = 13.sp
+                            )
+                        }
+                        if (index < points.lastIndex) {
+                            Spacer(modifier = Modifier.height(8.dp))
+                        }
+                    }
+                    Spacer(modifier = Modifier.height(12.dp))
+                    Text(
+                        text = stringResource(R.string.fi_warning_note),
+                        color = secondaryTextColor,
+                        fontSize = 12.sp
+                    )
+                }
+            },
+            confirmButton = {
+                Button(
+                    onClick = onConfirm,
+                    colors = ButtonDefaults.buttonColors(containerColor = primaryColor),
+                    shape = RoundedCornerShape(16.dp),
+                    modifier = Modifier.height(48.dp)
+                ) {
+                    Text(
+                        text = stringResource(R.string.fi_warning_confirm),
+                        fontWeight = FontWeight.SemiBold
+                    )
+                }
+            },
+            dismissButton = {
+                OutlinedButton(
+                    onClick = onDismiss,
+                    shape = RoundedCornerShape(16.dp),
+                    modifier = Modifier.height(48.dp)
+                ) {
+                    Text(text = stringResource(R.string.action_cancel))
+                }
+            }
+        )
+    }
+}
+
+@Composable
+private fun FolderExclusionDialog(
+    availableFolders: List<FolderInfo>,
+    excludedFolders: Set<String>,
+    isLoading: Boolean,
+    onAddExcludedFolder: (String) -> Unit,
+    onRemoveExcludedFolder: (String) -> Unit,
+    onDismiss: () -> Unit
+) {
+    val primaryColor = MaterialTheme.colorScheme.primary
+    val backgroundColor = MaterialTheme.colorScheme.surfaceContainerHigh
+    val textColor = MaterialTheme.colorScheme.onSurface
+    val secondaryTextColor = MaterialTheme.colorScheme.onSurfaceVariant
+    
+    // Dialog entry animation
+    var dialogVisible by remember { mutableStateOf(false) }
+    LaunchedEffect(Unit) {
+        dialogVisible = true
+    }
+    
+    AnimatedVisibility(
+        visible = dialogVisible,
+        enter = scaleIn(
+            initialScale = 0.8f,
+            animationSpec = spring(dampingRatio = Spring.DampingRatioMediumBouncy)
+        ) + fadeIn(tween(200)),
+        exit = scaleOut(targetScale = 0.8f) + fadeOut(tween(150))
+    ) {
+        AlertDialog(
+            onDismissRequest = onDismiss,
+            containerColor = backgroundColor,
+            shape = RoundedCornerShape(32.dp),
+            icon = {
+                Box(
+                    modifier = Modifier
+                        .size(64.dp)
+                        .clip(RoundedCornerShape(20.dp))
+                        .background(primaryColor.copy(alpha = 0.15f)),
+                    contentAlignment = Alignment.Center
+                ) {
+                    Icon(
+                        imageVector = Icons.Rounded.FolderOff,
+                        contentDescription = null,
+                        tint = primaryColor,
+                        modifier = Modifier.size(32.dp)
+                    )
+                }
+            },
+            title = {
+                Column(
+                    horizontalAlignment = Alignment.CenterHorizontally,
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Text(
+                        text = stringResource(R.string.sp_excluded_folders),
+                        color = textColor,
+                        fontSize = 22.sp,
+                        fontWeight = FontWeight.Bold,
+                        textAlign = TextAlign.Center
+                    )
+                    Spacer(modifier = Modifier.height(4.dp))
+                    Text(
+                        text = stringResource(R.string.sp_excluded_folders_sub),
+                        color = secondaryTextColor,
+                        fontSize = 13.sp,
+                        textAlign = TextAlign.Center
+                    )
+                }
+            },
+            text = {
+                Surface(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .height(320.dp),
+                    shape = RoundedCornerShape(20.dp),
+                    color = MaterialTheme.colorScheme.surfaceContainer
+                ) {
+                    when {
+                        isLoading -> {
+                            Box(
+                                modifier = Modifier.fillMaxSize(),
+                                contentAlignment = Alignment.Center
+                            ) {
+                                Column(
+                                    horizontalAlignment = Alignment.CenterHorizontally,
+                                    verticalArrangement = Arrangement.Center
+                                ) {
+                                    CircularProgressIndicator(
+                                        modifier = Modifier.size(40.dp),
+                                        color = primaryColor,
+                                        strokeWidth = 3.dp
+                                    )
+                                    Spacer(modifier = Modifier.height(12.dp))
+                                    Text(
+                                        text = stringResource(R.string.sp_scanning_folders),
+                                        color = secondaryTextColor,
+                                        fontSize = 14.sp
+                                    )
+                                }
+                            }
+                        }
+                        availableFolders.isEmpty() -> {
+                            Box(
+                                modifier = Modifier.fillMaxSize(),
+                                contentAlignment = Alignment.Center
+                            ) {
+                                Column(
+                                    horizontalAlignment = Alignment.CenterHorizontally
+                                ) {
+                                    Icon(
+                                        imageVector = Icons.Rounded.Folder,
+                                        contentDescription = null,
+                                        tint = secondaryTextColor.copy(alpha = 0.5f),
+                                        modifier = Modifier.size(48.dp)
+                                    )
+                                    Spacer(modifier = Modifier.height(12.dp))
+                                    Text(
+                                        text = stringResource(R.string.sp_no_music_folders),
+                                        color = secondaryTextColor,
+                                        fontSize = 14.sp
+                                    )
+                                }
+                            }
+                        }
+                        else -> {
+                            LazyColumn(
+                                modifier = Modifier.fillMaxSize(),
+                                contentPadding = PaddingValues(8.dp),
+                                verticalArrangement = Arrangement.spacedBy(4.dp)
+                            ) {
+                                itemsIndexed(availableFolders) { _, folder ->
+                                    val isExcluded = excludedFolders.contains(folder.path)
+                                    FolderItem(
+                                        folder = folder,
+                                        isExcluded = isExcluded,
+                                        onToggle = {
+                                            if (isExcluded) {
+                                                onRemoveExcludedFolder(folder.path)
+                                            } else {
+                                                onAddExcludedFolder(folder.path)
+                                            }
+                                        },
+                                        textColor = textColor,
+                                        secondaryTextColor = secondaryTextColor,
+                                        accentColor = primaryColor
+                                    )
+                                }
+                            }
+                        }
+                    }
+                }
+            },
+            confirmButton = {
+                Button(
+                    onClick = onDismiss,
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = primaryColor
+                    ),
+                    shape = RoundedCornerShape(16.dp),
+                    modifier = Modifier.height(48.dp)
+                ) {
+                    Icon(
+                        imageVector = Icons.Rounded.CheckCircle,
+                        contentDescription = null,
+                        modifier = Modifier.size(20.dp)
+                    )
+                    Spacer(modifier = Modifier.width(8.dp))
+                    Text(
+                        text = stringResource(R.string.action_done),
+                        fontWeight = FontWeight.SemiBold
+                    )
+                }
+            }
+        )
+    }
+}
+
+@Composable
+private fun FolderItem(
+    folder: FolderInfo,
+    isExcluded: Boolean,
+    onToggle: () -> Unit,
+    textColor: Color,
+    secondaryTextColor: Color,
+    accentColor: Color
+) {
+    val interactionSource = remember { MutableInteractionSource() }
+    val excludedColor = MaterialTheme.colorScheme.error
+
+    Surface(
+        modifier = Modifier
+            .fillMaxWidth()
+            .clip(RoundedCornerShape(12.dp))
+            .clickable(
+                interactionSource = interactionSource,
+                indication = null,
+                onClick = onToggle
+            ),
+        shape = RoundedCornerShape(12.dp),
+        color = if (isExcluded) excludedColor.copy(alpha = 0.08f) else Color.Transparent
+    ) {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = 12.dp, vertical = 10.dp),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            // Checkbox
+            Checkbox(
+                checked = isExcluded,
+                onCheckedChange = { onToggle() },
+                colors = CheckboxDefaults.colors(
+                    checkedColor = excludedColor,
+                    uncheckedColor = secondaryTextColor.copy(alpha = 0.5f),
+                    checkmarkColor = MaterialTheme.colorScheme.onError
+                )
+            )
+            
+            Spacer(modifier = Modifier.width(8.dp))
+            
+            // Folder icon
+            Icon(
+                imageVector = if (isExcluded) Icons.Rounded.FolderOff else Icons.Rounded.Folder,
+                contentDescription = null,
+                tint = if (isExcluded) excludedColor else accentColor,
+                modifier = Modifier.size(24.dp)
+            )
+            
+            Spacer(modifier = Modifier.width(12.dp))
+            
+            // Folder info
+            Column(modifier = Modifier.weight(1f)) {
+                Text(
+                    text = folder.displayName,
+                    color = if (isExcluded) excludedColor else textColor,
+                    fontSize = 14.sp,
+                    fontWeight = FontWeight.Medium,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis
+                )
+                Text(
+                    text = "${folder.songCount} song${if (folder.songCount != 1) "s" else ""}",
+                    color = secondaryTextColor,
+                    fontSize = 12.sp,
+                    maxLines = 1,
+                    overflow = TextOverflow.Ellipsis
+                )
+            }
+        }
+    }
+}
+
+/**
+ * Playful picker for the Shorts action rail: each action is a large shaped
+ * toggle that previews the real rail button — shown buttons sit plump in
+ * the same cookie shape the rail uses for its active state, hidden ones
+ * deflate into a small dimmed circle. Tap to flip; changes apply live.
+ */
+@OptIn(ExperimentalLayoutApi::class)
+@Composable
+private fun ShortsButtonsDialog(
+    hiddenActions: Set<String>,
+    onHiddenActionsChange: (Set<String>) -> Unit,
+    onDismiss: () -> Unit
+) {
+    val primaryColor = MaterialTheme.colorScheme.primary
+    val backgroundColor = MaterialTheme.colorScheme.surfaceContainerHigh
+    val textColor = MaterialTheme.colorScheme.onSurface
+    val secondaryTextColor = MaterialTheme.colorScheme.onSurfaceVariant
+
+    // Dialog entry animation
+    var dialogVisible by remember { mutableStateOf(false) }
+    LaunchedEffect(Unit) {
+        dialogVisible = true
+    }
+
+    fun toggle(action: String) {
+        onHiddenActionsChange(
+            if (action in hiddenActions) hiddenActions - action else hiddenActions + action
+        )
+    }
+
+    AnimatedVisibility(
+        visible = dialogVisible,
+        enter = scaleIn(
+            initialScale = 0.8f,
+            animationSpec = spring(dampingRatio = Spring.DampingRatioMediumBouncy)
+        ) + fadeIn(tween(200)),
+        exit = scaleOut(targetScale = 0.8f) + fadeOut(tween(150))
+    ) {
+        AlertDialog(
+            onDismissRequest = onDismiss,
+            containerColor = backgroundColor,
+            shape = RoundedCornerShape(32.dp),
+            icon = {
+                // Sunny hero badge, echoing the rail's shaped buttons
+                val heroShape = remember { PolygonShape(MaterialShapes.Sunny) }
+                Box(
+                    modifier = Modifier
+                        .size(64.dp)
+                        .clip(heroShape)
+                        .background(primaryColor.copy(alpha = 0.18f)),
+                    contentAlignment = Alignment.Center
+                ) {
+                    Icon(
+                        imageVector = Icons.Rounded.Visibility,
+                        contentDescription = null,
+                        tint = primaryColor,
+                        modifier = Modifier.size(28.dp)
+                    )
+                }
+            },
+            title = {
+                Column(
+                    horizontalAlignment = Alignment.CenterHorizontally,
+                    modifier = Modifier.fillMaxWidth()
+                ) {
+                    Text(
+                        text = stringResource(R.string.sp_shorts_buttons),
+                        color = textColor,
+                        fontSize = 22.sp,
+                        fontWeight = FontWeight.Bold,
+                        textAlign = TextAlign.Center
+                    )
+                    Spacer(modifier = Modifier.height(4.dp))
+                    Text(
+                        text = stringResource(R.string.sp_shorts_buttons_sub),
+                        color = secondaryTextColor,
+                        fontSize = 13.sp,
+                        textAlign = TextAlign.Center
+                    )
+                }
+            },
+            text = {
+                FlowRow(
+                    modifier = Modifier.fillMaxWidth(),
+                    maxItemsInEachRow = 2,
+                    horizontalArrangement = Arrangement.spacedBy(12.dp, Alignment.CenterHorizontally),
+                    verticalArrangement = Arrangement.spacedBy(16.dp)
+                ) {
+                    ShortsButtonShapeToggle(
+                        icon = Icons.Rounded.ThumbUp,
+                        label = stringResource(R.string.action_like),
+                        shown = ThemePreferences.SHORTS_ACTION_LIKE !in hiddenActions,
+                        onToggle = { toggle(ThemePreferences.SHORTS_ACTION_LIKE) }
+                    )
+                    ShortsButtonShapeToggle(
+                        icon = Icons.Rounded.ThumbDown,
+                        label = stringResource(R.string.cd_dislike),
+                        shown = ThemePreferences.SHORTS_ACTION_DISLIKE !in hiddenActions,
+                        onToggle = { toggle(ThemePreferences.SHORTS_ACTION_DISLIKE) }
+                    )
+                    ShortsButtonShapeToggle(
+                        icon = Icons.Rounded.ChatBubble,
+                        label = stringResource(R.string.cd_comments),
+                        shown = ThemePreferences.SHORTS_ACTION_COMMENTS !in hiddenActions,
+                        onToggle = { toggle(ThemePreferences.SHORTS_ACTION_COMMENTS) }
+                    )
+                    ShortsButtonShapeToggle(
+                        icon = Icons.Rounded.Share,
+                        label = stringResource(R.string.action_share),
+                        shown = ThemePreferences.SHORTS_ACTION_SHARE !in hiddenActions,
+                        onToggle = { toggle(ThemePreferences.SHORTS_ACTION_SHARE) }
+                    )
+                    ShortsButtonShapeToggle(
+                        icon = Icons.Rounded.NotInterested,
+                        label = stringResource(R.string.video_options_not_interested),
+                        shown = ThemePreferences.SHORTS_ACTION_NOT_INTERESTED !in hiddenActions,
+                        onToggle = { toggle(ThemePreferences.SHORTS_ACTION_NOT_INTERESTED) }
+                    )
+                }
+            },
+            confirmButton = {
+                Button(
+                    onClick = onDismiss,
+                    colors = ButtonDefaults.buttonColors(
+                        containerColor = primaryColor
+                    ),
+                    shape = RoundedCornerShape(16.dp),
+                    modifier = Modifier.height(48.dp)
+                ) {
+                    Icon(
+                        imageVector = Icons.Rounded.CheckCircle,
+                        contentDescription = null,
+                        modifier = Modifier.size(20.dp)
+                    )
+                    Spacer(modifier = Modifier.width(8.dp))
+                    Text(
+                        text = stringResource(R.string.action_done),
+                        fontWeight = FontWeight.SemiBold
+                    )
+                }
+            }
+        )
+    }
+}
+
+/**
+ * One shaped toggle of the Shorts buttons dialog. Shown = plump cookie
+ * (the rail's active shape) filled with secondaryContainer and a bouncy
+ * pop; hidden = deflated dim circle with a struck-through label.
+ */
+@Composable
+private fun ShortsButtonShapeToggle(
+    icon: ImageVector,
+    label: String,
+    shown: Boolean,
+    onToggle: () -> Unit
+) {
+    val cookieShape = remember { PolygonShape(MaterialShapes.Cookie9Sided) }
+    val shape = if (shown) cookieShape else CircleShape
+
+    val scale by animateFloatAsState(
+        targetValue = if (shown) 1f else 0.78f,
+        animationSpec = spring(
+            dampingRatio = Spring.DampingRatioMediumBouncy,
+            stiffness = Spring.StiffnessMediumLow
+        ),
+        label = "shortsToggleScale"
+    )
+    val containerColor by animateColorAsState(
+        targetValue = if (shown) MaterialTheme.colorScheme.secondaryContainer
+            else MaterialTheme.colorScheme.surfaceContainerHighest,
+        label = "shortsToggleColor"
+    )
+    val iconColor by animateColorAsState(
+        targetValue = if (shown) MaterialTheme.colorScheme.onSecondaryContainer
+            else MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.45f),
+        label = "shortsToggleIcon"
+    )
+
+    Column(
+        horizontalAlignment = Alignment.CenterHorizontally,
+        modifier = Modifier.width(108.dp)
+    ) {
+        Box(
+            modifier = Modifier.size(72.dp),
+            contentAlignment = Alignment.Center
+        ) {
+            Box(
+                modifier = Modifier
+                    .size(72.dp)
+                    .scale(scale)
+                    .clip(shape)
+                    .background(containerColor)
+                    .clickable(onClick = onToggle),
+                contentAlignment = Alignment.Center
+            ) {
+                Icon(
+                    imageVector = icon,
+                    contentDescription = "$label: ${if (shown) "shown" else "hidden"}",
+                    tint = iconColor,
+                    modifier = Modifier.size(26.dp)
+                )
+            }
+        }
+        Spacer(modifier = Modifier.height(6.dp))
+        Text(
+            text = label,
+            color = if (shown) MaterialTheme.colorScheme.onSurface
+                else MaterialTheme.colorScheme.onSurfaceVariant.copy(alpha = 0.6f),
+            fontSize = 13.sp,
+            fontWeight = FontWeight.SemiBold,
+            textDecoration = if (shown) null else TextDecoration.LineThrough,
+            textAlign = TextAlign.Center
+        )
+    }
+}
+
+internal fun isXiaomiDevice(): Boolean {
+    val manufacturer = android.os.Build.MANUFACTURER.lowercase()
+    val brand = android.os.Build.BRAND.lowercase()
+    return manufacturer.contains("xiaomi") || brand.contains("xiaomi") || 
+           brand.contains("redmi") || brand.contains("poco")
+}

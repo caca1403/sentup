@@ -1,0 +1,437 @@
+package com.sentup.android.ui.video
+import androidx.compose.ui.res.stringResource
+
+import android.view.LayoutInflater
+import androidx.compose.animation.core.Spring
+import androidx.compose.animation.core.animateFloatAsState
+import androidx.compose.animation.core.spring
+import androidx.compose.foundation.background
+import androidx.compose.foundation.layout.Arrangement
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.Row
+import androidx.compose.foundation.layout.Spacer
+import androidx.compose.foundation.layout.aspectRatio
+import androidx.compose.foundation.layout.fillMaxHeight
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.height
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
+import androidx.compose.foundation.layout.width
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.rounded.Pause
+import androidx.compose.material.icons.rounded.PlayArrow
+import androidx.compose.material.icons.rounded.Close
+import androidx.compose.material3.ExperimentalMaterial3ExpressiveApi
+import androidx.compose.material3.ContainedLoadingIndicator
+import androidx.compose.material3.FilledIconButton
+import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButtonDefaults
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.Text
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.collectAsState
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.remember
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.layout.boundsInWindow
+import androidx.compose.ui.layout.onGloballyPositioned
+import androidx.compose.ui.text.style.TextOverflow
+import androidx.compose.ui.unit.dp
+import androidx.compose.ui.viewinterop.AndroidView
+import androidx.media3.common.util.UnstableApi
+import androidx.media3.ui.AspectRatioFrameLayout
+import androidx.media3.ui.PlayerView
+import com.sentup.android.R
+import com.sentup.android.data.VideoItem
+import com.sentup.android.ui.components.BindMiniSkip
+import com.sentup.android.ui.components.MiniSkipCarousel
+import com.sentup.android.ui.components.MiniSkipState
+import com.sentup.android.ui.components.VideoThumbnail
+import com.sentup.android.ui.player.rememberPlayerHaptics
+
+/** Height of the collapsed bar. Shared with the overlay that sizes it. */
+val MINI_VIDEO_HEIGHT = 88.dp
+
+/**
+ * Gap between the collapsed bar and whatever is beneath it - the system
+ * navigation inset, or the host's own bottom chrome when it has any.
+ */
+val MINI_VIDEO_MARGIN = 16.dp
+
+/**
+ * Width of the video preview. Sized so a 16:9 frame is 52dp tall inside an
+ * 88dp bar - enough that the picture reads as picture - while leaving the
+ * title room to say something on a narrow screen.
+ */
+internal val MINI_VIDEO_THUMB_WIDTH = 92.dp
+
+/** Inset of the bar's content from the card edge. */
+internal val MINI_VIDEO_BAR_PADDING = 12.dp
+
+/** Rounding of the video frame inside the bar. */
+internal val MINI_VIDEO_THUMB_CORNER = 12.dp
+
+/** Rounding of the bar itself. */
+internal val MINI_VIDEO_BAR_CORNER = 28.dp
+
+/** Depth of the bar, which the container transform starts from and lands on. */
+internal val MINI_VIDEO_BAR_SHADOW = 12.dp
+
+/**
+ * The video player's collapsed bar: the video still playing, what it is, and
+ * the two controls worth reaching for without opening the player.
+ *
+ * Play/pause and Close are the durable actions here. A downward pull is the
+ * dismiss shortcut, never the only way to stop a persistent player. A sideways
+ * swipe moves to the next or previous video inside the bar - the bar stays put,
+ * the video slides, and the one it would move to peeks in from the edge - the
+ * same gesture the music pill answers to. Next is the playlist's next video, or
+ * the related one autoplay would pick when there is no playlist; previous
+ * exists only inside a playlist.
+ *
+ * Nothing here polls. Position comes off [VideoPlayerViewModel.progress], which
+ * the expanded player's scrubber already drives, replacing a one-second loop
+ * that stepped the bar in visible jumps and stopped updating the moment
+ * playback paused - so a seek while paused left the hairline behind.
+ */
+@OptIn(UnstableApi::class, ExperimentalMaterial3ExpressiveApi::class)
+@Composable
+fun MiniVideoPlayerContent(
+    viewModel: VideoPlayerViewModel,
+    /**
+     * Whether the bar's frame draws the picture right now. Inside the container
+     * transform the watch page holds the player's surface while it is on
+     * screen, and hands it to this frame as the bar comes back on the way down
+     * (see bindVideoSurface). Anywhere else the bar always holds it.
+     */
+    holdsSurface: () -> Boolean = { true },
+    /** The bar's sideways swipe, owned by the overlay's gesture and bound here. */
+    skipState: MiniSkipState,
+) {
+    val currentVideo by viewModel.currentVideo.collectAsState()
+    val isPlaying by viewModel.isPlaying.collectAsState()
+    val isBuffering by viewModel.isBuffering.collectAsState()
+    val progress by viewModel.progress.collectAsState()
+    val isLive by viewModel.isLive.collectAsState()
+    val isPortrait by viewModel.isPortraitVideo.collectAsState()
+    val queue by viewModel.queue.collectAsState()
+    val relatedVideos by viewModel.relatedVideos.collectAsState()
+
+    // What playNextOrRelated and playPreviousInQueue would each play, so the
+    // item that peeks in is the item a release lands on. A playlist at its end
+    // has no next, even with related videos loaded: that is the rule the
+    // ViewModel's own next follows.
+    val activeQueue = queue
+    val nextVideo = if (activeQueue != null) {
+        activeQueue.videos.getOrNull(activeQueue.index + 1)
+    } else {
+        relatedVideos.firstOrNull()
+    }
+    val previousVideo = activeQueue?.let { it.videos.getOrNull(it.index - 1) }
+    BindMiniSkip(
+        state = skipState,
+        contentKey = currentVideo?.videoId,
+        nextKey = nextVideo?.videoId,
+        previousKey = previousVideo?.videoId,
+        // Collapsed stays collapsed: the swipe changes what is in the bar, it
+        // is not a request to watch.
+        onNext = { viewModel.playNextOrRelated(expand = false) },
+        onPrevious = { viewModel.playPreviousInQueue(expand = false) },
+    )
+
+    val video = currentVideo ?: return
+    val haptics = rememberPlayerHaptics()
+    val liveLabel = stringResource(R.string.badge_live)
+    val playLabel = stringResource(R.string.cd_play)
+    val pauseLabel = stringResource(R.string.cd_pause)
+
+    Row(
+        modifier = Modifier
+            .fillMaxSize()
+            .padding(horizontal = MINI_VIDEO_BAR_PADDING),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        MiniSkipCarousel(
+            state = skipState,
+            modifier = Modifier
+                .weight(1f)
+                .fillMaxHeight(),
+            previousLabel = stringResource(R.string.cd_previous),
+            nextLabel = stringResource(R.string.cd_next),
+            previous = previousVideo,
+            next = nextVideo,
+            neighbour = { video -> MiniVideoNeighbour(video) },
+        ) {
+            Row(
+                modifier = Modifier.fillMaxSize(),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                MiniVideoSurface(
+                    viewModel = viewModel,
+                    isBuffering = isBuffering,
+                    isPortrait = isPortrait,
+                    isLive = isLive,
+                    progress = progress,
+                    holdsSurface = holdsSurface
+                )
+
+                Spacer(modifier = Modifier.width(12.dp))
+
+                Column(
+                    modifier = Modifier.weight(1f),
+                    verticalArrangement = Arrangement.Center
+                ) {
+                    Text(
+                        text = video.title,
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.colorScheme.onSurface,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
+                    )
+                    Text(
+                        // A live broadcast has no position to report, so the line
+                        // that would carry one says what it is instead, in the
+                        // accent rather than the red every other app uses: a
+                        // hardcoded red is what the palette system exists to
+                        // prevent, and the word already reads as live on its own.
+                        text = when {
+                            isLive ->
+                                listOf(liveLabel, video.channelName)
+                                    .filter { it.isNotBlank() }
+                                    .joinToString("  •  ")
+                            else -> video.channelName
+                        },
+                        style = MaterialTheme.typography.bodySmall,
+                        color = if (isLive) {
+                            MaterialTheme.colorScheme.primary
+                        } else {
+                            MaterialTheme.colorScheme.onSurfaceVariant
+                        },
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
+                    )
+                }
+            }
+        }
+
+        Spacer(modifier = Modifier.width(6.dp))
+
+        // Play/pause stays live while buffering rather than being
+        // replaced by a spinner the way the music pill's is. Buffering is
+        // already reported on the video itself a few dp to the left, and
+        // two indicators for one state read as two problems; pausing a
+        // video that is still loading is also a thing people do on purpose.
+        FilledIconButton(
+            onClick = {
+                haptics.playPause(!isPlaying)
+                viewModel.togglePlayPause()
+            },
+            modifier = Modifier.size(44.dp),
+            shapes = IconButtonDefaults.shapes(),
+            colors = IconButtonDefaults.filledIconButtonColors(
+                containerColor = MaterialTheme.colorScheme.primaryContainer,
+                contentColor = MaterialTheme.colorScheme.onPrimaryContainer
+            )
+        ) {
+            Icon(
+                imageVector = if (isPlaying) Icons.Rounded.Pause
+                    else Icons.Rounded.PlayArrow,
+                contentDescription = if (isPlaying) pauseLabel else playLabel,
+                modifier = Modifier.size(24.dp)
+            )
+        }
+
+        Spacer(modifier = Modifier.width(6.dp))
+        FilledIconButton(
+            onClick = { viewModel.closePlayer() },
+            modifier = Modifier.size(44.dp),
+            shapes = IconButtonDefaults.shapes(),
+            colors = IconButtonDefaults.filledIconButtonColors(
+                containerColor = MaterialTheme.colorScheme.surfaceVariant,
+                contentColor = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+        ) {
+            Icon(
+                imageVector = Icons.Rounded.Close,
+                contentDescription = stringResource(R.string.mv_close_player),
+                modifier = Modifier.size(22.dp)
+            )
+        }
+    }
+
+}
+
+/**
+ * A neighbouring video as it peeks in during a swipe: its thumbnail in the
+ * frame the playing video occupies, then its title and channel, laid out
+ * exactly like the bar so the one sliding in lands where the other was.
+ */
+@Composable
+private fun MiniVideoNeighbour(video: VideoItem) {
+    Row(
+        modifier = Modifier.fillMaxSize(),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        VideoThumbnail(
+            video = video,
+            modifier = Modifier
+                .width(MINI_VIDEO_THUMB_WIDTH)
+                .aspectRatio(16f / 9f)
+                .clip(RoundedCornerShape(MINI_VIDEO_THUMB_CORNER)),
+            showProgress = false,
+        )
+        Spacer(modifier = Modifier.width(12.dp))
+        Column(
+            modifier = Modifier.weight(1f),
+            verticalArrangement = Arrangement.Center
+        ) {
+            Text(
+                text = video.title,
+                style = MaterialTheme.typography.bodyMedium,
+                color = MaterialTheme.colorScheme.onSurface,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis
+            )
+            Text(
+                text = video.channelName,
+                style = MaterialTheme.typography.bodySmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis
+            )
+        }
+    }
+}
+
+/**
+ * The playing video itself, at bar size, with its position along the bottom.
+ *
+ * **A TextureView, not the SurfaceView `PlayerView` builds by default.** A
+ * SurfaceView is composited in its own layer behind the app window, so it
+ * cannot be clipped by the card around it: its opaque background slab bled out
+ * below the mini bar as a hard dark rectangle, and what looked like a rounded
+ * video was the card showing through a square hole. `surface_type` is only
+ * settable in the constructor, which is the whole reason `mini_video_surface`
+ * is a layout file. The portrait watch page does the same, because the minimize
+ * transition clips and fades it on its way into this bar; fullscreen and HDR
+ * keep their SurfaceView.
+ *
+ * **Fit, not zoom, for a portrait source.** The frame is 16:9 and a vertical
+ * video cropped to it loses its top and bottom, which is exactly where a
+ * vertical upload puts faces and captions - the same reason the watch page
+ * letterboxes past its crop limit rather than filling. A landscape video still
+ * fills, since cropping a 16:9 source into a 16:9 frame removes nothing.
+ */
+@OptIn(UnstableApi::class, ExperimentalMaterial3ExpressiveApi::class)
+@Composable
+private fun MiniVideoSurface(
+    viewModel: VideoPlayerViewModel,
+    isBuffering: Boolean,
+    isPortrait: Boolean,
+    isLive: Boolean,
+    progress: Float,
+    holdsSurface: () -> Boolean
+) {
+    val resizeMode = remember(isPortrait) {
+        if (isPortrait) AspectRatioFrameLayout.RESIZE_MODE_FIT
+        else AspectRatioFrameLayout.RESIZE_MODE_ZOOM
+    }
+    // Zoom needs the frame to know the video's shape, which the player does
+    // not report while Smooth motion's graph is installed (keepKnownAspectRatio).
+    val videoAspectRatio by viewModel.videoAspectRatio.collectAsState()
+
+    Box(
+        modifier = Modifier
+            .width(MINI_VIDEO_THUMB_WIDTH)
+            .aspectRatio(16f / 9f)
+            // PiP entry from the collapsed player must animate from the video
+            // thumbnail, never from a stale expanded-player rectangle or the
+            // whole activity. Window coordinates are what Android expects.
+            .onGloballyPositioned { coordinates ->
+                val bounds = coordinates.boundsInWindow()
+                viewModel.setMiniVideoSurfaceBounds(
+                    android.graphics.Rect(
+                        bounds.left.toInt(),
+                        bounds.top.toInt(),
+                        bounds.right.toInt(),
+                        bounds.bottom.toInt(),
+                    )
+                )
+            }
+            .clip(RoundedCornerShape(MINI_VIDEO_THUMB_CORNER))
+            // Letterbox bars are the absence of picture, not a themed surface,
+            // so they stay black in either theme. The documented exception to
+            // the palette rule, same as the watch page's own video box.
+            .background(Color.Black),
+        contentAlignment = Alignment.Center
+    ) {
+        AndroidView(
+            factory = { ctx ->
+                LayoutInflater.from(ctx)
+                    .inflate(R.layout.mini_video_surface, null) as PlayerView
+            },
+            update = { pv ->
+                pv.resizeMode = resizeMode
+                // Re-bound on every update rather than only at construction:
+                // error recovery can hand the ViewModel a new ExoPlayer, and a
+                // view still holding the old one shows a frozen last frame.
+                // Reading holdsSurface here re-runs this block, not the bar,
+                // when the transition moves the picture.
+                pv.bindVideoSurface(viewModel.exoPlayer, holdsSurface())
+                // After the bind: setPlayer resets the frame's shape.
+                pv.keepKnownAspectRatio(videoAspectRatio)
+            },
+            // Release the shared player before this view's surface goes away,
+            // so expanding and collapsing hand it over cleanly instead of
+            // racing the full player's own view for it.
+            onRelease = { pv ->
+                pv.player = null
+                pv.releaseKnownAspectRatio()
+            },
+            modifier = Modifier.fillMaxSize()
+        )
+
+        if (isBuffering) {
+            // The watch page's own choice over video: it draws its own
+            // container, so it reads over any frame without a colour picked
+            // against the picture.
+            ContainedLoadingIndicator(modifier = Modifier.size(28.dp))
+        }
+
+        // Position rides the bottom edge of the picture, the way it does on a
+        // thumbnail everywhere else in the app, rather than floating as a
+        // hairline across the card. On a 28dp-rounded card a full-bleed line
+        // gets visibly cut at both ends, and an inset one reads as unattached
+        // to anything. Live has no end to be a fraction of, so it shows none.
+        if (!isLive) {
+            val shownProgress by animateFloatAsState(
+                targetValue = progress.coerceIn(0f, 1f),
+                animationSpec = spring(
+                    dampingRatio = Spring.DampingRatioNoBouncy,
+                    stiffness = Spring.StiffnessLow
+                ),
+                label = "miniVideoProgress"
+            )
+            Box(
+                modifier = Modifier
+                    .align(Alignment.BottomStart)
+                    .fillMaxWidth()
+                    .height(3.dp)
+                    .background(Color.White.copy(alpha = 0.28f))
+            ) {
+                Box(
+                    modifier = Modifier
+                        .fillMaxWidth(shownProgress)
+                        .fillMaxHeight()
+                        .background(MaterialTheme.colorScheme.primary)
+                )
+            }
+        }
+    }
+}

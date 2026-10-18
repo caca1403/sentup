@@ -1,0 +1,32 @@
+<?xml version="1.0" encoding="utf-8"?>
+<resources>
+
+    <!--
+        Keep in step with values/themes.xml: transparent bars must be theme-
+        declared or OEM skins (HyperOS/MIUI) draw their own opaque scrim, and
+        the window background is what closes the gap between the splash and the
+        app's first frame. This variant only exists for API 31+, where the
+        splash attributes live; everything else is identical to the base.
+
+        The style was named `Theme.IvorMusic` here - a leftover from the app
+        this was taken from, which meant the API 31+ window used one theme and
+        every other API used another, both derived from `Theme.Sentup`'s name
+        and neither referencing the other.
+    -->
+    <style name="Theme.Sentup" parent="android:Theme.Material.NoActionBar">
+        <item name="android:windowDrawsSystemBarBackgrounds">true</item>
+        <item name="android:statusBarColor">@android:color/transparent</item>
+        <item name="android:navigationBarColor">@android:color/transparent</item>
+        <item name="android:enforceStatusBarContrast">false</item>
+        <item name="android:enforceNavigationBarContrast">false</item>
+        <item name="android:windowBackground">@color/sentup_window</item>
+    </style>
+
+    <!-- Splash Screen Theme (Android 12+) -->
+    <style name="Theme.App.Starting" parent="Theme.SplashScreen">
+        <item name="windowSplashScreenBackground">@color/sentup_window</item>
+        <item name="windowSplashScreenAnimatedIcon">@drawable/avd_splash</item>
+        <item name="windowSplashScreenAnimationDuration">800</item>
+        <item name="postSplashScreenTheme">@style/Theme.Sentup</item>
+    </style>
+</resources>

@@ -1,0 +1,179 @@
+package com.sentup.android.service
+
+import com.sentup.android.data.AudioProfile
+import org.junit.Assert.*
+import org.junit.Test
+
+class TransitionPlannerTest {
+    private fun rhythmic(id: String = "song", bpm: Float = 120f) = AudioProfile(
+        songId = id, durationMs = 180_000L,
+        bpm = bpm, tempoConfidence = 0.9f,
+        outroBpm = bpm, outroTempoConfidence = 0.9f,
+        outroLeadMs = 12_000L,
+    )
+
+    private fun plan(outgoing: AudioProfile?, incoming: AudioProfile?) = TransitionPlanner.plan(
+        fallbackOverlapMs = 3_000L, maximumOverlapMs = 15_000L,
+        outgoing = outgoing, incoming = incoming, outgoingDurationMs = 180_000L,
+    )
+
+    @Test fun `unknown tracks get a clean three second crossfade`() {
+        val result = plan(null, null)
+        assertEquals(3_000L, result.overlapMs)
+        assertEquals(1f, result.incomingSpeed, 0f)
+        assertEquals(0f, result.filterSweepStrength, 0f)
+        assertEquals(0L, result.incomingStartMs)
+    }
+
+    @Test fun `near tempos get bounded pitch preserving speed correction`() {
+        val result = plan(rhythmic(), rhythmic("incoming", 118f))
+        assertEquals(120f / 118f, result.incomingSpeed, 0.0001f)
+        assertTrue(result.overlapMs in 3_001L..15_000L)
+        assertEquals(0L, result.incomingStartMs)
+    }
+
+    @Test fun `incompatible tempos are echoed out over four beats, never blended`() {
+        val result = plan(rhythmic(), rhythmic("incoming", 95f))
+        assertEquals(TransitionPlan.Reason.TEMPO_MISMATCH, result.reason)
+        assertEquals(TransitionStyle.ECHO_OUT, result.style)
+        // 120 bpm: four beats are two seconds, and the echo repeats on the half beat.
+        assertEquals(2_000L, result.overlapMs)
+        assertEquals(250, result.echoDelayMs)
+        assertEquals(1f, result.incomingSpeed, 0f)
+        assertEquals(0f, result.filterSweepStrength, 0f)
+    }
+
+    @Test fun `tempos eight percent apart are matched, further are not`() {
+        val near = plan(rhythmic(), rhythmic("incoming", 112f))
+        assertEquals(120f / 112f, near.incomingSpeed, 0.0001f)
+        assertEquals(TransitionStyle.BASS_SWAP, near.style)
+        val far = plan(rhythmic(), rhythmic("incoming", 108f))
+        assertEquals(1f, far.incomingSpeed, 0f)
+        assertEquals(TransitionStyle.ECHO_OUT, far.style)
+    }
+
+    @Test fun `a long matched blend swaps the bass and a short one does not`() {
+        assertEquals(TransitionStyle.BASS_SWAP, plan(rhythmic(), rhythmic("in", 118f)).style)
+        val short = plan(rhythmic().copy(outroLeadMs = 4_000L), rhythmic("in", 118f))
+        assertEquals(TransitionStyle.BLEND, short.style)
+    }
+
+    @Test fun `a song is left at a confident phrase boundary well before its end`() {
+        val out = rhythmic().copy(
+            outroLeadMs = 28_000L, phraseOutroLeadMs = 28_000L, phraseConfidence = 0.9f,
+        )
+        val result = plan(out, rhythmic("in", 118f))
+        assertEquals(TransitionPlan.Reason.PHRASE_BOUNDARY, result.reason)
+        // The mix starts where the ending starts and lasts no longer than a mix may.
+        assertTrue(result.effectivePrepareLeadMs in 24_000L..32_000L)
+        assertTrue(result.overlapMs <= 15_000L)
+        assertTrue(result.overlapMs < result.effectivePrepareLeadMs)
+    }
+
+    @Test fun `an early ending is not acted on when the keys clash or the tempo is unknown`() {
+        val out = rhythmic().copy(
+            outroLeadMs = 28_000L, phraseOutroLeadMs = 28_000L, phraseConfidence = 0.9f,
+            keyPitchClass = 0, keyMode = "major", keyConfidence = 0.9f,
+        )
+        val clash = rhythmic("in").copy(keyPitchClass = 1, keyMode = "major", keyConfidence = 0.9f)
+        val clashed = plan(out, clash)
+        assertTrue(clashed.effectivePrepareLeadMs <= 3_000L)
+        val unknownTempo = plan(out.copy(outroBpm = null), rhythmic("in"))
+        assertTrue(unknownTempo.effectivePrepareLeadMs <= 3_000L)
+    }
+
+    @Test fun `a lone energy dip does not authorize a twelve second mix`() {
+        val result = plan(AudioProfile("out", outroLeadMs = 12_000L), null)
+        assertEquals(TransitionPlan.Reason.FALLBACK, result.reason)
+        assertEquals(3_000L, result.overlapMs)
+    }
+
+    @Test fun `natural fade stays brief without filter or tempo processing`() {
+        val result = plan(rhythmic().copy(tailFadeMs = 2_000L), rhythmic("in", 118f))
+        assertEquals(1_000L, result.overlapMs)
+        assertEquals(1f, result.incomingSpeed, 0f)
+        assertEquals(0f, result.filterSweepStrength, 0f)
+    }
+
+    @Test fun `sequential album playback preserves both ends even without analysis`() {
+        val result = TransitionPlanner.plan(
+            3_000L, outgoing = null, incoming = null, preserveAlbumSequence = true,
+        )
+        assertEquals(TransitionPlan.Reason.PRESERVE_ALBUM, result.reason)
+        assertFalse(result.shouldOverlap)
+        assertEquals(0L, result.incomingStartMs)
+    }
+
+    @Test fun `incoming interlude limits overlap to a quarter of its duration`() {
+        val result = plan(rhythmic(), rhythmic("in").copy(durationMs = 16_000L))
+        assertTrue(result.overlapMs in 750L..4_000L)
+    }
+
+    @Test fun `a two second incoming track is not swallowed by a transition`() {
+        assertFalse(plan(rhythmic(), rhythmic("in").copy(durationMs = 2_000L)).shouldOverlap)
+    }
+
+    @Test fun `bad tempo data cannot cause invalid speed or an endless cue search`() {
+        for (bpm in listOf(Float.NaN, Float.POSITIVE_INFINITY, 0f, -120f)) {
+            val result = plan(rhythmic(), rhythmic("in", bpm))
+            assertEquals(1f, result.incomingSpeed, 0f)
+            assertTrue(result.overlapMs <= 3_000L)
+        }
+    }
+
+    @Test fun `a confident key clash shortens even a compatible tempo pair`() {
+        val out = rhythmic().copy(keyPitchClass = 0, keyMode = "major", keyConfidence = 0.9f)
+        val incoming = rhythmic("in").copy(keyPitchClass = 1, keyMode = "major", keyConfidence = 0.9f)
+        val result = plan(out, incoming)
+        assertEquals(TransitionPlan.HarmonicMatch.CLASH, result.harmonicMatch)
+        assertTrue(result.overlapMs <= 3_000L)
+    }
+
+    @Test fun `relative major and minor keys are compatible`() {
+        val out = rhythmic().copy(keyPitchClass = 0, keyMode = "major", keyConfidence = 0.9f)
+        val incoming = rhythmic("in").copy(keyPitchClass = 9, keyMode = "minor", keyConfidence = 0.9f)
+        assertEquals(TransitionPlan.HarmonicMatch.COMPATIBLE, plan(out, incoming).harmonicMatch)
+    }
+
+    @Test fun `uncertain downbeat uses the beat grid without skipping a pickup`() {
+        val out = rhythmic().copy(outroLeadMs = 8_000L, outroDownbeatConfidence = 0.9f)
+        val incoming = rhythmic("in").copy(downbeatOffsetMs = 500L, downbeatConfidence = 0.9f)
+        val bars = plan(out, incoming)
+        val beats = plan(out, incoming.copy(downbeatConfidence = 0f))
+        assertEquals(0L, bars.incomingStartMs)
+        assertEquals(0L, beats.incomingStartMs)
+        assertEquals(500L, bars.incomingDownbeatDelayMs)
+        assertEquals(0L, beats.incomingDownbeatDelayMs)
+        assertTrue(bars.overlapMs < beats.overlapMs)
+    }
+
+    @Test fun `a chosen playback speed shortens the wall clock beat delay`() {
+        val out = rhythmic().copy(outroLeadMs = 8_000L, outroDownbeatConfidence = 0.9f)
+        val incoming = rhythmic("in").copy(downbeatOffsetMs = 500L, downbeatConfidence = 0.9f)
+        val normal = plan(out, incoming)
+        val doubled = TransitionPlanner.plan(
+            fallbackOverlapMs = 3_000L, maximumOverlapMs = 15_000L,
+            outgoing = out, incoming = incoming, outgoingDurationMs = 180_000L,
+            baseSpeed = 2f,
+        )
+        // The downbeat is in the same place on the source timeline either way.
+        // At twice the rate it simply arrives in half the time, and a delay
+        // measured as though the track were playing at its recorded speed
+        // would hold the incoming track back for twice as long as the music
+        // it is meant to land on.
+        assertEquals(500L, normal.incomingDownbeatDelayMs)
+        assertEquals(250L, doubled.incomingDownbeatDelayMs)
+        // Matching one tempo to the other is a ratio between two tracks that
+        // are both sped up, so it is untouched by the user's rate.
+        assertEquals(normal.incomingSpeed, doubled.incomingSpeed, 0.0001f)
+    }
+
+    @Test fun `silence skip uses a short unprocessed overlap`() {
+        val result = plan(rhythmic().copy(trailingSilenceMs = 60_000L), rhythmic("in", 118f))
+        assertEquals(TransitionPlan.Reason.SILENCE_SKIP, result.reason)
+        assertEquals(60_000L, result.effectivePrepareLeadMs)
+        assertEquals(1_000L, result.overlapMs)
+        assertEquals(1f, result.incomingSpeed, 0f)
+        assertEquals(0f, result.filterSweepStrength, 0f)
+    }
+}

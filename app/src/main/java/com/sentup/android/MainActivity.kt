@@ -1,0 +1,2083 @@
+package com.sentup.android
+
+import com.sentup.android.ui.components.hiddenFraction
+import com.sentup.android.ui.components.DismissibleSnackbarHost
+import android.content.Intent
+import android.os.Build
+import android.os.Bundle
+import android.view.WindowManager
+import androidx.activity.ComponentActivity
+import androidx.activity.compose.setContent
+import androidx.activity.enableEdgeToEdge
+import androidx.compose.animation.slideInHorizontally
+import androidx.compose.animation.slideOutHorizontally
+import androidx.compose.animation.fadeIn
+import androidx.compose.animation.fadeOut
+import androidx.compose.foundation.background
+import androidx.compose.foundation.shape.RoundedCornerShape
+import androidx.compose.runtime.LaunchedEffect
+import androidx.compose.material3.AlertDialog
+import androidx.compose.material3.Button
+import androidx.compose.material3.Icon
+import androidx.compose.material3.MaterialTheme
+import androidx.compose.material3.SnackbarDuration
+import androidx.compose.material3.SnackbarHostState
+import androidx.compose.material3.SnackbarResult
+import androidx.compose.material3.Text
+import androidx.compose.material3.TextButton
+import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.rounded.BugReport
+import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.res.stringResource
+import androidx.compose.runtime.Composable
+import androidx.compose.runtime.collectAsState
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.setValue
+import androidx.compose.runtime.remember
+import androidx.lifecycle.viewmodel.compose.viewModel
+import androidx.navigation.compose.NavHost
+import androidx.navigation.compose.currentBackStackEntryAsState
+import androidx.navigation.compose.composable
+import androidx.navigation.compose.rememberNavController
+import androidx.compose.foundation.layout.Box
+import androidx.compose.foundation.layout.fillMaxSize
+import androidx.compose.foundation.layout.fillMaxWidth
+import androidx.compose.foundation.layout.navigationBarsPadding
+import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.size
+import androidx.compose.ui.Alignment
+import androidx.compose.ui.Modifier
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.layout.ContentScale
+import androidx.compose.ui.text.font.FontWeight
+import com.sentup.android.data.LocalVideo
+import com.sentup.android.data.Song
+import com.sentup.android.data.hasWatchableVideo
+import com.sentup.android.data.toVideoItem
+import com.sentup.android.data.VideoItem
+import com.sentup.android.ui.home.HomeScreen
+import com.sentup.android.ui.home.HomeViewModel
+import com.sentup.android.ui.player.PlayerViewModel
+import kotlinx.coroutines.flow.collectLatest
+import com.sentup.android.ui.theme.SentupTheme
+import com.sentup.android.ui.theme.PaletteStyle
+import com.sentup.android.ui.theme.ThemeViewModel
+import com.sentup.android.data.MotionArtworkQuality
+import com.sentup.android.data.PlayerStyle
+import androidx.compose.ui.unit.dp
+
+
+import androidx.compose.foundation.isSystemInDarkTheme
+import com.sentup.android.ui.theme.ThemeMode
+
+import androidx.core.splashscreen.SplashScreen.Companion.installSplashScreen
+import androidx.lifecycle.lifecycleScope
+import kotlinx.coroutines.delay
+import kotlinx.coroutines.isActive
+import kotlinx.coroutines.launch
+import com.sentup.android.ui.onboarding.OnboardingScreen
+import com.sentup.android.ui.video.enterPipMode
+import com.sentup.android.ui.share.PendingSharedLink
+import com.sentup.android.ui.share.SharedLinkHandler
+import com.sentup.android.ui.share.sharedLinkText
+import com.sentup.android.ui.video.PendingExternalVideo
+import com.sentup.android.ui.video.externalVideoUri
+
+/**
+ * Height the floating navigation bar occupies at the bottom of the Home
+ * screen, above the system navigation inset: the toolbar itself plus the 20dp
+ * it is padded away from the inset.
+ *
+ * Here rather than in `HomeScreen` because the thing that needs it is the
+ * video overlay, which is drawn above the NavHost and cannot see inside the
+ * screen that draws the bar.
+ */
+private val EXPRESSIVE_NAV_BAR_RESERVE = 84.dp
+
+/** Material 3's standard navigation container height, excluding system insets. */
+private val NON_EXPRESSIVE_NAV_BAR_RESERVE = 80.dp
+
+/** Height the collapsed music player occupies above the navigation bar. */
+private val MUSIC_PILL_RESERVE = 88.dp
+
+class MainActivity : ComponentActivity() {
+
+    // A YouTube link shared or opened into Sentüp, picked up by SharedLinkHandler
+    // inside the composition. Snapshot state so a link arriving while the app is
+    // already running reaches the UI without restarting anything.
+    private var pendingSharedLink by androidx.compose.runtime.mutableStateOf<PendingSharedLink?>(null)
+    private var sharedLinkCounter = 0L
+
+    // A video file handed to Sentüp by another app - an "open with", or a video
+    // shared in. Separate from the link above because it is answered by playing
+    // a file rather than by resolving anything, and the two can never both be
+    // present on one intent.
+    private var pendingExternalVideo by androidx.compose.runtime.mutableStateOf<PendingExternalVideo?>(null)
+
+    // True while the app is in system Picture-in-Picture. Held here rather than
+    // inside the video overlay because the whole app has to stand down in PiP:
+    // the NavHost used to keep composing and animating behind the window, and
+    // any gap around the video showed app chrome instead of black.
+    private var isInPipMode by androidx.compose.runtime.mutableStateOf(false)
+
+    // Set by the video player so onUserLeaveHint can enter PiP on Android 11,
+    // where setAutoEnterEnabled does not exist. The controller has already
+    // installed the active surface bounds and the full transport action set.
+    private var pipEligible = false
+
+    /**
+     * The daily time limit's lock state, evaluated by [tickAppTime] every 30
+     * seconds while foregrounded (and once at start). Snapshot state so the
+     * overlay in MusicApp reacts without any flow plumbing; the underlying
+     * decision always fresh-reads preferences, so budget changes apply on the
+     * next tick.
+     */
+    private var appTimeLocked by androidx.compose.runtime.mutableStateOf(false)
+    private var foregroundedAtMs = 0L
+    private var appTimeTicker: kotlinx.coroutines.Job? = null
+
+    override fun onCreate(savedInstanceState: Bundle?) {
+        val splashScreen = installSplashScreen()
+        super.onCreate(savedInstanceState)
+
+        // A fresh launch from the launcher opens in the mode the user chose in
+        // Settings. Not on a recreation (rotation, theme change), and not for a
+        // shortcut or a shared link, which say where they want to land.
+        if (savedInstanceState == null &&
+            intent?.action == android.content.Intent.ACTION_MAIN &&
+            intent?.hasCategory(android.content.Intent.CATEGORY_LAUNCHER) == true &&
+            intent?.data == null
+        ) {
+            com.sentup.android.data.ThemePreferences(applicationContext).applyStartMode()
+        }
+
+        takeSharedLink(intent)
+        // Off the main thread: publishing is a binder call into the launcher.
+        Thread { com.sentup.android.util.ModeShortcuts.publish(applicationContext) }.start()
+
+        // Remove splash instantly when ready — the AVD entrance animation is the show
+        splashScreen.setOnExitAnimationListener { it.remove() }
+
+        // Large screens follow the device; phones stay portrait unless
+        // Settings, Appearance, "Rotate with device" is on (AppOrientation).
+        // The video watch page still holds portrait while it is open and
+        // requests landscape for fullscreen; every exit hands back to this
+        // policy rather than to a hardcoded portrait.
+        com.sentup.android.ui.theme.AppOrientation.apply(this)
+
+        enableEdgeToEdge()
+        // Treat camera cutouts as usable edge-to-edge space everywhere. The
+        // old video-only toggle restored DEFAULT on exit, which could
+        // letterbox the rest of the app for the remainder of the session.
+        // Controls still handle status/navigation bars independently; only
+        // the notch-specific exclusion is deliberately ignored.
+        window.attributes = window.attributes.also {
+            it.layoutInDisplayCutoutMode =
+                WindowManager.LayoutParams.LAYOUT_IN_DISPLAY_CUTOUT_MODE_ALWAYS
+        }
+
+        setContent {
+            val themeViewModel: ThemeViewModel = viewModel()
+            val themeMode by themeViewModel.themeMode.collectAsState()
+            val amoledTheme by themeViewModel.amoledTheme.collectAsState()
+            val colorPalette by themeViewModel.colorPalette.collectAsState()
+            val paletteStyle by themeViewModel.paletteStyle.collectAsState()
+            val appIcon by themeViewModel.appIcon.collectAsState()
+            val loadLocalSongs by themeViewModel.loadLocalSongs.collectAsState()
+            val ambientBackground by themeViewModel.ambientBackground.collectAsState()
+            val motionArtwork by themeViewModel.motionArtwork.collectAsState()
+            val motionArtworkWifiOnly by themeViewModel.motionArtworkWifiOnly.collectAsState()
+            val motionArtworkQuality by themeViewModel.motionArtworkQuality.collectAsState()
+            val waveformSeekBar by themeViewModel.waveformSeekBar.collectAsState()
+            val playerArtworkColors by themeViewModel.playerArtworkColors.collectAsState()
+            val videoMode by themeViewModel.videoMode.collectAsState()
+            val homeModeToggleEnabled by themeViewModel.homeModeToggleEnabled.collectAsState()
+            val videoHomeConfiguration by themeViewModel.videoHomeConfiguration.collectAsState()
+            val playerStyle by themeViewModel.playerStyle.collectAsState()
+            val saveVideoHistory by themeViewModel.saveVideoHistory.collectAsState()
+            val saveMusicHistory by themeViewModel.saveMusicHistory.collectAsState()
+            val liveDownloadUpdates by themeViewModel.liveDownloadUpdates.collectAsState()
+            val livePlaybackUpdates by themeViewModel.livePlaybackUpdates.collectAsState()
+            val timedCommentsEnabled by themeViewModel.timedCommentsEnabled.collectAsState()
+            val showRecentSearches by themeViewModel.showRecentSearches.collectAsState()
+            val showRelatedVideos by themeViewModel.showRelatedVideos.collectAsState()
+            val inlinePreviews by themeViewModel.inlinePreviews.collectAsState()
+            val compactVideoHome by themeViewModel.compactVideoHome.collectAsState()
+            val playlistSwipeEnabled by themeViewModel.playlistSwipeEnabled.collectAsState()
+            val playlistSwipeStartAction by themeViewModel.playlistSwipeStartAction.collectAsState()
+            val playlistSwipeEndAction by themeViewModel.playlistSwipeEndAction.collectAsState()
+            val shortsEnabled by themeViewModel.shortsEnabled.collectAsState()
+            val shortsHardBlock by themeViewModel.shortsHardBlock.collectAsState()
+            val returnDislike by themeViewModel.returnDislike.collectAsState()
+            val contentRegion by themeViewModel.contentRegion.collectAsState()
+            val shortsHiddenActions by themeViewModel.shortsHiddenActions.collectAsState()
+            val videoQualityWifi by themeViewModel.videoQualityWifi.collectAsState()
+            val videoQualityMobile by themeViewModel.videoQualityMobile.collectAsState()
+            val preferHdr by themeViewModel.preferHdr.collectAsState()
+            val frameInterpolation by themeViewModel.frameInterpolation.collectAsState()
+            val frameInterpolationMaxFps by themeViewModel.frameInterpolationMaxFps.collectAsState()
+            val musicQualityWifi by themeViewModel.musicQualityWifi.collectAsState()
+            val musicQualityMobile by themeViewModel.musicQualityMobile.collectAsState()
+            val spotlightHome by themeViewModel.spotlightHome.collectAsState()
+            val uiScale by themeViewModel.uiScale.collectAsState()
+            val lyricsConfiguration by themeViewModel.lyricsConfiguration.collectAsState()
+            val sponsorBlockEnabled by themeViewModel.sponsorBlockEnabled.collectAsState()
+            val sponsorBlockActions by themeViewModel.sponsorBlockActions.collectAsState()
+            val sponsorBlockShowOnSeekBar by
+                themeViewModel.sponsorBlockShowOnSeekBar.collectAsState()
+            val sponsorBlockNotice by themeViewModel.sponsorBlockNotice.collectAsState()
+            val sponsorBlockMinDurationMs by
+                themeViewModel.sponsorBlockMinDurationMs.collectAsState()
+            val nonExpressiveNavigationBar by
+                themeViewModel.nonExpressiveNavigationBar.collectAsState()
+            val rotateWithDevice by themeViewModel.rotateWithDevice.collectAsState()
+            // Re-applied when the switch moves and when the device changes
+            // class under the activity (a foldable opening), which does not
+            // recreate it because smallestScreenSize is in configChanges.
+            val smallestWidthDp = androidx.compose.ui.platform.LocalConfiguration.current
+                .smallestScreenWidthDp
+            LaunchedEffect(rotateWithDevice, smallestWidthDp) {
+                com.sentup.android.ui.theme.AppOrientation.apply(this@MainActivity)
+            }
+            val subscriptionSource by themeViewModel.subscriptionSource.collectAsState()
+            val subscribeTarget by themeViewModel.subscribeTarget.collectAsState()
+            val fastSubscriptionFeed by themeViewModel.fastSubscriptionFeed.collectAsState()
+            val subscriptionRefresh by themeViewModel.subscriptionRefresh.collectAsState()
+            val excludedFolders by themeViewModel.excludedFolders.collectAsState()
+            val oemFixEnabled by themeViewModel.oemFixEnabled.collectAsState()
+            val manualScanEnabled by themeViewModel.manualScanEnabled.collectAsState()
+            val privateDownloadsEnabled by
+                themeViewModel.privateDownloadsEnabled.collectAsState()
+            val onboardingCompleted by themeViewModel.onboardingCompleted.collectAsState()
+            val localOnlyMode by themeViewModel.localOnlyMode.collectAsState()
+            
+            val cacheEnabled by themeViewModel.cacheEnabled.collectAsState()
+            val videoCacheEnabled by themeViewModel.videoCacheEnabled.collectAsState()
+            val shortsCacheEnabled by themeViewModel.shortsCacheEnabled.collectAsState()
+            val playbackPreloadEnabled by themeViewModel.playbackPreloadEnabled.collectAsState()
+            val maxCacheSizeMb by themeViewModel.maxCacheSizeMb.collectAsState()
+            val currentCacheSize by themeViewModel.currentCacheSizeBytes.collectAsState()
+            val autoLoadQueue by themeViewModel.autoLoadQueue.collectAsState()
+            val crossfadeEnabled by themeViewModel.crossfadeEnabled.collectAsState()
+            val crossfadeAuto by themeViewModel.crossfadeAuto.collectAsState()
+            val crossfadeDurationMs by themeViewModel.crossfadeDurationMs.collectAsState()
+            val normalizeVolume by themeViewModel.normalizeVolume.collectAsState()
+            val discordPresence by themeViewModel.discordPresence.collectAsState()
+            val rememberVideoBrightness by themeViewModel.rememberVideoBrightness.collectAsState()
+            val pipButtons by themeViewModel.pipButtons.collectAsState()
+            val hapticsLevel by themeViewModel.hapticsLevel.collectAsState()
+            val uploadNotificationsEnabled by themeViewModel.uploadNotificationsEnabled.collectAsState()
+            
+            val isSystemDark = isSystemInDarkTheme()
+            val isDarkTheme = remember(themeMode, isSystemDark) {
+                when (themeMode) {
+                    ThemeMode.SYSTEM -> isSystemDark
+                    ThemeMode.LIGHT -> false
+                    ThemeMode.DARK -> true
+                }
+            }
+            
+            // Album colours across the app, in music mode: the playing song's
+            // cover colour becomes the seed of the whole scheme. The player
+            // ViewModel is the activity's own, the same instance MusicApp
+            // asks for below, read here because the theme sits above it.
+            val artworkColorsWholeApp by themeViewModel.artworkColorsWholeApp.collectAsState()
+            val albumThemeWholeApp = playerArtworkColors && artworkColorsWholeApp
+            val themePlayerViewModel: PlayerViewModel = viewModel {
+                PlayerViewModel(applicationContext)
+            }
+            val themeSong by themePlayerViewModel.currentSong.collectAsState()
+            val albumSeed = com.sentup.android.ui.player.rememberArtworkSeed(
+                enabled = albumThemeWholeApp && !videoMode,
+                albumArtUri = themeSong?.let { it.albumArtUri?.toString() ?: it.thumbnailUrl }
+            )
+
+            SentupTheme(
+                darkTheme = isDarkTheme,
+                colorPalette = colorPalette,
+                amoledDark = amoledTheme,
+                uiScale = uiScale,
+                paletteStyle = paletteStyle,
+                artworkSeed = albumSeed,
+                // Music mode only: in video mode the app keeps its palette, and
+                // a playlist page there tints its accents as it did before.
+                artworkWholeApp = albumThemeWholeApp && !videoMode
+            ) {
+                val videoListLayout by themeViewModel.videoListLayout.collectAsState()
+                // Every link Sentüp draws goes through LocalUriHandler, so this
+                // is the one place a YouTube URL is kept in the app rather than
+                // handed to the browser or the YouTube app. Anything the link
+                // parser cannot act on still leaves, as before.
+                val platformUriHandler = androidx.compose.ui.platform.LocalUriHandler.current
+                val inAppUriHandler = androidx.compose.runtime.remember(platformUriHandler) {
+                    object : androidx.compose.ui.platform.UriHandler {
+                        override fun openUri(uri: String) {
+                            if (com.sentup.android.data.YouTubeLinkParser.parse(uri) != null) {
+                                openLinkInApp(uri)
+                            } else {
+                                runCatching { platformUriHandler.openUri(uri) }
+                                    .onFailure {
+                                        com.sentup.android.util.KLog.w("MainActivity", "No handler for $uri", it)
+                                    }
+                            }
+                        }
+                    }
+                }
+                androidx.compose.runtime.CompositionLocalProvider(
+                    com.sentup.android.ui.video.LocalVideoListLayout provides videoListLayout,
+                    androidx.compose.ui.platform.LocalUriHandler provides inAppUriHandler
+                ) {
+                Box(modifier = Modifier.fillMaxSize()) {
+                    MusicApp(
+                        pendingSharedLink = pendingSharedLink,
+                        pendingExternalVideo = pendingExternalVideo,
+                        isInPipMode = isInPipMode,
+                        appTimeLocked = appTimeLocked,
+                        onPipStateChanged = { eligible -> pipEligible = eligible },
+                        currentThemeMode = themeMode,
+                        onThemeModeChange = { themeViewModel.setThemeMode(it) },
+                        amoledTheme = amoledTheme,
+                        onAmoledThemeToggle = { themeViewModel.setAmoledTheme(it) },
+                        colorPalette = colorPalette,
+                        onColorPaletteChange = { themeViewModel.setColorPalette(it) },
+                        paletteStyle = paletteStyle,
+                        onPaletteStyleChange = { themeViewModel.setPaletteStyle(it) },
+                        appIcon = appIcon,
+                        isDarkMode = isDarkTheme, // Derived for compatibility
+                        onThemeToggle = { isDark ->
+                            themeViewModel.setThemeMode(if (isDark) ThemeMode.DARK else ThemeMode.LIGHT)
+                        },
+                        loadLocalSongs = loadLocalSongs,
+                        onLoadLocalSongsToggle = { themeViewModel.setLoadLocalSongs(it) },
+                        ambientBackground = ambientBackground,
+                        onAmbientBackgroundToggle = { themeViewModel.setAmbientBackground(it) },
+                        playerArtworkColors = playerArtworkColors,
+                        onPlayerArtworkColorsToggle = { themeViewModel.setPlayerArtworkColors(it) },
+                        motionArtwork = motionArtwork,
+                        onMotionArtworkToggle = themeViewModel::setMotionArtwork,
+                        motionArtworkWifiOnly = motionArtworkWifiOnly,
+                        onMotionArtworkWifiOnlyToggle = themeViewModel::setMotionArtworkWifiOnly,
+                        motionArtworkQuality = motionArtworkQuality,
+                        onMotionArtworkQualityChange = themeViewModel::setMotionArtworkQuality,
+                        waveformSeekBar = waveformSeekBar,
+                        onWaveformSeekBarToggle = themeViewModel::setWaveformSeekBar,
+                        videoMode = videoMode,
+                        onVideoModeToggle = { themeViewModel.setVideoMode(it) },
+                        homeModeToggleEnabled = homeModeToggleEnabled,
+                        onHomeModeToggleEnabledChange = { themeViewModel.setHomeModeToggleEnabled(it) },
+                        videoHomeConfiguration = videoHomeConfiguration,
+                        onVideoRecommendationsEnabledChange = {
+                            themeViewModel.setVideoRecommendationsEnabled(it)
+                        },
+                        onVideoHomeDestinationVisibleChange = { destination, visible ->
+                            themeViewModel.setVideoHomeDestinationVisible(destination, visible)
+                        },
+                        onMoveVideoHomeDestination = { destination, delta ->
+                            themeViewModel.moveVideoHomeDestination(destination, delta)
+                        },
+                        spotlightHome = spotlightHome,
+                        uiScale = uiScale,
+                        onUiScaleChange = { themeViewModel.setUiScale(it) },
+                        lyricsConfiguration = lyricsConfiguration,
+                        onLyricsConfigurationChange = themeViewModel::setLyricsConfiguration,
+                        sponsorBlockEnabled = sponsorBlockEnabled,
+                        onSponsorBlockEnabledToggle = { themeViewModel.setSponsorBlockEnabled(it) },
+                        sponsorBlockActions = sponsorBlockActions,
+                        onSponsorBlockActionChange = { category, action ->
+                            themeViewModel.setSponsorBlockAction(category, action)
+                        },
+                        onResetSponsorBlockActions = { themeViewModel.resetSponsorBlockActions() },
+                        sponsorBlockShowOnSeekBar = sponsorBlockShowOnSeekBar,
+                        onSponsorBlockShowOnSeekBarToggle = {
+                            themeViewModel.setSponsorBlockShowOnSeekBar(it)
+                        },
+                        sponsorBlockNotice = sponsorBlockNotice,
+                        onSponsorBlockNoticeToggle = { themeViewModel.setSponsorBlockNotice(it) },
+                        sponsorBlockMinDurationMs = sponsorBlockMinDurationMs,
+                        onSponsorBlockMinDurationChange = {
+                            themeViewModel.setSponsorBlockMinDurationMs(it)
+                        },
+                        onSpotlightHomeToggle = { themeViewModel.setSpotlightHome(it) },
+                        nonExpressiveNavigationBar = nonExpressiveNavigationBar,
+                        onNonExpressiveNavigationBarToggle = {
+                            themeViewModel.setNonExpressiveNavigationBar(it)
+                        },
+                        rotateWithDevice = rotateWithDevice,
+                        onRotateWithDeviceToggle = themeViewModel::setRotateWithDevice,
+                        playerStyle = playerStyle,
+                        onPlayerStyleChange = { themeViewModel.setPlayerStyle(it) },
+                        saveVideoHistory = saveVideoHistory,
+                        onSaveVideoHistoryToggle = { themeViewModel.setSaveVideoHistory(it) },
+                        saveMusicHistory = saveMusicHistory,
+                        onSaveMusicHistoryToggle = { themeViewModel.setSaveMusicHistory(it) },
+                        liveDownloadUpdates = liveDownloadUpdates,
+                        onLiveDownloadUpdatesToggle = { themeViewModel.setLiveDownloadUpdates(it) },
+                        livePlaybackUpdates = livePlaybackUpdates,
+                        onLivePlaybackUpdatesToggle = { themeViewModel.setLivePlaybackUpdates(it) },
+                        timedCommentsEnabled = timedCommentsEnabled,
+                        onTimedCommentsToggle = { themeViewModel.setTimedCommentsEnabled(it) },
+                        showRecentSearches = showRecentSearches,
+                        onShowRecentSearchesToggle = { themeViewModel.setShowRecentSearches(it) },
+                        showRelatedVideos = showRelatedVideos,
+                        onShowRelatedVideosToggle = { themeViewModel.setShowRelatedVideos(it) },
+                        inlinePreviews = inlinePreviews,
+                        onInlinePreviewsToggle = { themeViewModel.setInlinePreviews(it) },
+                        compactVideoHome = compactVideoHome,
+                        onCompactVideoHomeToggle = { themeViewModel.setCompactVideoHome(it) },
+                        playlistSwipeEnabled = playlistSwipeEnabled,
+                        onPlaylistSwipeEnabledToggle = { themeViewModel.setPlaylistSwipeEnabled(it) },
+                        playlistSwipeStartAction = playlistSwipeStartAction,
+                        onPlaylistSwipeStartActionChange = { themeViewModel.setPlaylistSwipeStartAction(it) },
+                        playlistSwipeEndAction = playlistSwipeEndAction,
+                        onPlaylistSwipeEndActionChange = { themeViewModel.setPlaylistSwipeEndAction(it) },
+                        shortsEnabled = shortsEnabled,
+                        onShortsEnabledToggle = { themeViewModel.setShortsEnabled(it) },
+                        shortsHardBlock = shortsHardBlock,
+                        onShortsHardBlockToggle = { themeViewModel.setShortsHardBlock(it) },
+                        returnDislike = returnDislike,
+                        onReturnDislikeToggle = { themeViewModel.setReturnDislike(it) },
+                        contentRegion = contentRegion,
+                        onContentRegionChange = { themeViewModel.setContentRegion(it) },
+                        shortsHiddenActions = shortsHiddenActions,
+                        onShortsHiddenActionsChange = { themeViewModel.setShortsHiddenActions(it) },
+                        videoQualityWifi = videoQualityWifi,
+                        onVideoQualityWifiChange = { themeViewModel.setVideoQualityWifi(it) },
+                        videoQualityMobile = videoQualityMobile,
+                        onVideoQualityMobileChange = { themeViewModel.setVideoQualityMobile(it) },
+                        preferHdr = preferHdr,
+                        onPreferHdrToggle = { themeViewModel.setPreferHdr(it) },
+                        frameInterpolation = frameInterpolation,
+                        onFrameInterpolationToggle = { themeViewModel.setFrameInterpolation(it) },
+                        frameInterpolationMaxFps = frameInterpolationMaxFps,
+                        onFrameInterpolationMaxFpsChange = { themeViewModel.setFrameInterpolationMaxFps(it) },
+                        musicQualityWifi = musicQualityWifi,
+                        onMusicQualityWifiChange = { themeViewModel.setMusicQualityWifi(it) },
+                        musicQualityMobile = musicQualityMobile,
+                        onMusicQualityMobileChange = { themeViewModel.setMusicQualityMobile(it) },
+                        subscriptionSource = subscriptionSource,
+                        onSubscriptionSourceChange = { themeViewModel.setSubscriptionSource(it) },
+                        subscribeTarget = subscribeTarget,
+                        onSubscribeTargetChange = { themeViewModel.setSubscribeTarget(it) },
+                        fastSubscriptionFeed = fastSubscriptionFeed,
+                        onFastSubscriptionFeedToggle = { themeViewModel.setFastSubscriptionFeed(it) },
+                        subscriptionRefresh = subscriptionRefresh,
+                        onSubscriptionRefreshChange = { themeViewModel.setSubscriptionRefresh(it) },
+                        excludedFolders = excludedFolders,
+                        onAddExcludedFolder = { themeViewModel.addExcludedFolder(it) },
+                        onRemoveExcludedFolder = { themeViewModel.removeExcludedFolder(it) },
+                        oemFixEnabled = oemFixEnabled,
+                        onOemFixEnabledToggle = { themeViewModel.setOemFixEnabled(it) },
+                        manualScanEnabled = manualScanEnabled,
+                        onManualScanEnabledToggle = { themeViewModel.setManualScanEnabled(it) },
+                        privateDownloadsEnabled = privateDownloadsEnabled,
+                        onPrivateDownloadsEnabledToggle = {
+                            themeViewModel.setPrivateDownloadsEnabled(it)
+                        },
+                        cacheEnabled = cacheEnabled,
+                        onCacheEnabledToggle = { themeViewModel.setCacheEnabled(it) },
+                        videoCacheEnabled = videoCacheEnabled,
+                        onVideoCacheEnabledToggle = { themeViewModel.setVideoCacheEnabled(it) },
+                        shortsCacheEnabled = shortsCacheEnabled,
+                        onShortsCacheEnabledToggle = { themeViewModel.setShortsCacheEnabled(it) },
+                        playbackPreloadEnabled = playbackPreloadEnabled,
+                        onPlaybackPreloadEnabledToggle = { themeViewModel.setPlaybackPreloadEnabled(it) },
+                        maxCacheSizeMb = maxCacheSizeMb,
+                        onMaxCacheSizeMbChange = { themeViewModel.setMaxCacheSizeMb(it) },
+                        currentCacheSize = currentCacheSize,
+                        onClearCacheClick = { themeViewModel.clearCacheAction() },
+                        onClearVideoCacheClick = {
+                            lifecycleScope.launch(kotlinx.coroutines.Dispatchers.IO) {
+                                com.sentup.android.data.CacheManager.clearVideoCache(shorts = false)
+                            }
+                        },
+                        onClearShortsCacheClick = {
+                            lifecycleScope.launch(kotlinx.coroutines.Dispatchers.IO) {
+                                com.sentup.android.data.CacheManager.clearVideoCache(shorts = true)
+                            }
+                        },
+                        autoLoadQueue = autoLoadQueue,
+                        onAutoLoadQueueToggle = { themeViewModel.setAutoLoadQueue(it) },
+                        crossfadeEnabled = crossfadeEnabled,
+                        onCrossfadeEnabledToggle = { themeViewModel.setCrossfadeEnabled(it) },
+                        crossfadeAuto = crossfadeAuto,
+                        onCrossfadeAutoChange = { themeViewModel.setCrossfadeAuto(it) },
+                        crossfadeDurationMs = crossfadeDurationMs,
+                        onCrossfadeDurationChange = { themeViewModel.setCrossfadeDuration(it) },
+                        normalizeVolume = normalizeVolume,
+                        onNormalizeVolumeToggle = { themeViewModel.setNormalizeVolume(it) },
+                        discordPresence = discordPresence,
+                        onDiscordPresenceToggle = { themeViewModel.setDiscordPresence(it) },
+                        rememberVideoBrightness = rememberVideoBrightness,
+                        onRememberVideoBrightnessToggle =
+                            { themeViewModel.setRememberVideoBrightness(it) },
+                        pipButtons = pipButtons,
+                        onPipButtonsChange = { themeViewModel.setPipButtons(it) },
+                        hapticsLevel = hapticsLevel,
+                        onHapticsLevelChange = { themeViewModel.setHapticsLevel(it) },
+                        uploadNotificationsEnabled = uploadNotificationsEnabled,
+                        onUploadNotificationsToggle =
+                            { themeViewModel.setUploadNotificationsEnabled(it) },
+                        onboardingCompleted = onboardingCompleted,
+                        onOnboardingCompleted = { themeViewModel.setOnboardingCompleted(it) },
+                        localOnlyMode = localOnlyMode,
+                        onLocalOnlyModeToggle = { themeViewModel.setLocalOnlyMode(it) }
+                    )
+                }
+                }
+            }
+        }
+    }
+
+    override fun onPictureInPictureModeChanged(
+        isInPictureInPictureMode: Boolean,
+        newConfig: android.content.res.Configuration
+    ) {
+        super.onPictureInPictureModeChanged(isInPictureInPictureMode, newConfig)
+        isInPipMode = isInPictureInPictureMode
+    }
+
+    /**
+     * Daily time limit bookkeeping. STARTED is the whole definition of
+     * "using Sentüp" here: foregrounded, on screen, in front of the user.
+     * PiP counts as background - the video is a floating window, not app use.
+     */
+    override fun onStart() {
+        super.onStart()
+        foregroundedAtMs = android.os.SystemClock.elapsedRealtime()
+        tickAppTime()
+        appTimeTicker = lifecycleScope.launch {
+            while (isActive) {
+                delay(30_000L)
+                chargeForegroundTime()
+                tickAppTime()
+            }
+        }
+    }
+
+    override fun onStop() {
+        appTimeTicker?.cancel()
+        appTimeTicker = null
+        chargeForegroundTime()
+        super.onStop()
+    }
+
+    /** Flush the time since the last marker into today's total. */
+    private fun chargeForegroundTime() {
+        val now = android.os.SystemClock.elapsedRealtime()
+        if (foregroundedAtMs == 0L || appTimeLocked) {
+            // Locked sessions are deliberately uncounted: sitting on the lock
+            // screen must not eat the budget, and the marker still moves so a
+            // midnight rollover or budget raise resumes cleanly.
+            foregroundedAtMs = now
+            return
+        }
+        val prefs = com.sentup.android.data.ThemePreferences(applicationContext)
+        val shouldTrack = prefs.isTimeLimitEnabled() &&
+            com.sentup.android.data.AppTimeLimit.budgetMinutesForToday(
+                com.sentup.android.data.AppTimeLimit.parseBudgets(
+                    prefs.getTimeLimitBudgets()
+                )
+            ) > 0
+        if (shouldTrack) {
+            com.sentup.android.data.AppTimeLimit.addForegroundMillis(
+                this,
+                now - foregroundedAtMs
+            )
+        }
+        foregroundedAtMs = now
+    }
+
+    private fun tickAppTime() {
+        val prefs = com.sentup.android.data.ThemePreferences(applicationContext)
+        appTimeLocked = com.sentup.android.data.AppTimeLimit.isLocked(
+            this,
+            prefs.isTimeLimitEnabled(),
+            prefs.getTimeLimitBudgets()
+        )
+    }
+
+    /**
+     * Entering PiP on the way out of the app.
+     *
+     * API 31+ is already armed through setAutoEnterEnabled for the smooth
+     * gesture-navigation transition. Calling enterPictureInPictureMode here as
+     * well replaces the prepared action list on OxygenOS 12, leaving PiP with
+     * only the MediaSession pause button, so the explicit path is API 30 only.
+     */
+    @Deprecated("Deprecated in Java")
+    override fun onUserLeaveHint() {
+        super.onUserLeaveHint()
+        if (Build.VERSION.SDK_INT >= Build.VERSION_CODES.S) return
+        if (!pipEligible || isInPipMode || isInPictureInPictureMode) return
+        enterPipMode(this)
+    }
+
+    /**
+     * A link shared into Sentüp while it was already running is delivered here
+     * rather than through a fresh onCreate, thanks to singleTop.
+     */
+    override fun onNewIntent(intent: Intent) {
+        super.onNewIntent(intent)
+        setIntent(intent)
+        takeSharedLink(intent)
+    }
+
+    /**
+     * Pick up the YouTube link an intent carries, if it has one, and neutralize
+     * the intent so it cannot fire twice - the activity is recreated on theme
+     * and locale changes, and would otherwise replay the same link each time.
+     */
+    private fun takeSharedLink(intent: Intent?) {
+        if (intent == null) return
+        // A launcher shortcut (ModeShortcuts): open in music or video mode.
+        when (intent.action) {
+            com.sentup.android.util.ModeShortcuts.ACTION_OPEN_MUSIC,
+            com.sentup.android.util.ModeShortcuts.ACTION_OPEN_VIDEOS -> {
+                val videos = intent.action == com.sentup.android.util.ModeShortcuts.ACTION_OPEN_VIDEOS
+                neutralize(intent)
+                pendingModeRequest.value = videos
+                return
+            }
+        }
+        val navTarget = intent.getStringExtra("navigate_to")
+        if (navTarget != null) {
+            neutralize(intent)
+            pendingNavigation.value = navTarget
+            return
+        }
+        // A video file is checked for first: an "open with" on a video puts the
+        // file in the same `data` field a YouTube link would use, and letting
+        // the link path see it first would turn a playable file into "no
+        // YouTube link found in what you shared".
+        val videoUri = intent.externalVideoUri()
+        if (videoUri != null) {
+            // Take the grant for as long as the process lives where the sender
+            // offered a persistable one; without it the URI stops resolving as
+            // soon as the sending activity goes away, which on some file
+            // managers is immediately.
+            if (intent.flags and Intent.FLAG_GRANT_READ_URI_PERMISSION != 0) {
+                runCatching {
+                    contentResolver.takePersistableUriPermission(
+                        videoUri,
+                        Intent.FLAG_GRANT_READ_URI_PERMISSION
+                    )
+                }
+            }
+            neutralize(intent)
+            pendingExternalVideo = PendingExternalVideo(videoUri, ++sharedLinkCounter)
+            return
+        }
+        val text = intent.sharedLinkText() ?: return
+        neutralize(intent)
+        pendingSharedLink = PendingSharedLink(text, ++sharedLinkCounter)
+    }
+
+    /** A YouTube link tapped inside Sentüp, opened through the shared-link path. */
+    private fun openLinkInApp(url: String) {
+        pendingSharedLink = PendingSharedLink(url, ++sharedLinkCounter, fromApp = true)
+    }
+
+    /**
+     * Strip an intent of what made it actionable, so it cannot fire twice. The
+     * activity is recreated on theme and locale changes and would otherwise
+     * replay the same hand-off each time.
+     */
+    private fun neutralize(intent: Intent) {
+        intent.action = Intent.ACTION_MAIN
+        intent.data = null
+        intent.type = null
+        intent.removeExtra(Intent.EXTRA_TEXT)
+        intent.removeExtra(Intent.EXTRA_STREAM)
+        intent.removeExtra("navigate_to")
+    }
+
+    companion object {
+        var pendingNavigation = androidx.compose.runtime.mutableStateOf<String?>(null)
+
+        /** Video mode (true) or music mode (false) asked for by a launcher shortcut. */
+        var pendingModeRequest = androidx.compose.runtime.mutableStateOf<Boolean?>(null)
+    }
+}
+
+@Composable
+fun MusicApp(
+    pendingSharedLink: PendingSharedLink?,
+    /** A video file handed in by another app, waiting to be played. */
+    pendingExternalVideo: PendingExternalVideo?,
+    isInPipMode: Boolean,
+
+    /**
+     * The daily time limit's lock. Owned by the activity's ticker rather
+     * than a flow: the decision fresh-reads preferences every tick, and the
+     * only consumer is this overlay.
+     */
+    appTimeLocked: Boolean = false,
+    onPipStateChanged: (eligible: Boolean) -> Unit,
+    currentThemeMode: ThemeMode,
+    onThemeModeChange: (ThemeMode) -> Unit,
+    amoledTheme: Boolean,
+    onAmoledThemeToggle: (Boolean) -> Unit,
+    colorPalette: String,
+    onColorPaletteChange: (String) -> Unit,
+    paletteStyle: PaletteStyle,
+    onPaletteStyleChange: (PaletteStyle) -> Unit,
+    appIcon: String = com.sentup.android.data.ThemePreferences.DEFAULT_APP_ICON,
+    isDarkMode: Boolean,
+    onThemeToggle: (Boolean) -> Unit,
+    loadLocalSongs: Boolean,
+    onLoadLocalSongsToggle: (Boolean) -> Unit,
+    ambientBackground: Boolean,
+    onAmbientBackgroundToggle: (Boolean) -> Unit,
+    playerArtworkColors: Boolean,
+    onPlayerArtworkColorsToggle: (Boolean) -> Unit,
+    motionArtwork: Boolean,
+    onMotionArtworkToggle: (Boolean) -> Unit,
+    motionArtworkWifiOnly: Boolean,
+    onMotionArtworkWifiOnlyToggle: (Boolean) -> Unit,
+    motionArtworkQuality: MotionArtworkQuality,
+    onMotionArtworkQualityChange: (MotionArtworkQuality) -> Unit,
+    waveformSeekBar: Boolean,
+    onWaveformSeekBarToggle: (Boolean) -> Unit,
+    videoMode: Boolean,
+    onVideoModeToggle: (Boolean) -> Unit,
+    homeModeToggleEnabled: Boolean,
+    onHomeModeToggleEnabledChange: (Boolean) -> Unit,
+    videoHomeConfiguration: com.sentup.android.data.VideoHomeConfiguration,
+    onVideoRecommendationsEnabledChange: (Boolean) -> Unit,
+    onVideoHomeDestinationVisibleChange: (
+        com.sentup.android.data.VideoHomeDestination,
+        Boolean,
+    ) -> Unit,
+    onMoveVideoHomeDestination: (com.sentup.android.data.VideoHomeDestination, Int) -> Unit,
+    spotlightHome: Boolean,
+    uiScale: Float,
+    onUiScaleChange: (Float) -> Unit,
+    lyricsConfiguration: com.sentup.android.data.LyricsConfiguration,
+    onLyricsConfigurationChange: (com.sentup.android.data.LyricsConfiguration) -> Unit,
+    sponsorBlockEnabled: Boolean,
+    onSponsorBlockEnabledToggle: (Boolean) -> Unit,
+    sponsorBlockActions: Map<com.sentup.android.data.SponsorCategory, com.sentup.android.data.SegmentAction>,
+    onSponsorBlockActionChange: (com.sentup.android.data.SponsorCategory, com.sentup.android.data.SegmentAction) -> Unit,
+    onResetSponsorBlockActions: () -> Unit,
+    sponsorBlockShowOnSeekBar: Boolean,
+    onSponsorBlockShowOnSeekBarToggle: (Boolean) -> Unit,
+    sponsorBlockNotice: Boolean,
+    onSponsorBlockNoticeToggle: (Boolean) -> Unit,
+    sponsorBlockMinDurationMs: Long,
+    onSponsorBlockMinDurationChange: (Long) -> Unit,
+    onSpotlightHomeToggle: (Boolean) -> Unit,
+    nonExpressiveNavigationBar: Boolean,
+    onNonExpressiveNavigationBarToggle: (Boolean) -> Unit,
+    rotateWithDevice: Boolean,
+    onRotateWithDeviceToggle: (Boolean) -> Unit,
+    playerStyle: PlayerStyle,
+    onPlayerStyleChange: (PlayerStyle) -> Unit,
+    saveVideoHistory: Boolean,
+    onSaveVideoHistoryToggle: (Boolean) -> Unit,
+    saveMusicHistory: Boolean,
+    onSaveMusicHistoryToggle: (Boolean) -> Unit,
+    liveDownloadUpdates: Boolean,
+    onLiveDownloadUpdatesToggle: (Boolean) -> Unit,
+    livePlaybackUpdates: Boolean,
+    onLivePlaybackUpdatesToggle: (Boolean) -> Unit,
+    timedCommentsEnabled: Boolean,
+    onTimedCommentsToggle: (Boolean) -> Unit,
+    showRecentSearches: Boolean,
+    onShowRecentSearchesToggle: (Boolean) -> Unit,
+    showRelatedVideos: Boolean,
+    onShowRelatedVideosToggle: (Boolean) -> Unit,
+    inlinePreviews: Boolean,
+    onInlinePreviewsToggle: (Boolean) -> Unit,
+    compactVideoHome: Boolean,
+    onCompactVideoHomeToggle: (Boolean) -> Unit,
+    playlistSwipeEnabled: Boolean,
+    onPlaylistSwipeEnabledToggle: (Boolean) -> Unit,
+    playlistSwipeStartAction: String,
+    onPlaylistSwipeStartActionChange: (String) -> Unit,
+    playlistSwipeEndAction: String,
+    onPlaylistSwipeEndActionChange: (String) -> Unit,
+    shortsEnabled: Boolean,
+    onShortsEnabledToggle: (Boolean) -> Unit,
+    shortsHardBlock: Boolean,
+    onShortsHardBlockToggle: (Boolean) -> Unit,
+    returnDislike: Boolean,
+    onReturnDislikeToggle: (Boolean) -> Unit,
+    contentRegion: String,
+    onContentRegionChange: (String) -> Unit,
+    shortsHiddenActions: Set<String>,
+    onShortsHiddenActionsChange: (Set<String>) -> Unit,
+    videoQualityWifi: String,
+    onVideoQualityWifiChange: (String) -> Unit,
+    videoQualityMobile: String,
+    onVideoQualityMobileChange: (String) -> Unit,
+    preferHdr: Boolean,
+    onPreferHdrToggle: (Boolean) -> Unit,
+    frameInterpolation: Boolean,
+    onFrameInterpolationToggle: (Boolean) -> Unit,
+    frameInterpolationMaxFps: Int,
+    onFrameInterpolationMaxFpsChange: (Int) -> Unit,
+    musicQualityWifi: String,
+    onMusicQualityWifiChange: (String) -> Unit,
+    musicQualityMobile: String,
+    onMusicQualityMobileChange: (String) -> Unit,
+    subscriptionSource: String,
+    onSubscriptionSourceChange: (String) -> Unit,
+    subscribeTarget: String,
+    onSubscribeTargetChange: (String) -> Unit,
+    fastSubscriptionFeed: Boolean,
+    onFastSubscriptionFeedToggle: (Boolean) -> Unit,
+    subscriptionRefresh: Int,
+    onSubscriptionRefreshChange: (Int) -> Unit,
+    excludedFolders: Set<String>,
+    onAddExcludedFolder: (String) -> Unit,
+    onRemoveExcludedFolder: (String) -> Unit,
+    cacheEnabled: Boolean,
+    onCacheEnabledToggle: (Boolean) -> Unit,
+    videoCacheEnabled: Boolean,
+    onVideoCacheEnabledToggle: (Boolean) -> Unit,
+    shortsCacheEnabled: Boolean,
+    onShortsCacheEnabledToggle: (Boolean) -> Unit,
+    playbackPreloadEnabled: Boolean,
+    onPlaybackPreloadEnabledToggle: (Boolean) -> Unit,
+    maxCacheSizeMb: Long,
+    onMaxCacheSizeMbChange: (Long) -> Unit,
+    currentCacheSize: Long,
+    onClearCacheClick: () -> Unit,
+    onClearVideoCacheClick: () -> Unit,
+    onClearShortsCacheClick: () -> Unit,
+    autoLoadQueue: Boolean,
+    onAutoLoadQueueToggle: (Boolean) -> Unit,
+    crossfadeEnabled: Boolean,
+    onCrossfadeEnabledToggle: (Boolean) -> Unit,
+    crossfadeAuto: Boolean,
+    onCrossfadeAutoChange: (Boolean) -> Unit,
+    crossfadeDurationMs: Int,
+    onCrossfadeDurationChange: (Int) -> Unit,
+    normalizeVolume: Boolean,
+    onNormalizeVolumeToggle: (Boolean) -> Unit,
+    discordPresence: Boolean,
+    onDiscordPresenceToggle: (Boolean) -> Unit,
+    rememberVideoBrightness: Boolean,
+    onRememberVideoBrightnessToggle: (Boolean) -> Unit,
+    pipButtons: String,
+    onPipButtonsChange: (String) -> Unit,
+    hapticsLevel: String,
+    onHapticsLevelChange: (String) -> Unit,
+    uploadNotificationsEnabled: Boolean,
+    onUploadNotificationsToggle: (Boolean) -> Unit,
+    oemFixEnabled: Boolean,
+    onOemFixEnabledToggle: (Boolean) -> Unit,
+    manualScanEnabled: Boolean,
+    onManualScanEnabledToggle: (Boolean) -> Unit,
+    privateDownloadsEnabled: Boolean,
+    onPrivateDownloadsEnabledToggle: (Boolean) -> Unit,
+    onboardingCompleted: Boolean,
+    onOnboardingCompleted: (Boolean) -> Unit,
+    localOnlyMode: Boolean,
+    onLocalOnlyModeToggle: (Boolean) -> Unit
+) {
+    val context = androidx.compose.ui.platform.LocalContext.current
+    val navController = rememberNavController()
+    val pendingNav by MainActivity.pendingNavigation
+    LaunchedEffect(pendingNav) {
+        val target = pendingNav
+        if (target != null) {
+            MainActivity.pendingNavigation.value = null
+            navController.navigate(target)
+        }
+    }
+    // Scope the player VM to the ViewModelStore so it survives configuration
+    // changes and onCleared() actually runs (releasing the MediaController).
+    // Application context is used so the Activity isn't retained.
+    val playerViewModel: PlayerViewModel = viewModel {
+        PlayerViewModel(context.applicationContext)
+    }
+    val homeViewModel: HomeViewModel = viewModel()
+
+    val videoPlayerViewModel: com.sentup.android.ui.video.VideoPlayerViewModel = viewModel()
+    val shortsPlayerViewModel: com.sentup.android.ui.shorts.ShortsPlayerViewModel = viewModel()
+
+    // Changing content modes pauses what was playing; it does not dismantle
+    // it. This used to route the toggle through the players' own dismiss
+    // actions, and those are deliberately destructive - `clearPlayer` stops
+    // the controller, empties the queue and erases both the last-played song
+    // and the saved session, while `closePlayer` clears the video resume
+    // snapshot because an explicit close means "I am done with this video".
+    // A mode switch means neither of those things: someone flicking over to
+    // look at videos has not finished with the album they were halfway
+    // through, and coming back to a Home with no mini player and no way to
+    // recover the queue is the app throwing away work the user did not ask it
+    // to throw away.
+    //
+    // Both mini players surviving at once is the case the layout was already
+    // built for - `videoMiniBottomChrome` stacks the video bar above the music
+    // pill, and `bottomOverlayInset` reserves 196dp for the pair - it simply
+    // could not be reached through this toggle while the switch was closing
+    // one of them. Video collapses through `setExpanded(false)` rather than by
+    // writing the flag, because that is the path that swaps an HDR rendition
+    // for its SDR twin: the mini player is a TextureView and cannot present
+    // HDR.
+    //
+    // Shorts is the one thing still closed outright. It has no minimised form
+    // to park in - a swipe feed has no mini bar - so there is nowhere for it
+    // to persist to.
+    //
+    // Callbacks repeating the current value are ignored, including preference
+    // restoration during composition.
+    //
+    // `pauseMusic` is false for exactly one caller: "Listen as music", which is
+    // a handover rather than a mode switch. The music pipeline has just been
+    // told to play at the video's position, and pausing it here would cancel
+    // that play before it ever started - `PlayerViewModel.pause()` also drops a
+    // pending playWhenReady, precisely so a song still resolving cannot begin
+    // over a video. That is the right behaviour for a switch and the wrong one
+    // for a handover, so the two are now separate entry points. [scar]
+    val changePlaybackMode: (Boolean, Boolean) -> Unit = { nextVideoMode, pauseMusic ->
+        if (nextVideoMode != videoMode) {
+            if (pauseMusic) playerViewModel.pause()
+            videoPlayerViewModel.setExpanded(false)
+            videoPlayerViewModel.pause()
+            shortsPlayerViewModel.close()
+            onVideoModeToggle(nextVideoMode)
+        }
+    }
+
+    val switchPlaybackMode: (Boolean) -> Unit = { nextVideoMode ->
+        changePlaybackMode(nextVideoMode, true)
+    }
+
+    // A launcher shortcut lands on Home in the mode it names, through the same
+    // switch as the toggle: pausing the other player, never dismantling it.
+    val pendingMode by MainActivity.pendingModeRequest
+    LaunchedEffect(pendingMode) {
+        val target = pendingMode ?: return@LaunchedEffect
+        MainActivity.pendingModeRequest.value = null
+        switchPlaybackMode(target)
+        // By route, so onboarding (a different start) is left alone. Guarded:
+        // on a cold start from the shortcut this can run before the NavHost
+        // has set its graph, and there is no deeper screen to leave anyway.
+        runCatching { navController.popBackStack("home", inclusive = false) }
+    }
+
+    // "Listen as music" from video playback settings: a real migration into
+    // MusicService, so the track joins the music queue, notification and
+    // player styles. An opened VideoQueue migrates whole (the one case where
+    // "what plays next" is already decided); a lone video migrates alone and
+    // music's ordinary end-of-queue behavior applies.
+    //
+    // Pause-first rather than warm-then-swap: the music resolve buffers
+    // before it plays, and overlapping the two pipelines would echo the same
+    // audio twice. The cost is a short silence at the switch; the staged
+    // overlap from ROADMAP ("Switching modes without stopping the audio")
+    // remains the follow-up that removes it.
+    val moveVideoToMusic: () -> Unit = move@{
+        val video = videoPlayerViewModel.currentVideo.value ?: return@move
+        if (LocalVideo.isDeviceVideoId(video.videoId)) return@move
+        if (video.videoId.startsWith("external:")) return@move
+        if (videoPlayerViewModel.isLive.value) return@move
+        val positionMs = (videoPlayerViewModel.exoPlayer?.currentPosition ?: 0L).coerceAtLeast(0L)
+        val queueVideos = videoPlayerViewModel.queue.value?.videos.orEmpty()
+        val songs = if (queueVideos.isNotEmpty()) {
+            queueVideos.map { it.toSong() }
+        } else {
+            listOf(video.toSong())
+        }
+        if (songs.isEmpty()) return@move
+        val startIndex = videoPlayerViewModel.queue.value?.index?.coerceIn(songs.indices) ?: 0
+        val start = songs[startIndex]
+        val startPositionMs = start.duration.takeIf { it > 0L }
+            ?.let { positionMs.coerceIn(0L, it) }
+            ?: positionMs
+        // Order is load-bearing. The mode switch runs first and without its
+        // music pause, so everything that stops the video pipeline has already
+        // happened by the time the music play is issued; starting the music
+        // first meant a play() followed immediately by the switch's pause(),
+        // and the track sat silent at the handed-over position. The player is
+        // then asked to open, so a full-screen video becomes a full-screen
+        // player rather than collapsing to a pill mid-song.
+        videoPlayerViewModel.pause()
+        changePlaybackMode(false, false)
+        videoPlayerViewModel.closePlayer()
+        playerViewModel.playQueueAtPosition(songs, start, startPositionMs)
+        playerViewModel.requestPlayerExpanded()
+    }
+
+    // The reverse of "Listen as music": promote what is playing to its video.
+    //
+    // Not symmetric with its mirror, and deliberately so. Every video carries
+    // audio, so that direction always has somewhere to go; not every song has
+    // a video, which is why the control is conditional (see
+    // Song.hasWatchableVideo) rather than always offered and often broken.
+    //
+    // What is still to play of the music queue comes along (asked for,
+    // September 2026: the other direction already carried its queue). Not the
+    // whole thing: a music queue is often a radio that tops itself up forever,
+    // and would arrive as an endless "playlist". So it is the songs from this
+    // one on, in play order, that have a video to watch, capped at
+    // MUSIC_TO_VIDEO_QUEUE_MAX; past its end video mode's ordinary related
+    // videos take over, as they did before.
+    // Resolved in composition, so a locale change reaches it.
+    val musicQueueTitle = androidx.compose.ui.res.stringResource(R.string.vq_from_music_queue)
+    val moveMusicToVideo: () -> Unit = move@{
+        val song = playerViewModel.currentSong.value ?: return@move
+        if (!song.hasWatchableVideo(context)) return@move
+        val playOrder = playerViewModel.playOrderQueue.value
+        val currentAt = playOrder.indexOfFirst { it.id == playerViewModel.currentQueueItemId.value }
+        val carried = (if (currentAt >= 0) playOrder.drop(currentAt + 1) else emptyList())
+            .map { it.song }
+            .filter { it.hasWatchableVideo(context) }
+            .take(MUSIC_TO_VIDEO_QUEUE_MAX - 1)
+        val videoQueue = com.sentup.android.data.VideoQueue(
+            videos = listOf(song.toVideoItem()) + carried.map { it.toVideoItem() },
+            index = 0,
+            title = musicQueueTitle
+        )
+        val positionMs = playerViewModel.progress.value.coerceAtLeast(0L)
+        val startPositionMs = song.duration.takeIf { it > 0L }
+            ?.let { positionMs.coerceIn(0L, it) }
+            ?: positionMs
+        // Pause-first and in this order, for the reason the mirror documents:
+        // the mode switch stops the other pipeline, so it has to finish before
+        // the incoming one is told to play, or the switch's own pause lands on
+        // top of the play it was meant to precede.
+        playerViewModel.pause()
+        changePlaybackMode(true, true)
+        // The song moved, so the music player has nothing left to hold: left
+        // paused, its mini bar sat beside the video showing the same track.
+        // Its mirror closes the video player for the same reason. Unrelated
+        // content in the other player is still only paused by a mode switch.
+        playerViewModel.setPlayerExpanded(false)
+        playerViewModel.clearPlayer()
+        videoPlayerViewModel.playQueueAt(videoQueue, startPositionMs)
+    }
+
+    // A live broadcast that turned up in the Shorts feed. The Shorts player
+    // cannot present one honestly (no chat, and a seek bar for a duration that
+    // does not exist), so it closes itself and the stream reopens here, where
+    // the vertical live layout lives.
+    androidx.compose.runtime.LaunchedEffect(shortsPlayerViewModel) {
+        shortsPlayerViewModel.liveHandoff.collect { liveVideo ->
+            videoPlayerViewModel.playVideo(liveVideo)
+        }
+    }
+
+    /**
+     * Opens a creator's page from anywhere: a feed card, a search result, the
+     * player's channel row, the Subscriptions tab, or a shared link.
+     *
+     * **The two overlays step out of the way rather than being drawn over.**
+     * The channel screen is a NavHost destination, and both players live above
+     * the NavHost, so an expanded video player would simply cover it. Dropping
+     * the video to its mini bar is also the behaviour worth having on its own
+     * merits: the video keeps playing while its creator's page is read, which
+     * is exactly what someone tapping a channel name mid-video wants. Shorts
+     * close outright, because that overlay is full-bleed with no minimised form
+     * to fall back to.
+     *
+     * `launchSingleTop` is deliberately absent: opening channel B from channel
+     * A's "Featured channels" shelf has to push a second entry, or back from B
+     * would leave the app rather than return to A.
+     */
+    val openChannel: (String) -> Unit = openChannel@{ channelId ->
+        if (channelId.isBlank()) return@openChannel
+        videoPlayerViewModel.setExpanded(false)
+        shortsPlayerViewModel.close()
+        navController.navigate("channel/${android.net.Uri.encode(channelId)}")
+    }
+
+    // One launch contract for every Shorts surface. The preference controls
+    // the Home shelf and the destination, not whether a Short exists elsewhere:
+    // channel pages keep their Shorts, but open them in the ordinary watch page
+    // when the endless swipe player is disabled.
+    val openShorts: (List<com.sentup.android.data.ShortsItem>, Int) -> Unit =
+        openShorts@{ shorts, index ->
+            if (shorts.isEmpty()) return@openShorts
+            val selectedShort = shorts.getOrNull(index.coerceIn(0, shorts.lastIndex))
+                ?: return@openShorts
+            if (!shortsEnabled) {
+                shortsPlayerViewModel.close()
+                videoPlayerViewModel.playVideo(selectedShort.toVideoItem())
+                return@openShorts
+            }
+            videoPlayerViewModel.exoPlayer?.pause()
+            shortsPlayerViewModel.open(shorts, index)
+        }
+
+    // Music, video and Shorts are mutually exclusive: whichever pipeline
+    // starts playing pauses the other two. System audio focus alone is not
+    // reliable between players inside the same app, so this is enforced
+    // explicitly. Each effect only fires on a transition to playing, so
+    // pausing one player never re-triggers the others.
+    val isMusicPlaying by playerViewModel.isPlaying.collectAsState()
+    val isVideoPlaying by videoPlayerViewModel.isPlaying.collectAsState()
+    val isShortsPlaying by shortsPlayerViewModel.isPlaying.collectAsState()
+    val pendingSongDownload by playerViewModel.pendingSongDownload.collectAsState()
+    androidx.compose.runtime.LaunchedEffect(isMusicPlaying) {
+        if (isMusicPlaying) {
+            videoPlayerViewModel.pause()
+            shortsPlayerViewModel.pause()
+        }
+    }
+    androidx.compose.runtime.LaunchedEffect(isVideoPlaying) {
+        if (isVideoPlaying) {
+            playerViewModel.pause()
+            shortsPlayerViewModel.pause()
+        }
+    }
+    androidx.compose.runtime.LaunchedEffect(isShortsPlaying) {
+        if (isShortsPlaying) {
+            playerViewModel.pause()
+            videoPlayerViewModel.pause()
+        }
+    }
+
+    // Video overlay state, needed by HomeScreen so bottom-anchored UI (FABs)
+    // and the music mini player can stay clear of the video mini player.
+    val overlayVideo by videoPlayerViewModel.currentVideo.collectAsState()
+    val isVideoOverlayExpanded by videoPlayerViewModel.isExpanded.collectAsState()
+    val hasVideoMiniPlayer = overlayVideo != null && !isVideoOverlayExpanded
+    val musicPillVisible = playerViewModel.currentSong.collectAsState().value != null
+
+    // The floating nav bar and the music pill both live inside HomeScreen, so
+    // they exist on the "home" route and nowhere else. The video overlay is
+    // drawn above the NavHost and therefore renders on every route, so it has
+    // to be told what is actually underneath it rather than assuming: reserving
+    // their height unconditionally is what left the video mini bar hovering in
+    // empty space over Settings, Downloads, Stats and channel pages.
+    val currentRoute = navController.currentBackStackEntryAsState()
+        .value?.destination?.route
+    val onHomeRoute = currentRoute == "home"
+    // From 600dp across Home navigates from a rail on the start edge
+    // (HomeScreen), so the bottom holds only the music pill, which rests just
+    // above the system inset there. The overlay adds its own MINI_VIDEO_MARGIN
+    // on top of this, so a rail reserves nothing: anything more rested the bar
+    // twice its side margin above the inset (#303).
+    val homeUsesRail = com.sentup.android.ui.theme.currentWindowLayout().usesNavigationRail
+    val navBarReserve = when {
+        homeUsesRail -> 0.dp
+        nonExpressiveNavigationBar -> NON_EXPRESSIVE_NAV_BAR_RESERVE
+        else -> EXPRESSIVE_NAV_BAR_RESERVE
+    }
+    val videoMiniBottomChrome = when {
+        !onHomeRoute -> 0.dp
+        // Stacked above the music pill rather than on top of it, when both
+        // players are alive at once.
+        musicPillVisible -> navBarReserve + MUSIC_PILL_RESERVE
+        else -> navBarReserve
+    }
+
+    // Home's floating toolbar hides as a feed is scrolled, and the mini bar
+    // parked above it has to come down with it or it floats over the strip the
+    // toolbar left behind. The state is created here rather than inside
+    // HomeScreen because this overlay is a sibling of the NavHost and cannot
+    // read anything HomeScreen provides. Only the floating variant hides; the
+    // standard NavigationBar is pinned, and off the home route there is no
+    // toolbar at all.
+    //
+    // The bar travels exactly the toolbar's height, the same distance the music
+    // pill travels, and nothing more. Alone it then rests MINI_VIDEO_MARGIN
+    // above the inset - the same as its side margins and as on every other
+    // route - and stacked it stays the same gap above the music pill. Sliding
+    // by the whole chrome less a resting gap parked a lone bar 32dp up while
+    // its sides sat at 16dp (#303), and dropped a stacked bar onto the pill.
+    val floatingToolbarState = androidx.compose.material3.rememberFloatingToolbarState()
+    val videoMiniFollowDistancePx = with(androidx.compose.ui.platform.LocalDensity.current) {
+        if (!onHomeRoute || nonExpressiveNavigationBar || homeUsesRail) 0f
+        else navBarReserve.toPx()
+    }
+    val videoMiniFollowOffsetPx: () -> Float = {
+        videoMiniFollowDistancePx *
+            floatingToolbarState.hiddenFraction()
+    }
+
+    // Keep the Activity's PiP inputs current. It needs them outside the
+    // composition, in onUserLeaveHint on Android 11. Match the same proven 4.5
+    // eligibility used by VideoPipController: bounds and playback state are not
+    // prerequisites for entering PiP.
+    androidx.compose.runtime.SideEffect {
+        onPipStateChanged(overlayVideo != null && isVideoOverlayExpanded)
+    }
+
+    // Keep the ViewModel's PiP flag current so it can suppress auto-play
+    // (advancing to the next video while in PiP means the user returns to
+    // a video they did not put there).
+    androidx.compose.runtime.LaunchedEffect(isInPipMode) {
+        videoPlayerViewModel.setInPipMode(isInPipMode)
+    }
+
+    // Opens YouTube links shared into the app. Composed above the PiP
+    // early return so its remembered deduplication token survives PiP
+    // transitions; disabled while in PiP so it does not try to navigate
+    // or start a new video inside the tiny window.
+    SharedLinkHandler(
+        pendingLink = pendingSharedLink,
+        enabled = onboardingCompleted && !isInPipMode,
+        localOnlyMode = localOnlyMode,
+        homeViewModel = homeViewModel,
+        playerViewModel = playerViewModel,
+        videoPlayerViewModel = videoPlayerViewModel,
+        onNavigateHome = {
+            navController.navigate("home") {
+                popUpTo("home") { inclusive = false }
+                launchSingleTop = true
+            }
+        },
+        onOpenChannel = openChannel
+    )
+
+    com.sentup.android.ui.video.ExternalVideoHandler(
+        pending = pendingExternalVideo,
+        // Deliberately not gated on PiP, unlike the shared-link handler above.
+        // A file hand-off is an explicit "play this now", and the window it
+        // would replace is the one still playing the previous video - holding
+        // it until PiP happens to end is what left the two fighting.
+        enabled = onboardingCompleted,
+        videoPlayerViewModel = videoPlayerViewModel,
+        onNavigateHome = {
+            navController.navigate("home") {
+                popUpTo("home") { inclusive = false }
+                launchSingleTop = true
+            }
+        }
+    )
+
+    // Drives the PiP window's shape and its transport controls. Composed above
+    // the early return so the package-scoped receiver remains alive when the
+    // normal app UI is replaced by the dedicated video-only PiP surface.
+    com.sentup.android.ui.video.VideoPipController(viewModel = videoPlayerViewModel)
+
+    // In system PiP the app is just a video surface. Returning here keeps the
+    // NavHost, both players and every overlay out of the composition entirely,
+    // rather than letting them draw and animate behind a window nobody can see
+    // them in.
+    if (isInPipMode) {
+        com.sentup.android.ui.video.PipVideoSurface(viewModel = videoPlayerViewModel)
+        return
+    }
+
+    Box(
+        modifier = Modifier
+            .fillMaxSize()
+            .background(MaterialTheme.colorScheme.background)
+    ) {
+        NavHost(
+            navController = navController,
+            startDestination = if (onboardingCompleted) "home" else "onboarding"
+        ) {
+            composable("onboarding") {
+                OnboardingScreen(
+                    currentThemeMode = currentThemeMode,
+                    onThemeModeChange = onThemeModeChange,
+                    loadLocalSongs = loadLocalSongs,
+                    onLoadLocalSongsToggle = onLoadLocalSongsToggle,
+                    ambientBackground = ambientBackground,
+                    onAmbientBackgroundToggle = onAmbientBackgroundToggle,
+                    videoMode = videoMode,
+                    onVideoModeToggle = switchPlaybackMode,
+                    homeModeToggleEnabled = homeModeToggleEnabled,
+                    onHomeModeToggleEnabledChange = onHomeModeToggleEnabledChange,
+                    shortsEnabled = shortsEnabled,
+                    onShortsEnabledToggle = onShortsEnabledToggle,
+                    spotlightHome = spotlightHome,
+                    onSpotlightHomeChange = onSpotlightHomeToggle,
+                    playerStyle = playerStyle,
+                    onPlayerStyleChange = onPlayerStyleChange,
+                    crossfadeEnabled = crossfadeEnabled,
+                    onCrossfadeEnabledToggle = onCrossfadeEnabledToggle,
+                    manualScanEnabled = manualScanEnabled,
+                    onManualScanEnabledToggle = onManualScanEnabledToggle,
+                    onFinish = {
+                        onOnboardingCompleted(true)
+                        navController.navigate("home") {
+                            popUpTo("onboarding") { inclusive = true }
+                            launchSingleTop = true
+                        }
+                    }
+                )
+            }
+
+            composable("home") {
+                // Taste setup is offered once per install, from here for both
+                // of its unprompted entrances: a new user lands on Home out
+                // of onboarding, and someone updating lands on it at launch.
+                // It marks itself seen on every way out, so coming back to
+                // this route does not open it again. Not in Local Only:
+                // every artist on it is fetched. It opens filled in from the
+                // listening history where there is one; "Clear all" on the
+                // screen is the blank start.
+                val tasteContext = androidx.compose.ui.platform.LocalContext.current
+                LaunchedEffect(Unit) {
+                    if (!localOnlyMode &&
+                        !com.sentup.android.data.TasteProfileStore(tasteContext).setupSeen
+                    ) {
+                        navController.navigate("taste") {
+                            launchSingleTop = true
+                        }
+                    }
+                }
+                HomeScreen(
+                    compactVideoHome = compactVideoHome,
+                    inlinePreviews = inlinePreviews,
+                    onWatchAsVideo = moveMusicToVideo,
+                    onSongClick = { song ->
+                        playerViewModel.playSong(song)
+                    },
+                    playerViewModel = playerViewModel,
+                    viewModel = homeViewModel,
+                    isDarkMode = isDarkMode,
+                    onThemeToggle = onThemeToggle,
+                    onNavigateToSettings = { navController.navigate("settings") },
+                    onNavigateToDownloads = { navController.navigate("downloads") },
+                    onNavigateToStats = { navController.navigate("stats") },
+                    onNavigateToSubscriptions = { navController.navigate("subscriptions") },
+                    onNavigateToUpdate = { navController.navigate("update") },
+                    onNavigateToVideoPlayer = { video ->
+                        videoPlayerViewModel.playVideo(video)
+                    },
+                    onPlayDownloadedVideos = { videos, selected ->
+                        videoPlayerViewModel.playDownloadedVideos(videos, selected)
+                    },
+                    onPlayDeviceVideos = { videos, selected ->
+                        videoPlayerViewModel.playDeviceVideos(videos, selected)
+                    },
+                    onPlayVideoQueue = { queue ->
+                        videoPlayerViewModel.playQueue(queue)
+                    },
+                    onEnqueueVideo = { video, playNext ->
+                        videoPlayerViewModel.enqueueVideo(video, playNext)
+                    },
+                    onOpenShorts = openShorts,
+                    onOpenChannel = openChannel,
+                    shortsEnabled = shortsEnabled,
+                    loadLocalSongs = loadLocalSongs,
+                    excludedFolders = excludedFolders,
+                    ambientBackground = ambientBackground,
+                    playerArtworkColors = playerArtworkColors,
+                    videoMode = videoMode,
+                    onVideoModeToggle = switchPlaybackMode,
+                    showModeToggle = homeModeToggleEnabled,
+                    videoHomeConfiguration = videoHomeConfiguration,
+                    floatingToolbarState = floatingToolbarState,
+                    playerStyle = playerStyle,
+                    onPlayerStyleChange = onPlayerStyleChange,
+                    manualScan = manualScanEnabled,
+                    localOnly = localOnlyMode,
+                    hasVideoMiniPlayer = hasVideoMiniPlayer,
+                    hasExpandedVideoPlayer = overlayVideo != null && isVideoOverlayExpanded,
+                    spotlightHome = spotlightHome,
+                    nonExpressiveNavigationBar = nonExpressiveNavigationBar
+                )
+            }
+            composable(
+                route = "settings",
+                enterTransition = { slideInHorizontally(initialOffsetX = { it }) + fadeIn() },
+                exitTransition = { slideOutHorizontally(targetOffsetX = { it }) + fadeOut() },
+                popEnterTransition = { slideInHorizontally(initialOffsetX = { -it / 3 }) + fadeIn() },
+                popExitTransition = { slideOutHorizontally(targetOffsetX = { it }) + fadeOut() }
+            ) {
+                com.sentup.android.ui.settings.SettingsScreen(
+                    currentThemeMode = currentThemeMode,
+                    onThemeModeChange = onThemeModeChange,
+                    amoledTheme = amoledTheme,
+                    onAmoledThemeToggle = onAmoledThemeToggle,
+                    colorPalette = colorPalette,
+                    onNavigateToColorPalette = { navController.navigate("color_palette") },
+                    paletteStyle = paletteStyle,
+                    onNavigateToSubscriptions = { navController.navigate("subscriptions") },
+                    onNavigateToNotInterested = { navController.navigate("not_interested") },
+                    onNavigateToTaste = { navController.navigate("taste") },
+                    onNavigateToBackup = { navController.navigate("backup") },
+                    onNavigateToReportBug = { navController.navigate("report") },
+                    onNavigateToTimeLimit = { navController.navigate("app_time_limit") },
+                    loadLocalSongs = loadLocalSongs,
+                    onLoadLocalSongsToggle = onLoadLocalSongsToggle,
+                    ambientBackground = ambientBackground,
+                    onAmbientBackgroundToggle = onAmbientBackgroundToggle,
+                    playerArtworkColors = playerArtworkColors,
+                    onPlayerArtworkColorsToggle = onPlayerArtworkColorsToggle,
+                    motionArtwork = motionArtwork,
+                    onMotionArtworkToggle = onMotionArtworkToggle,
+                    motionArtworkWifiOnly = motionArtworkWifiOnly,
+                    onMotionArtworkWifiOnlyToggle = onMotionArtworkWifiOnlyToggle,
+                    motionArtworkQuality = motionArtworkQuality,
+                    onMotionArtworkQualityChange = onMotionArtworkQualityChange,
+                    waveformSeekBar = waveformSeekBar,
+                    onWaveformSeekBarToggle = onWaveformSeekBarToggle,
+                    videoMode = videoMode,
+                    onVideoModeToggle = switchPlaybackMode,
+                    homeModeToggleEnabled = homeModeToggleEnabled,
+                    onHomeModeToggleChange = onHomeModeToggleEnabledChange,
+                    videoHomeConfiguration = videoHomeConfiguration,
+                    onVideoRecommendationsEnabledChange =
+                        onVideoRecommendationsEnabledChange,
+                    onVideoHomeDestinationVisibleChange =
+                        onVideoHomeDestinationVisibleChange,
+                    onMoveVideoHomeDestination = onMoveVideoHomeDestination,
+                    spotlightHome = spotlightHome,
+                    onSpotlightHomeToggle = onSpotlightHomeToggle,
+                    nonExpressiveNavigationBar = nonExpressiveNavigationBar,
+                    onNonExpressiveNavigationBarToggle =
+                        onNonExpressiveNavigationBarToggle,
+                    rotateWithDevice = rotateWithDevice,
+                    onRotateWithDeviceToggle = onRotateWithDeviceToggle,
+                    playerStyle = playerStyle,
+                    onPlayerStyleChange = onPlayerStyleChange,
+                    saveVideoHistory = saveVideoHistory,
+                    onSaveVideoHistoryToggle = onSaveVideoHistoryToggle,
+                    saveMusicHistory = saveMusicHistory,
+                    onSaveMusicHistoryToggle = onSaveMusicHistoryToggle,
+                    liveDownloadUpdates = liveDownloadUpdates,
+                    onLiveDownloadUpdatesToggle = onLiveDownloadUpdatesToggle,
+                    livePlaybackUpdates = livePlaybackUpdates,
+                    onLivePlaybackUpdatesToggle = onLivePlaybackUpdatesToggle,
+                    timedCommentsEnabled = timedCommentsEnabled,
+                    onTimedCommentsToggle = onTimedCommentsToggle,
+                    showRecentSearches = showRecentSearches,
+                    onShowRecentSearchesToggle = onShowRecentSearchesToggle,
+                    showRelatedVideos = showRelatedVideos,
+                    onShowRelatedVideosToggle = onShowRelatedVideosToggle,
+                    inlinePreviews = inlinePreviews,
+                    onInlinePreviewsToggle = onInlinePreviewsToggle,
+                    compactVideoHome = compactVideoHome,
+                    onCompactVideoHomeToggle = onCompactVideoHomeToggle,
+                    playlistSwipeEnabled = playlistSwipeEnabled,
+                    onPlaylistSwipeEnabledToggle = onPlaylistSwipeEnabledToggle,
+                    playlistSwipeStartAction = playlistSwipeStartAction,
+                    onPlaylistSwipeStartActionChange = onPlaylistSwipeStartActionChange,
+                    playlistSwipeEndAction = playlistSwipeEndAction,
+                    onPlaylistSwipeEndActionChange = onPlaylistSwipeEndActionChange,
+                    shortsEnabled = shortsEnabled,
+                    onShortsEnabledToggle = onShortsEnabledToggle,
+                    shortsHardBlock = shortsHardBlock,
+                    onShortsHardBlockToggle = onShortsHardBlockToggle,
+                    returnDislike = returnDislike,
+                    onReturnDislikeToggle = onReturnDislikeToggle,
+                    contentRegion = contentRegion,
+                    onContentRegionChange = onContentRegionChange,
+                    shortsHiddenActions = shortsHiddenActions,
+                    onShortsHiddenActionsChange = onShortsHiddenActionsChange,
+                    videoQualityWifi = videoQualityWifi,
+                    onVideoQualityWifiChange = onVideoQualityWifiChange,
+                    videoQualityMobile = videoQualityMobile,
+                    onVideoQualityMobileChange = onVideoQualityMobileChange,
+                    preferHdr = preferHdr,
+                    onPreferHdrToggle = onPreferHdrToggle,
+                    frameInterpolation = frameInterpolation,
+                    onFrameInterpolationToggle = onFrameInterpolationToggle,
+                    frameInterpolationMaxFps = frameInterpolationMaxFps,
+                    onFrameInterpolationMaxFpsChange = onFrameInterpolationMaxFpsChange,
+                    musicQualityWifi = musicQualityWifi,
+                    onMusicQualityWifiChange = onMusicQualityWifiChange,
+                    musicQualityMobile = musicQualityMobile,
+                    onMusicQualityMobileChange = onMusicQualityMobileChange,
+                    subscriptionSource = subscriptionSource,
+                    onSubscriptionSourceChange = onSubscriptionSourceChange,
+                    subscribeTarget = subscribeTarget,
+                    onSubscribeTargetChange = onSubscribeTargetChange,
+                    fastSubscriptionFeed = fastSubscriptionFeed,
+                    onFastSubscriptionFeedToggle = onFastSubscriptionFeedToggle,
+                    subscriptionRefresh = subscriptionRefresh,
+                    onSubscriptionRefreshChange = onSubscriptionRefreshChange,
+                    excludedFolders = excludedFolders,
+                    onAddExcludedFolder = onAddExcludedFolder,
+                    onRemoveExcludedFolder = onRemoveExcludedFolder,
+                    homeViewModel = homeViewModel,
+                    onLogoutClick = { 
+                        homeViewModel.logout()
+                    },
+                    onBackClick = { navController.popBackStack() },
+                    cacheEnabled = cacheEnabled,
+                    onCacheEnabledToggle = onCacheEnabledToggle,
+                    videoCacheEnabled = videoCacheEnabled,
+                    onVideoCacheEnabledToggle = onVideoCacheEnabledToggle,
+                    shortsCacheEnabled = shortsCacheEnabled,
+                    onShortsCacheEnabledToggle = onShortsCacheEnabledToggle,
+                    playbackPreloadEnabled = playbackPreloadEnabled,
+                    onPlaybackPreloadEnabledToggle = onPlaybackPreloadEnabledToggle,
+                    maxCacheSizeMb = maxCacheSizeMb,
+                    onMaxCacheSizeMbChange = onMaxCacheSizeMbChange,
+                    currentCacheSize = currentCacheSize,
+                    onClearCacheClick = onClearCacheClick,
+                    onClearVideoCacheClick = onClearVideoCacheClick,
+                    onClearShortsCacheClick = onClearShortsCacheClick,
+                    autoLoadQueue = autoLoadQueue,
+                    onAutoLoadQueueToggle = onAutoLoadQueueToggle,
+                    crossfadeEnabled = crossfadeEnabled,
+                    onCrossfadeEnabledToggle = onCrossfadeEnabledToggle,
+                    crossfadeAuto = crossfadeAuto,
+                    onCrossfadeAutoChange = onCrossfadeAutoChange,
+                    crossfadeDurationMs = crossfadeDurationMs,
+                    onCrossfadeDurationChange = onCrossfadeDurationChange,
+                    normalizeVolume = normalizeVolume,
+                    onNormalizeVolumeToggle = onNormalizeVolumeToggle,
+                    discordPresence = discordPresence,
+                    onDiscordPresenceToggle = onDiscordPresenceToggle,
+                    rememberVideoBrightness = rememberVideoBrightness,
+                    onRememberVideoBrightnessToggle = onRememberVideoBrightnessToggle,
+                    pipButtons = pipButtons,
+                    onPipButtonsChange = onPipButtonsChange,
+                    hapticsLevel = hapticsLevel,
+                    onHapticsLevelChange = onHapticsLevelChange,
+                    uploadNotificationsEnabled = uploadNotificationsEnabled,
+                    onUploadNotificationsToggle = onUploadNotificationsToggle,
+                    oemFixEnabled = oemFixEnabled,
+                    onOemFixEnabledToggle = onOemFixEnabledToggle,
+                    manualScanEnabled = manualScanEnabled,
+                    onManualScanEnabledToggle = onManualScanEnabledToggle,
+                    privateDownloadsEnabled = privateDownloadsEnabled,
+                    onPrivateDownloadsEnabledToggle = onPrivateDownloadsEnabledToggle,
+                    onNavigateToUpdate = { navController.navigate("update") },
+                    onNavigateToLicenses = { navController.navigate("licenses") },
+                    localOnlyMode = localOnlyMode,
+                    onLocalOnlyModeToggle = onLocalOnlyModeToggle,
+                    uiScale = uiScale,
+                    onUiScaleChange = onUiScaleChange,
+                    lyricsConfiguration = lyricsConfiguration,
+                    onLyricsConfigurationChange = onLyricsConfigurationChange,
+                    sponsorBlockEnabled = sponsorBlockEnabled,
+                    onSponsorBlockEnabledToggle = onSponsorBlockEnabledToggle,
+                    sponsorBlockActions = sponsorBlockActions,
+                    onSponsorBlockActionChange = onSponsorBlockActionChange,
+                    onResetSponsorBlockActions = onResetSponsorBlockActions,
+                    sponsorBlockShowOnSeekBar = sponsorBlockShowOnSeekBar,
+                    onSponsorBlockShowOnSeekBarToggle = onSponsorBlockShowOnSeekBarToggle,
+                    sponsorBlockNotice = sponsorBlockNotice,
+                    onSponsorBlockNoticeToggle = onSponsorBlockNoticeToggle,
+                    sponsorBlockMinDurationMs = sponsorBlockMinDurationMs,
+                    onSponsorBlockMinDurationChange = onSponsorBlockMinDurationChange,
+                    playerViewModel = playerViewModel,
+                    videoPlayerViewModel = videoPlayerViewModel
+                )
+            }
+            composable(
+                route = "color_palette",
+                enterTransition = { slideInHorizontally(initialOffsetX = { it }) + fadeIn() },
+                exitTransition = { slideOutHorizontally(targetOffsetX = { it }) + fadeOut() },
+                popEnterTransition = { slideInHorizontally(initialOffsetX = { -it / 3 }) + fadeIn() },
+                popExitTransition = { slideOutHorizontally(targetOffsetX = { it }) + fadeOut() }
+            ) {
+                com.sentup.android.ui.theme.ColorPaletteScreen(
+                    currentPalette = colorPalette,
+                    onPaletteSelected = onColorPaletteChange,
+                    paletteStyle = paletteStyle,
+                    onPaletteStyleSelected = onPaletteStyleChange,
+                    amoledDark = amoledTheme,
+                    isDarkMode = isDarkMode,
+                    onBack = { navController.popBackStack() }
+                )
+            }
+            composable(
+                route = "subscriptions",
+                enterTransition = { slideInHorizontally(initialOffsetX = { it }) + fadeIn() },
+                exitTransition = { slideOutHorizontally(targetOffsetX = { it }) + fadeOut() },
+                popEnterTransition = { slideInHorizontally(initialOffsetX = { -it / 3 }) + fadeIn() },
+                popExitTransition = { slideOutHorizontally(targetOffsetX = { it }) + fadeOut() }
+            ) {
+                com.sentup.android.ui.video.SubscriptionsManagerScreen(
+                    viewModel = homeViewModel,
+                    onBack = { navController.popBackStack() },
+                    // The sign-in dialog lives on the home screen, so a login
+                    // ask from here has to go back for it rather than opening a
+                    // second WebView on top of a settings sub-screen.
+                    onLoginClick = { navController.popBackStack("home", inclusive = false) },
+                    onOpenChannel = openChannel
+                )
+            }
+            composable(
+                route = "backup",
+                enterTransition = { slideInHorizontally(initialOffsetX = { it }) + fadeIn() },
+                exitTransition = { slideOutHorizontally(targetOffsetX = { it }) + fadeOut() },
+                popEnterTransition = { slideInHorizontally(initialOffsetX = { -it / 3 }) + fadeIn() },
+                popExitTransition = { slideOutHorizontally(targetOffsetX = { it }) + fadeOut() }
+            ) {
+                com.sentup.android.ui.settings.BackupScreen(
+                    onBack = { navController.popBackStack() }
+                )
+            }
+            composable(
+                route = "not_interested",
+                enterTransition = { slideInHorizontally(initialOffsetX = { it }) + fadeIn() },
+                exitTransition = { slideOutHorizontally(targetOffsetX = { it }) + fadeOut() },
+                popEnterTransition = { slideInHorizontally(initialOffsetX = { -it / 3 }) + fadeIn() },
+                popExitTransition = { slideOutHorizontally(targetOffsetX = { it }) + fadeOut() }
+            ) {
+                com.sentup.android.ui.video.NotInterestedScreen(
+                    viewModel = homeViewModel,
+                    onBack = { navController.popBackStack() }
+                )
+            }
+            // A creator's page. The argument is normally a UC id, may be an
+            // @handle/full URL from a shared link, or a video:<id> fallback
+            // when a modern feed card omitted its creator endpoint. The screen
+            // resolves whichever it was given without starting that video.
+            composable(
+                route = "channel/{channelId}",
+                arguments = listOf(
+                    androidx.navigation.navArgument("channelId") {
+                        type = androidx.navigation.NavType.StringType
+                    }
+                ),
+                enterTransition = { slideInHorizontally(initialOffsetX = { it }) + fadeIn() },
+                exitTransition = { slideOutHorizontally(targetOffsetX = { -it / 3 }) + fadeOut() },
+                popEnterTransition = { slideInHorizontally(initialOffsetX = { -it / 3 }) + fadeIn() },
+                popExitTransition = { slideOutHorizontally(targetOffsetX = { it }) + fadeOut() }
+            ) { entry ->
+                val channelArg = entry.arguments?.getString("channelId").orEmpty()
+                com.sentup.android.ui.channel.ChannelScreen(
+                    channelId = channelArg,
+                    homeViewModel = homeViewModel,
+                    onBack = { navController.popBackStack() },
+                    onPlayVideo = { video -> videoPlayerViewModel.playVideo(video) },
+                    onPlayQueue = { queue -> videoPlayerViewModel.playQueue(queue) },
+                    onOpenShorts = openShorts,
+                    // A channel opened from inside a channel is a new entry, so
+                    // back walks the trail of creators the user actually followed.
+                    onOpenChannel = openChannel,
+                    onEnqueueVideo = { video, playNext ->
+                        videoPlayerViewModel.enqueueVideo(video, playNext)
+                    },
+                    // The sign-in dialog lives on the home screen, so a login ask
+                    // from here goes back for it rather than opening a second
+                    // WebView on top of a detail screen - same rule as the
+                    // subscriptions manager above.
+                    onLoginClick = { navController.popBackStack("home", inclusive = false) },
+                    // The music artist page lives inside the Library tab rather
+                    // than on a route of its own, so the cross-link goes home
+                    // and asks for it; HomeScreen routes to the tab and clears
+                    // the request as it renders.
+                    onOpenMusicArtist = { _, name ->
+                        homeViewModel.requestArtistPage(name)
+                        navController.popBackStack("home", inclusive = false)
+                    }
+                )
+            }
+            composable(
+                route = "downloads",
+                enterTransition = { slideInHorizontally(initialOffsetX = { it }) + fadeIn() },
+                exitTransition = { slideOutHorizontally(targetOffsetX = { it }) + fadeOut() },
+                popEnterTransition = { slideInHorizontally(initialOffsetX = { -it / 3 }) + fadeIn() },
+                popExitTransition = { slideOutHorizontally(targetOffsetX = { it }) + fadeOut() }
+            ) {
+                val downloadedSongs by playerViewModel.downloadedSongs.collectAsState()
+                val downloadedVideos by playerViewModel.downloadedVideos.collectAsState()
+                val downloadProgress by playerViewModel.downloadProgress.collectAsState()
+                com.sentup.android.ui.downloads.DownloadsScreen(
+                    downloadedSongs = downloadedSongs,
+                    downloadedVideos = downloadedVideos,
+                    activeDownloads = downloadProgress,
+                    onPauseDownload = playerViewModel::pauseDownload,
+                    onResumeDownload = playerViewModel::resumeDownload,
+                    initiallyShowVideos = videoMode,
+                    onBack = { navController.popBackStack() },
+                    onPlaySong = { song ->
+                        playerViewModel.playSong(song)
+                    },
+                    onPlayQueue = { songs, song ->
+                        playerViewModel.playQueue(songs, song)
+                    },
+                    onPlayVideo = { videos, video ->
+                        videoPlayerViewModel.playDownloadedVideos(videos, video)
+                    },
+                    onDeleteDownload = { songId ->
+                        playerViewModel.deleteDownload(songId)
+                    },
+                    onDeleteVideo = { videoId ->
+                        playerViewModel.deleteVideoDownload(videoId)
+                    },
+                    onCancelDownload = { songId ->
+                        playerViewModel.cancelDownload(songId)
+                    },
+                    onRetryDownload = { request ->
+                        playerViewModel.retryDownload(request)
+                    },
+                    onCancelAll = { playerViewModel.cancelAllDownloads() }
+                )
+            }
+            composable(
+                route = "stats",
+                enterTransition = { 
+                    slideInHorizontally(
+                        initialOffsetX = { it },
+                        animationSpec = androidx.compose.animation.core.tween(500, easing = androidx.compose.animation.core.CubicBezierEasing(0.2f, 0f, 0f, 1f))
+                    ) + fadeIn(animationSpec = androidx.compose.animation.core.tween(400))
+                },
+                exitTransition = { 
+                    slideOutHorizontally(
+                        targetOffsetX = { it },
+                        animationSpec = androidx.compose.animation.core.tween(500, easing = androidx.compose.animation.core.CubicBezierEasing(0.2f, 0f, 0f, 1f))
+                    ) + fadeOut(animationSpec = androidx.compose.animation.core.tween(400))
+                },
+                popEnterTransition = { 
+                    slideInHorizontally(
+                        initialOffsetX = { -it / 3 },
+                        animationSpec = androidx.compose.animation.core.tween(500, easing = androidx.compose.animation.core.CubicBezierEasing(0.2f, 0f, 0f, 1f))
+                    ) + fadeIn(animationSpec = androidx.compose.animation.core.tween(400))
+                },
+                popExitTransition = { 
+                    slideOutHorizontally(
+                        targetOffsetX = { it },
+                        animationSpec = androidx.compose.animation.core.tween(500, easing = androidx.compose.animation.core.CubicBezierEasing(0.2f, 0f, 0f, 1f))
+                    ) + fadeOut(animationSpec = androidx.compose.animation.core.tween(400))
+                }
+            ) {
+                com.sentup.android.ui.library.StatsScreen(
+                    onBack = { navController.popBackStack() },
+                    viewModel = homeViewModel,
+                    contentPadding = androidx.compose.foundation.layout.PaddingValues(bottom = 160.dp)
+                )
+            }
+            composable(
+                route = "taste",
+                enterTransition = { slideInHorizontally(initialOffsetX = { it }) + fadeIn() },
+                exitTransition = { slideOutHorizontally(targetOffsetX = { it }) + fadeOut() },
+                popEnterTransition = { slideInHorizontally(initialOffsetX = { -it / 3 }) + fadeIn() },
+                popExitTransition = { slideOutHorizontally(targetOffsetX = { it }) + fadeOut() }
+            ) {
+                com.sentup.android.ui.taste.TasteSetupScreen(
+                    ignoreExisting = false,
+                    onFinished = {
+                        // Home was built from the taste as it stood before.
+                        homeViewModel.loadYouTubeRecommendations(force = true)
+                        navController.popBackStack()
+                    }
+                )
+            }
+            composable(
+                route = "update",
+                enterTransition = { slideInHorizontally(initialOffsetX = { it }) + fadeIn() },
+                exitTransition = { slideOutHorizontally(targetOffsetX = { it }) + fadeOut() },
+                popEnterTransition = { slideInHorizontally(initialOffsetX = { -it / 3 }) + fadeIn() },
+                popExitTransition = { slideOutHorizontally(targetOffsetX = { it }) + fadeOut() }
+            ) {
+                // Local Only is handled inside the screen rather than by
+                // replacing it. The installed version, build, ABI and Android
+                // version are on the device already, and the full-screen notice
+                // hid all of it behind a page with no visible way back.
+                com.sentup.android.ui.settings.UpdateScreen(
+                    onBack = { navController.popBackStack() },
+                    localOnlyMode = localOnlyMode
+                )
+            }
+            composable(
+                route = "licenses",
+                enterTransition = { slideInHorizontally(initialOffsetX = { it }) + fadeIn() },
+                exitTransition = { slideOutHorizontally(targetOffsetX = { it }) + fadeOut() },
+                popEnterTransition = { slideInHorizontally(initialOffsetX = { -it / 3 }) + fadeIn() },
+                popExitTransition = { slideOutHorizontally(targetOffsetX = { it }) + fadeOut() }
+            ) {
+                com.sentup.android.ui.settings.LicensesScreen(onBack = { navController.popBackStack() })
+            }
+            composable(
+                route = "report",
+                enterTransition = { slideInHorizontally(initialOffsetX = { it }) + fadeIn() },
+                exitTransition = { slideOutHorizontally(targetOffsetX = { it }) + fadeOut() },
+                popEnterTransition = { slideInHorizontally(initialOffsetX = { -it / 3 }) + fadeIn() },
+                popExitTransition = { slideOutHorizontally(targetOffsetX = { it }) + fadeOut() }
+            ) {
+                com.sentup.android.ui.report.ReportBugScreen(
+                    onBack = { navController.popBackStack() }
+                )
+            }
+            composable(
+                route = "app_time_limit",
+                enterTransition = { slideInHorizontally(initialOffsetX = { it }) + fadeIn() },
+                exitTransition = { slideOutHorizontally(targetOffsetX = { it }) + fadeOut() },
+                popEnterTransition = { slideInHorizontally(initialOffsetX = { -it / 3 }) + fadeIn() },
+                popExitTransition = { slideOutHorizontally(targetOffsetX = { it }) + fadeOut() }
+            ) {
+                com.sentup.android.ui.applock.AppTimeLimitScreen(
+                    onBack = { navController.popBackStack() }
+                )
+            }
+        }
+        
+        // This overlay is above the NavHost, so its collapsed bar was drawing
+        // over the full-screen music player, which is inside Home. Both players
+        // surviving a mode switch is deliberate; one of them hovering over the
+        // other's open player is not.
+        val isMusicPlayerExpanded by playerViewModel.isPlayerExpanded.collectAsState()
+
+        com.sentup.android.ui.video.VideoPlayerOverlay(
+            viewModel = videoPlayerViewModel,
+            timedCommentsEnabled = timedCommentsEnabled,
+            showRelatedVideos = showRelatedVideos,
+            onOpenChannel = openChannel,
+            onListenAsMusic = moveVideoToMusic,
+            hostBottomChrome = videoMiniBottomChrome,
+            hostChromeFollowOffsetPx = videoMiniFollowOffsetPx,
+            miniBarHidden = isMusicPlayerExpanded
+        )
+
+        // Shorts sit above everything, including the video player overlay. The
+        // host remains available because the setting hides only Home's shelf;
+        // the shared launch contract above decides between this swipe player
+        // and the ordinary video player for every other surface.
+        com.sentup.android.ui.shorts.ShortsPlayerOverlay(
+            viewModel = shortsPlayerViewModel,
+            hiddenActions = shortsHiddenActions,
+            onOpenChannel = openChannel,
+            homeViewModel = homeViewModel
+        )
+
+        // Standby owns the whole window while it is open, so it sits above
+        // both players and Shorts; its offer sits just under it.
+        com.sentup.android.ui.standby.StandbySuggestion(viewModel = playerViewModel)
+        com.sentup.android.ui.standby.StandbyOverlay(viewModel = playerViewModel)
+
+        // One confirmation host covers the player controls and every song
+        // options sheet. Download requests carry the chosen song through the
+        // PlayerViewModel so a non-playing row works even when no mini player
+        // exists to host UI of its own.
+        pendingSongDownload?.let {
+            com.sentup.android.ui.downloads.SongDownloadSheet(
+                song = it,
+                onConfirm = playerViewModel::confirmPendingSongDownload,
+                onDismiss = playerViewModel::dismissPendingSongDownload
+            )
+        }
+
+        // Undo for "don't recommend", and word of a song that could not be
+        // played, app-wide and last in the stack.
+        //
+        // One host for the whole app rather than one per screen: the action can
+        // be taken from the home grid, the subscriptions feed, search, the
+        // player's Up Next list and Shorts, and two of those are overlays
+        // drawn above the NavHost. A per-screen snackbar would be hidden behind
+        // the Shorts overlay exactly when it is needed most, and could show
+        // twice when a screen and an overlay are both alive. The playback
+        // messages share it so the two can never draw over each other.
+        AppSnackbarHost(
+            playbackFailures = playerViewModel.playbackFailures,
+            modifier = Modifier
+                .align(Alignment.BottomCenter)
+                .navigationBarsPadding()
+                .padding(bottom = if (musicPillVisible) 96.dp else 16.dp)
+        )
+
+        // Offer to report the crash from the previous run. Read once per
+        // composition of MusicApp (an activity recreation re-reads the file,
+        // but either answer has deleted it by then). Only after onboarding -
+        // a crash during first-run setup would otherwise interrupt it again.
+        if (onboardingCompleted) {
+            var showCrashPrompt by remember {
+                mutableStateOf(
+                    com.sentup.android.data.CrashReporter.shouldPromptForPendingCrash(context)
+                )
+            }
+            if (showCrashPrompt) {
+                CrashReportPrompt(
+                    onViewReport = {
+                        showCrashPrompt = false
+                        navController.navigate("report")
+                    },
+                    onDismiss = {
+                        showCrashPrompt = false
+                        com.sentup.android.data.CrashReporter.dismissPendingCrashPrompt(context)
+                    }
+                )
+            }
+        }
+
+        // The daily time limit's enforcement surface, last in the stack so it
+        // covers the NavHost, both player overlays and every prompt. Locking
+        // also stands playback down: a limiter that locks the screen while
+        // music keeps playing would be counting nothing and stopping nothing.
+        androidx.compose.runtime.LaunchedEffect(appTimeLocked) {
+            if (appTimeLocked) {
+                playerViewModel.pause()
+                videoPlayerViewModel.pause()
+                shortsPlayerViewModel.pause()
+            }
+        }
+        if (appTimeLocked && !isInPipMode) {
+            val limitPrefs = remember { com.sentup.android.data.ThemePreferences(context) }
+            val usedSeconds = remember(appTimeLocked) {
+                com.sentup.android.data.AppTimeLimit.usedSecondsToday(context)
+            }
+            val budgetMinutes = remember(appTimeLocked) {
+                com.sentup.android.data.AppTimeLimit.budgetMinutesForToday(
+                    com.sentup.android.data.AppTimeLimit.parseBudgets(
+                        limitPrefs.getTimeLimitBudgets()
+                    )
+                )
+            }
+            com.sentup.android.ui.applock.AppLockOverlay(
+                usedSecondsToday = usedSeconds,
+                budgetMinutes = budgetMinutes
+            )
+        }
+    }
+}
+
+/**
+ * Shows "Video hidden - Undo" whenever something is dismissed, says so when a
+ * song could not be played, and confirms a channel's bell change.
+ *
+ * Keyed on the action's id rather than the action itself so two identical
+ * dismissals in a row still re-show the snackbar instead of the second one
+ * silently doing nothing.
+ */
+@Composable
+private fun AppSnackbarHost(
+    playbackFailures: kotlinx.coroutines.flow.Flow<PlayerViewModel.PlaybackFailure>,
+    modifier: Modifier = Modifier,
+) {
+    val context = LocalContext.current
+    val repository = remember(context) {
+        com.sentup.android.data.NotInterestedRepository(context)
+    }
+    // Undo also takes back the account-side dismissal when there was one, so it
+    // goes through the actions layer rather than straight to the local store.
+    //
+    // Built lazily: this host is composed for the whole life of the app, while
+    // a YouTubeRepository carries its own OkHttp pool and opens
+    // EncryptedSharedPreferences. Nobody should pay that at startup for a path
+    // that only runs when someone actually taps Undo.
+    val actions = remember(context) {
+        lazy {
+            com.sentup.android.data.NotInterestedActions(
+                repository,
+                com.sentup.android.data.YouTubeRepository(context)
+            )
+        }
+    }
+    // Deliberately not the LaunchedEffect's own scope: that is cancelled the
+    // moment another dismissal replaces this one, which would drop the undo
+    // request mid-flight exactly when the user is undoing in a hurry.
+    val undoScope = androidx.compose.runtime.rememberCoroutineScope()
+    val lastAction by repository.lastAction.collectAsState()
+    val snackbarHostState = remember { SnackbarHostState() }
+
+    LaunchedEffect(lastAction?.id) {
+        val action = lastAction ?: return@LaunchedEffect
+        val result = snackbarHostState.showSnackbar(
+            message = action.message,
+            actionLabel = context.getString(R.string.undo),
+            withDismissAction = false,
+            duration = SnackbarDuration.Short
+        )
+        if (result == SnackbarResult.ActionPerformed) {
+            actions.value.undo(action, undoScope)
+        } else {
+            // Timed out or was replaced. The hide stands; just stop offering
+            // an undo for something the user has moved on from.
+            repository.clearLastAction()
+        }
+    }
+
+    // Latest only: a newer failure replaces the one on screen, so a run of
+    // them - no connection, a whole queue refusing - reads as one message
+    // rather than a queue of snackbars to sit through.
+    LaunchedEffect(playbackFailures) {
+        playbackFailures.collectLatest { failure ->
+            val title = failure.title?.takeIf { it.isNotBlank() }
+                ?: context.getString(R.string.music_failed_untitled)
+            val message = when (failure.outcome) {
+                PlayerViewModel.PlaybackFailure.Outcome.SKIPPED ->
+                    context.getString(R.string.music_failed_skipped, title)
+                PlayerViewModel.PlaybackFailure.Outcome.STOPPED ->
+                    context.getString(R.string.music_failed_stopped, title)
+                PlayerViewModel.PlaybackFailure.Outcome.REFUSED ->
+                    context.getString(R.string.music_failed_refused)
+            }
+            snackbarHostState.showSnackbar(
+                message = message,
+                withDismissAction = false,
+                duration = SnackbarDuration.Short,
+            )
+        }
+    }
+
+    // Bell changes from the watch page, the channel page and the channel list.
+    // Latest only, like the failures above: a second pick replaces the first.
+    LaunchedEffect(Unit) {
+        com.sentup.android.data.ChannelBellActions.messages.collectLatest { message ->
+            snackbarHostState.showSnackbar(
+                message = message,
+                withDismissAction = false,
+                duration = SnackbarDuration.Short,
+            )
+        }
+    }
+
+    DismissibleSnackbarHost(hostState = snackbarHostState, modifier = modifier)
+}
+
+/**
+ * One-time offer to report the crash the app died with on its previous run.
+ *
+ * A dialog at the MusicApp root rather than a card inside Home: it must be
+ * answerable before any of the tab content, overlays or mini players settle,
+ * and both answers are one tap - "Report" opens the reporter route (which
+ * carries the crash file's contents), while "Not now" keeps it available from
+ * the manual reporter and suppresses only this prompt. Either way it never
+ * appears twice for the same crash.
+ */
+@Composable
+private fun CrashReportPrompt(
+    onViewReport: () -> Unit,
+    onDismiss: () -> Unit
+) {
+    AlertDialog(
+        onDismissRequest = onDismiss,
+        containerColor = MaterialTheme.colorScheme.surfaceContainerHigh,
+        shape = RoundedCornerShape(32.dp),
+        icon = {
+            Box(
+                modifier = Modifier
+                    .size(64.dp)
+                    .clip(RoundedCornerShape(20.dp))
+                    .background(MaterialTheme.colorScheme.primary.copy(alpha = 0.15f)),
+                contentAlignment = Alignment.Center
+            ) {
+                Icon(
+                    imageVector = Icons.Rounded.BugReport,
+                    contentDescription = null,
+                    tint = MaterialTheme.colorScheme.primary
+                )
+            }
+        },
+        title = {
+            Text(
+                text = stringResource(R.string.crash_dialog_title),
+                fontWeight = FontWeight.Bold,
+                modifier = Modifier.fillMaxWidth()
+            )
+        },
+        text = {
+            Text(
+                text = stringResource(R.string.crash_dialog_message),
+                color = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+        },
+        confirmButton = {
+            Button(onClick = onViewReport) {
+                Text(stringResource(R.string.crash_dialog_view_report))
+            }
+        },
+        dismissButton = {
+            TextButton(onClick = onDismiss) {
+                Text(stringResource(R.string.crash_dialog_not_now))
+            }
+        }
+    )
+}
+
+/**
+ * Music-mode representation of a video handed over by "Listen as music".
+ * Same shape as the search and shared-link converters: the channel stands in
+ * for the artist, and there is no album to name.
+ */
+private fun VideoItem.toSong(): Song = Song.fromYouTube(
+    videoId = videoId,
+    title = title,
+    artist = channelName,
+    album = "",
+    duration = duration * 1000,
+    thumbnailUrl = thumbnailUrl
+)
+
+
+/** How many songs of the music queue a move to video mode carries along. */
+private const val MUSIC_TO_VIDEO_QUEUE_MAX = 50

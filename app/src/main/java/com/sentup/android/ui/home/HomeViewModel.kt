@@ -1,0 +1,4556 @@
+package com.sentup.android.ui.home
+import com.sentup.android.R
+
+import com.sentup.android.util.KLog
+
+import android.app.Application
+import androidx.lifecycle.AndroidViewModel
+import com.sentup.android.ui.theme.playlistCoverSeeds
+import androidx.lifecycle.viewModelScope
+import com.sentup.android.data.SessionManager
+import com.sentup.android.data.Song
+import com.sentup.android.data.toVideoItem
+import com.sentup.android.data.SongRepository
+import com.sentup.android.data.SongSource
+import com.sentup.android.data.SubscriptionTransfer
+import com.sentup.android.data.UNKNOWN_ARTIST
+import com.sentup.android.data.FolderInfo
+import com.sentup.android.data.VideoItem
+import com.sentup.android.data.ArtistItem
+import com.sentup.android.data.PlaylistDisplayItem
+import com.sentup.android.data.PlaylistPageInfo
+import com.sentup.android.data.VideoPlaylist
+import com.sentup.android.data.YouTubeRepository
+import com.sentup.android.data.LikedSongsRepository
+import com.sentup.android.data.HomeRecommendationCache
+import com.sentup.android.data.usableHomeRecommendations
+import kotlinx.coroutines.flow.MutableStateFlow
+import kotlinx.coroutines.flow.StateFlow
+import kotlinx.coroutines.flow.asStateFlow
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.Job
+import kotlinx.coroutines.withContext
+import kotlinx.coroutines.async
+import kotlinx.coroutines.awaitAll
+import kotlinx.coroutines.flow.first
+import kotlinx.coroutines.flow.SharingStarted
+import kotlinx.coroutines.flow.combine
+import kotlinx.coroutines.flow.distinctUntilChanged
+import kotlinx.coroutines.flow.drop
+import kotlinx.coroutines.flow.map
+import kotlinx.coroutines.flow.stateIn
+import kotlinx.coroutines.channels.awaitClose
+import kotlinx.coroutines.launch
+
+internal const val BROWSE_HOME = "FEmusic_home"
+internal const val BROWSE_EXPLORE = "FEmusic_explore"
+internal const val BROWSE_CHARTS = "FEmusic_charts"
+internal const val BROWSE_NEW = "FEmusic_new_releases"
+internal const val BROWSE_MOOD = "mood"
+private const val MAX_DURATION_BACKFILL = 30
+
+internal fun shouldWarmSubscriptionFeed(
+    source: String,
+    hasLocalSubscriptions: Boolean,
+    isLoggedIn: Boolean
+): Boolean = when (source) {
+    com.sentup.android.data.ThemePreferences.SUBSCRIPTIONS_LOCAL -> hasLocalSubscriptions
+    com.sentup.android.data.ThemePreferences.SUBSCRIPTIONS_YOUTUBE -> isLoggedIn
+    else -> hasLocalSubscriptions || isLoggedIn
+}
+
+class HomeViewModel(application: Application) : AndroidViewModel(application) {
+
+    private val app get() = getApplication<Application>()
+    private val localRepository = SongRepository(application)
+    private val youtubeRepository = YouTubeRepository(application)
+    private val playlistRepository = com.sentup.android.data.PlaylistRepository(application)
+    private val sessionManager = SessionManager(application)
+    private val searchHistoryRepository = com.sentup.android.data.SearchHistoryRepository(application)
+    private val recommendationEngine = com.sentup.android.data.RecommendationEngine(application, youtubeRepository)
+    private val homeRecommendationCache = HomeRecommendationCache(application)
+    // Ids that have led Home this session, oldest first, so a pull to refresh
+    // can lead with something else. Above init, which runs the first load.
+    private val recentHomeLeads = ArrayDeque<String>()
+    private val videoHistoryRepository = com.sentup.android.data.VideoHistoryRepository(application)
+    private val localVideoRepository = com.sentup.android.data.LocalVideoRepository(application)
+
+    // What the user asked not to be recommended, in either mode. Declared with
+    // the other repositories rather than beside the video feeds it started
+    // with: the music recommendation flow is initialised further up this file
+    // and now filters through it, and a property initialiser cannot reach a
+    // declaration below it.
+    private val notInterestedRepository =
+        com.sentup.android.data.NotInterestedRepository(application)
+
+    /** Local hide plus best-effort account propagation - see NotInterestedActions. */
+    private val notInterestedActions =
+        com.sentup.android.data.NotInterestedActions(notInterestedRepository, youtubeRepository)
+    private val themePreferences = com.sentup.android.data.ThemePreferences(application)
+
+    private val _songs = MutableStateFlow<List<Song>>(emptyList())
+    val songs: StateFlow<List<Song>> = _songs.asStateFlow()
+
+    /**
+     * An artist page asked for from outside the Home screen - today, the
+     * "Open music artist page" cross-link on a creator's channel page.
+     *
+     * The Library owns artist detail and is handed one through `initialArtist`,
+     * which is state inside `HomeScreen` and therefore unreachable from a
+     * NavHost destination sitting beside it. This is the same hand-off, one
+     * level up: set from anywhere, consumed by `HomeScreen` the moment it
+     * routes to the Library tab, and cleared so returning to Library later
+     * lands on the list rather than re-opening the artist.
+     */
+    private val _pendingArtistPage = MutableStateFlow<String?>(null)
+    val pendingArtistPage: StateFlow<String?> = _pendingArtistPage.asStateFlow()
+
+    fun requestArtistPage(artistName: String) {
+        _pendingArtistPage.value = artistName.takeIf { it.isNotBlank() }
+    }
+
+    fun consumeArtistPageRequest() {
+        _pendingArtistPage.value = null
+    }
+
+    /**
+     * A playlist page asked for from outside the Home screen - today, a
+     * playlist link shared or opened into the app.
+     *
+     * The same hand-off as [pendingArtistPage] and for the same reason: both
+     * playlist pages live inside the tab system, which a share intent arriving
+     * at `MainActivity` cannot reach. Two flows rather than one tagged value
+     * because the two modes land on different tabs and hold different types,
+     * and a share names which mode it wants by the link it carries.
+     */
+    private val _pendingPlaylistPage = MutableStateFlow<PlaylistDisplayItem?>(null)
+    val pendingPlaylistPage: StateFlow<PlaylistDisplayItem?> = _pendingPlaylistPage.asStateFlow()
+
+    private val _pendingVideoPlaylistPage = MutableStateFlow<VideoPlaylist?>(null)
+    val pendingVideoPlaylistPage: StateFlow<VideoPlaylist?> = _pendingVideoPlaylistPage.asStateFlow()
+
+    /**
+     * A Spotify playlist or album link shared into the app, waiting for the
+     * Library to open its import screen on it. The same hand-off as the
+     * playlist page above: the screen lives inside the tab system.
+     */
+    private val _pendingSpotifyImport = MutableStateFlow<String?>(null)
+    val pendingSpotifyImport: StateFlow<String?> = _pendingSpotifyImport.asStateFlow()
+
+    fun requestSpotifyImport(link: String) {
+        _pendingSpotifyImport.value = link.takeIf { it.isNotBlank() }
+    }
+
+    fun consumeSpotifyImportRequest() {
+        _pendingSpotifyImport.value = null
+    }
+
+    private val spotifyPlaylistSource = com.sentup.android.data.SpotifyPlaylistSource()
+
+    /** The songs a Spotify link names, or null when it cannot be read (private, removed, offline). */
+    suspend fun loadSpotifyCollection(ref: com.sentup.android.data.SpotifyRef): com.sentup.android.data.SpotifyCollection? =
+        try {
+            spotifyPlaylistSource.load(ref)
+        } catch (e: kotlinx.coroutines.CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            KLog.w("HomeViewModel", "Spotify playlist could not be read", e)
+            null
+        }
+
+    /**
+     * The same recording on YouTube Music, or null when no result is an exact
+     * match. One song search per track: the caller paces them and stops on a
+     * rate-limit hold, since a hundred searches in a row is exactly the
+     * traffic that hold exists to stop.
+     */
+    suspend fun matchSpotifyTrack(track: com.sentup.android.data.SpotifyTrack): Song? =
+        try {
+            com.sentup.android.data.SpotifyMatcher.pick(
+                track,
+                youtubeRepository.search(com.sentup.android.data.SpotifyMatcher.query(track))
+            )
+        } catch (e: kotlinx.coroutines.CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            null
+        }
+
+    fun requestPlaylistPage(info: PlaylistPageInfo) {
+        _pendingPlaylistPage.value = info.toDisplayItem()
+    }
+
+    fun consumePlaylistPageRequest() {
+        _pendingPlaylistPage.value = null
+    }
+
+    fun requestVideoPlaylistPage(info: PlaylistPageInfo) {
+        _pendingVideoPlaylistPage.value = info.toVideoPlaylist()
+    }
+
+    fun consumeVideoPlaylistPageRequest() {
+        _pendingVideoPlaylistPage.value = null
+    }
+
+    /**
+     * What a shared playlist link points at, as the page that opens it needs to
+     * describe itself. Null when the id has no page behind it - a generated
+     * mix, a private or deleted list - which is the caller's cue to fall back
+     * to playing rather than opening.
+     */
+    suspend fun resolvePlaylistPageFromLink(playlistId: String): PlaylistPageInfo? {
+        return try {
+            youtubeRepository.getPlaylistHeader(playlistId)
+        } catch (e: Exception) {
+            null
+        }
+    }
+
+    private val _searchHistory = MutableStateFlow(searchHistoryRepository.getHistory())
+    val searchHistory: StateFlow<List<String>> = _searchHistory.asStateFlow()
+
+    private val _youtubeSongs = MutableStateFlow(homeRecommendationCache.load())
+    /**
+     * The music recommendation feed, with dismissed songs and blocked artists
+     * removed.
+     *
+     * A derived flow over the raw fetch, never a write into it - the rule the
+     * video feeds already follow: a tap removes the row on the next frame with
+     * no refetch, and undo puts it back where it was rather than somewhere
+     * else or nowhere. The local library (`songs`) is deliberately not filtered
+     * through here: it is music the user chose to have, and "stop recommending
+     * this" was never a request to hide their own files.
+     */
+    val youtubeSongs: StateFlow<List<Song>> = combine(
+        _youtubeSongs,
+        notInterestedRepository.hiddenVideos,
+        notInterestedRepository.blockedChannels
+    ) { songs, _, _ -> notInterestedRepository.filterSongs(songs) }
+        .stateIn(
+            viewModelScope,
+            kotlinx.coroutines.flow.SharingStarted.WhileSubscribed(5000),
+            emptyList()
+        )
+    
+
+
+    private val _isYouTubeConnected = MutableStateFlow(false)
+
+    /**
+     * A YouTube session that actually authenticates. A session YouTube has
+     * rejected reads as disconnected, so account-only screens offer the sign-in
+     * wall instead of sitting on an empty list with no explanation.
+     */
+    val isYouTubeConnected: StateFlow<Boolean> =
+        combine(_isYouTubeConnected, SessionManager.sessionExpired) { connected, expired ->
+            connected && !expired
+        }.stateIn(viewModelScope, SharingStarted.Eagerly, false)
+
+    private val _isLoading = MutableStateFlow(false)
+    val isLoading: StateFlow<Boolean> = _isLoading.asStateFlow()
+
+    private val _likedSongs = MutableStateFlow<List<Song>>(emptyList())
+    // Combine YouTube liked songs with manually liked songs (local or YT)
+    private val likedSongsRepository = LikedSongsRepository(application)
+    
+    // Combined liked songs: manually liked (full metadata stored on like, so
+    // YouTube songs show without a login) + YT-account liked + liked local songs.
+    val likedSongs: StateFlow<List<Song>> = combine(
+        _likedSongs,                       // YouTube Liked (from API, requires login)
+        _songs,                            // Local Songs
+        likedSongsRepository.likedSongs,   // Manually liked, with metadata (newest first)
+        likedSongsRepository.likedSongIds  // Manually liked IDs (covers legacy likes without metadata)
+    ) { ytLiked, localSongs, manuallyLikedSongs, manuallyLikedIds ->
+        val manuallyLikedLocalSongs = localSongs.filter { it.id in manuallyLikedIds }
+        (manuallyLikedSongs + ytLiked + manuallyLikedLocalSongs).distinctBy { it.id }
+    }.stateIn(viewModelScope, kotlinx.coroutines.flow.SharingStarted.WhileSubscribed(5000), emptyList())
+
+    // YouTube playlists
+    private val _youtubePlaylists = MutableStateFlow<List<com.sentup.android.data.PlaylistDisplayItem>>(emptyList())
+    
+    // Playlists and albums saved from search or an artist page: references,
+    // fetched live when opened. See SavedPlaylistsRepository.
+    private val savedPlaylistsRepository =
+        com.sentup.android.data.SavedPlaylistsRepository(application)
+
+    // Playlists the user told Sentüp not to show them. Process-wide, because the
+    // Library grid, Spotlight's shelves and the player's add-to-playlist sheet
+    // are three ViewModels holding three sets of repositories.
+    private val hiddenPlaylistsRepository =
+        com.sentup.android.data.HiddenPlaylistsRepository(application)
+
+    // Video playlists held on the device, with the videos embedded. The video
+    // counterpart of playlistRepository, and the reason video mode can save
+    // anything at all signed out. See LocalVideoPlaylistsRepository.
+    private val localVideoPlaylistsRepository =
+        com.sentup.android.data.LocalVideoPlaylistsRepository(application)
+
+    // Merged Playlists (Local + Saved + YouTube)
+    //
+    // Saved sit between the two because that is what they are: not the user's
+    // own, but kept deliberately, so they belong above the account's own list
+    // rather than lost at the end of it.
+    val userPlaylists: StateFlow<List<com.sentup.android.data.PlaylistDisplayItem>> = combine(
+        _youtubePlaylists,
+        playlistRepository.userPlaylists,
+        savedPlaylistsRepository.savedPlaylists,
+        hiddenPlaylistsRepository.hiddenPlaylists
+    ) { ytPlaylists, localPlaylists, savedPlaylists, hidden ->
+        val localItems = localPlaylists.map { it.toDisplayItem() }
+        // A playlist kept locally that also turns up in the account's own
+        // library would otherwise appear twice in the grid.
+        val accountIds = ytPlaylists.map { it.id }.toSet()
+        val savedItems = savedPlaylists
+            .filterNot { it.id in accountIds }
+            .map { it.toDisplayItem() }
+        // Hiding is applied to the merged list rather than to each source, so
+        // one hidden id covers the playlist wherever it came from - and it is
+        // a filter over the fetch, never a write into it, so un-hiding brings
+        // the playlist straight back without a refetch.
+        val hiddenIds = hidden.map { it.playlistId }.toSet()
+        (localItems + savedItems + ytPlaylists).filterNot { it.id in hiddenIds }
+    }.stateIn(viewModelScope, kotlinx.coroutines.flow.SharingStarted.WhileSubscribed(5000), emptyList())
+
+    // --- Spotlight's YouTube Music tabs (home, explore, charts, new, a mood) ---
+
+    data class MusicBrowseState(
+        val shelves: List<com.sentup.android.data.MusicShelf> = emptyList(),
+        val loading: Boolean = false,
+        val failed: Boolean = false,
+        val continuation: String? = null,
+        val title: String? = null,
+    )
+
+    private val _musicBrowse = MutableStateFlow<Map<String, MusicBrowseState>>(emptyMap())
+    val musicBrowse: StateFlow<Map<String, MusicBrowseState>> = _musicBrowse.asStateFlow()
+    private var moodRequest: com.sentup.android.data.MusicShelfItem.Mood? = null
+
+    /**
+     * Bumped on a profile switch. These tabs are fetched signed in and so are
+     * the account's own, and a page requested for one profile that answers
+     * after the switch must not be shown to the next.
+     */
+    private var musicBrowseGeneration = 0
+
+    private fun updateBrowse(key: String, block: (MusicBrowseState) -> MusicBrowseState) {
+        _musicBrowse.value = _musicBrowse.value + (key to block(_musicBrowse.value[key] ?: MusicBrowseState()))
+    }
+
+    private fun withoutDismissed(shelves: List<com.sentup.android.data.MusicShelf>) = shelves.mapNotNull { shelf ->
+        val items = shelf.items.filterNot {
+            it is com.sentup.android.data.MusicShelfItem.Track && notInterestedRepository.filterSongs(listOf(it.song)).isEmpty()
+        }
+        shelf.copy(items = items).takeIf { items.isNotEmpty() }
+    }
+
+    fun loadMusicBrowse(key: String, force: Boolean = false) {
+        val current = _musicBrowse.value[key]
+        if (current?.loading == true || (!force && current?.shelves?.isNotEmpty() == true)) return
+        if (themePreferences.isLocalOnlyModeEnabled()) return
+        val mood = if (key == BROWSE_MOOD) moodRequest ?: return else null
+        updateBrowse(key) { it.copy(loading = true, failed = false) }
+        val generation = musicBrowseGeneration
+        viewModelScope.launch {
+            val page = youtubeRepository.getMusicShelves(mood?.browseId ?: key, mood?.params)
+            if (generation != musicBrowseGeneration) return@launch
+            updateBrowse(key) {
+                if (page == null) it.copy(loading = false, failed = it.shelves.isEmpty())
+                else MusicBrowseState(withoutDismissed(page.shelves), false, false, page.continuation, mood?.title)
+            }
+        }
+    }
+
+    /** One-off shelf fetch for callers that play a mood page straight away. */
+    suspend fun fetchMusicShelves(
+        browseId: String,
+        params: String?
+    ): com.sentup.android.data.MusicShelfPage? = youtubeRepository.getMusicShelves(browseId, params)
+
+    fun loadMoreMusicBrowse(key: String) {
+        val current = _musicBrowse.value[key] ?: return
+        val token = current.continuation ?: return
+        if (current.loading) return
+        updateBrowse(key) { it.copy(loading = true) }
+        val generation = musicBrowseGeneration
+        viewModelScope.launch {
+            val page = youtubeRepository.getMusicShelvesContinuation(token)
+            if (generation != musicBrowseGeneration) return@launch
+            updateBrowse(key) {
+                it.copy(
+                    loading = false,
+                    shelves = it.shelves + withoutDismissed(page?.shelves.orEmpty()),
+                    continuation = page?.continuation
+                )
+            }
+        }
+    }
+
+    fun openMood(mood: com.sentup.android.data.MusicShelfItem.Mood) {
+        moodRequest = mood
+        _musicBrowse.value = _musicBrowse.value - BROWSE_MOOD
+        loadMusicBrowse(BROWSE_MOOD)
+    }
+
+    fun closeMood() {
+        moodRequest = null
+        _musicBrowse.value = _musicBrowse.value - BROWSE_MOOD
+    }
+
+    // --- Spotlight's "New for you" shelf ---
+
+    private val _discoverySongs = MutableStateFlow<List<Song>>(emptyList())
+
+    /**
+     * Songs the user has not heard, from what they do listen to.
+     *
+     * Filtered through the same dismissal store the rest of the music feed
+     * is: a discovery shelf that keeps offering something the user explicitly
+     * said no to is the one place that reads worst.
+     */
+    val discoverySongs: StateFlow<List<Song>> = combine(
+        _discoverySongs,
+        notInterestedRepository.hiddenVideos,
+        notInterestedRepository.blockedChannels
+    ) { discovered, _, _ -> notInterestedRepository.filterSongs(discovered) }
+        .stateIn(
+            viewModelScope,
+            kotlinx.coroutines.flow.SharingStarted.WhileSubscribed(5000),
+            emptyList()
+        )
+
+    private val _discoveryCollections =
+        MutableStateFlow(com.sentup.android.data.RecommendationEngine.DiscoveryCollections())
+
+    /**
+     * The albums, playlists and artists under the discovery songs.
+     *
+     * Filtered against the same two stores the rest of the screen respects, as
+     * a derived flow rather than at fetch time: hiding a playlist or blocking
+     * an artist has to take it off this shelf on the next frame, not on the
+     * next refresh.
+     */
+    val discoveryCollections: StateFlow<com.sentup.android.data.RecommendationEngine.DiscoveryCollections> =
+        combine(
+            _discoveryCollections,
+            hiddenPlaylistsRepository.hiddenPlaylists,
+            notInterestedRepository.blockedChannels
+        ) { collections, _, _ ->
+            collections.copy(
+                albums = collections.albums.filterNot { hiddenPlaylistsRepository.isHidden(it.id) },
+                playlists = collections.playlists
+                    .filterNot { hiddenPlaylistsRepository.isHidden(it.id) },
+                artists = collections.artists.filterNot {
+                    notInterestedRepository.isCreatorBlocked(it.id, it.name)
+                }
+            )
+        }.stateIn(
+            viewModelScope,
+            kotlinx.coroutines.flow.SharingStarted.WhileSubscribed(5000),
+            com.sentup.android.data.RecommendationEngine.DiscoveryCollections()
+        )
+
+    private val _isDiscoveryLoading = MutableStateFlow(false)
+    val isDiscoveryLoading: StateFlow<Boolean> = _isDiscoveryLoading.asStateFlow()
+
+    private var discoveryJob: kotlinx.coroutines.Job? = null
+
+    /**
+     * Fetch the discovery shelf, once, when the tab that shows it is opened.
+     *
+     * Lazy rather than loaded with the rest of Home: it is several searches
+     * and a radio call, and most sessions never open that tab. [force] is the
+     * pull-to-refresh path, which must actually re-run rather than see a
+     * non-empty list and decline.
+     */
+    fun loadDiscovery(force: Boolean = false) {
+        if (!force && (_discoverySongs.value.isNotEmpty() || _isDiscoveryLoading.value)) return
+        discoveryJob?.cancel()
+        discoveryJob = viewModelScope.launch {
+            _isDiscoveryLoading.value = true
+            try {
+                // Everything the user already has is what makes this
+                // "discovery" rather than a second copy of their library.
+                val known = buildSet {
+                    _songs.value.forEach { add(it.id) }
+                    likedSongsRepository.likedSongIds.value.forEach { add(it) }
+                    _recentlyPlayed.value.forEach { add(it.id) }
+                }
+                // The two halves are fetched together and awaited together:
+                // the shelves are what the songs grid scrolls into, and loading
+                // them on a second pass would make the tab grow under the
+                // finger a second or two after it looked finished.
+                val discoveredSongs = async {
+                    recommendationEngine.getDiscoveryRecommendations(known)
+                }
+                val collections = async {
+                    recommendationEngine.getDiscoveryCollections(
+                        // Nothing already in the library is a discovery, and a
+                        // playlist the user saved or made is the clearest case
+                        // of that.
+                        excludeCollectionIds = buildSet {
+                            userPlaylists.value.forEach { add(it.id) }
+                            savedPlaylistIds.value.forEach { add(it) }
+                        },
+                        // The seeds themselves: an "artists you might like"
+                        // shelf that opens with the artist the seed came from
+                        // is telling the user about themselves.
+                        excludeArtistNames = buildSet {
+                            _songs.value.forEach { add(it.artist) }
+                            _recentlyPlayed.value.forEach { add(it.artist) }
+                        }
+                    )
+                }
+                val discovered = discoveredSongs.await()
+                // An empty result must not wipe a shelf that is already showing
+                // something usable - a failed refresh should look like nothing
+                // happened, not like the feature broke.
+                if (discovered.isNotEmpty() || _discoverySongs.value.isEmpty()) {
+                    _discoverySongs.value = discovered
+                }
+                val fetchedCollections = collections.await()
+                if (!fetchedCollections.isEmpty() || _discoveryCollections.value.isEmpty()) {
+                    _discoveryCollections.value = fetchedCollections
+                }
+            } catch (e: Exception) {
+                KLog.w("HomeViewModel", "Discovery recommendations failed", e)
+            } finally {
+                _isDiscoveryLoading.value = false
+            }
+        }
+    }
+
+    /** Playlists the user told Sentüp not to show, for the management sheet. */
+    val hiddenPlaylists: StateFlow<List<com.sentup.android.data.HiddenPlaylist>> =
+        hiddenPlaylistsRepository.hiddenPlaylists
+
+    fun isPlaylistHidden(playlistId: String?): Boolean =
+        hiddenPlaylistsRepository.isHidden(playlistId)
+
+    /**
+     * Stop showing [playlist] in Sentüp. Local only - nothing is unsubscribed,
+     * unfollowed or deleted, and the playlist is still reachable by link or
+     * search. Synchronous, because the row has to leave in the frame it was
+     * dismissed in.
+     */
+    fun hidePlaylist(playlist: com.sentup.android.data.PlaylistDisplayItem) {
+        hiddenPlaylistsRepository.hide(
+            com.sentup.android.data.HiddenPlaylist(
+                playlistId = playlist.id,
+                name = playlist.name,
+                uploaderName = playlist.uploaderName,
+                thumbnailUrl = playlist.thumbnailUrl
+            )
+        )
+    }
+
+    fun unhidePlaylist(playlistId: String) = hiddenPlaylistsRepository.unhide(playlistId)
+    
+    /**
+     * Video mode's device playlists, shown in the music Library's own section
+     * (feedback, September 2026: local playlists should be visible in both
+     * modes). A separate list rather than merged into [userPlaylists] on
+     * purpose: that list also feeds the add-to-playlist sheet and the
+     * rename/delete paths, which would treat an unfamiliar id as an account
+     * playlist. Here they open read-only and play as songs; they are edited in
+     * the mode that owns them.
+     */
+    val videoPlaylistsForMusic: StateFlow<List<com.sentup.android.data.PlaylistDisplayItem>> = combine(
+        localVideoPlaylistsRepository.playlists,
+        hiddenPlaylistsRepository.hiddenPlaylists
+    ) { local, hidden ->
+        val hiddenIds = hidden.map { it.playlistId }.toSet()
+        local.filter { it.videos.isNotEmpty() && it.id !in hiddenIds }.map { playlist ->
+            com.sentup.android.data.PlaylistDisplayItem(
+                name = playlist.name,
+                url = playlist.id,
+                uploaderName = CROSS_MODE_VIDEO_SUBTITLE,
+                itemCount = playlist.videos.size,
+                thumbnailUrl = playlist.videos.first().thumbnailUrl
+            )
+        }
+    }.stateIn(viewModelScope, kotlinx.coroutines.flow.SharingStarted.WhileSubscribed(5000), emptyList())
+
+    /**
+     * Music mode's device playlists for video mode's Library, the other half
+     * of [videoPlaylistsForMusic]. Only the songs that are YouTube videos come
+     * across (a device audio file has no video), and a playlist with none is
+     * left out rather than shown empty.
+     */
+    val musicPlaylistsForVideo: StateFlow<List<com.sentup.android.data.VideoPlaylist>> = combine(
+        playlistRepository.userPlaylists,
+        hiddenPlaylistsRepository.hiddenPlaylists
+    ) { local, hidden ->
+        val hiddenIds = hidden.map { it.playlistId }.toSet()
+        local.mapNotNull { playlist ->
+            if (playlist.id in hiddenIds) return@mapNotNull null
+            val watchable = playlist.songs.filter { it.source == SongSource.YOUTUBE }
+            if (watchable.isEmpty()) return@mapNotNull null
+            com.sentup.android.data.VideoPlaylist(
+                playlistId = playlist.id,
+                title = playlist.name,
+                thumbnailUrl = watchable.first().thumbnailUrl,
+                videoCountText = if (watchable.size == 1) "1 video" else "${watchable.size} videos",
+                subtitle = CROSS_MODE_MUSIC_SUBTITLE
+            )
+        }
+    }.stateIn(viewModelScope, kotlinx.coroutines.flow.SharingStarted.WhileSubscribed(5000), emptyList())
+
+    val localPlaylistIds: StateFlow<Set<String>> = playlistRepository.userPlaylists
+        .map { playlists -> playlists.map { it.id }.toSet() }
+        .stateIn(viewModelScope, kotlinx.coroutines.flow.SharingStarted.WhileSubscribed(5000), emptySet())
+
+    /**
+     * Ids of playlists kept as references rather than owned.
+     *
+     * The UI needs this and not just "is it in the library": a saved playlist
+     * is somebody else's, so the rename and delete actions a library playlist
+     * normally offers would be writes against a playlist the user has no rights
+     * to. Anything the account genuinely owns is excluded, so an id here is
+     * always a reference.
+     */
+    val savedPlaylistIds: StateFlow<Set<String>> = combine(
+        savedPlaylistsRepository.savedPlaylists,
+        _youtubePlaylists
+    ) { saved, _ ->
+        // Not filtered by the account list: a saved playlist is also liked into
+        // the account's library when signed in, and still is not the user's own.
+        saved.map { it.id }.toSet()
+    }.stateIn(viewModelScope, kotlinx.coroutines.flow.SharingStarted.WhileSubscribed(5000), emptySet())
+
+    fun isPlaylistSaved(playlistId: String?): Boolean = savedPlaylistsRepository.isSaved(playlistId)
+
+    /**
+     * Keep or drop [playlist]. Returns the state after the toggle.
+     *
+     * Synchronous: the store is one preference write, and the button has to
+     * settle in the frame it was tapped in.
+     */
+    fun toggleSavedPlaylist(
+        playlist: com.sentup.android.data.PlaylistDisplayItem,
+        isAlbum: Boolean = false
+    ): Boolean = savedPlaylistsRepository.toggle(
+        com.sentup.android.data.SavedPlaylist(
+            id = playlist.id,
+            url = playlist.url,
+            name = playlist.name,
+            uploaderName = playlist.uploaderName,
+            thumbnailUrl = playlist.thumbnailUrl,
+            itemCount = playlist.itemCount,
+            isAlbum = isAlbum,
+            releaseType = playlist.releaseType,
+            releaseYear = playlist.releaseYear
+        )
+    ).also { saved -> syncSavedToAccount(playlist.id, saved) }
+
+    fun removeSavedPlaylist(playlistId: String) {
+        savedPlaylistsRepository.remove(playlistId)
+        syncSavedToAccount(playlistId, false)
+    }
+
+    // Signed in, Save also puts the playlist in the account's library. Albums
+    // (MPREb browse ids) have no playlist id to like, so they stay device-only.
+    private fun syncSavedToAccount(playlistId: String, saved: Boolean) {
+        if (!sessionManager.isLoggedIn() || playlistId.startsWith("MPRE")) return
+        viewModelScope.launch {
+            if (!youtubeRepository.setPlaylistInLibrary(playlistId, saved)) {
+                KLog.w("HomeViewModel", "Account library ${if (saved) "save" else "remove"} failed for $playlistId")
+            }
+        }
+    }
+
+    private val _userAvatar = MutableStateFlow<String?>(sessionManager.getUserAvatar())
+    val userAvatar: StateFlow<String?> = _userAvatar.asStateFlow()
+
+    private val _userName = MutableStateFlow<String?>(sessionManager.getUserName())
+    val userName: StateFlow<String?> = _userName.asStateFlow()
+
+    // Downloads
+    private val downloadRepository = com.sentup.android.data.DownloadRepository.getInstance(application)
+    val downloadedSongs = downloadRepository.downloadedSongs
+    val downloadedVideos = downloadRepository.downloadedVideos
+    val downloadingIds = downloadRepository.downloadingIds
+    val downloadProgress = downloadRepository.downloadProgress
+
+    // Recently played (from the local play history)
+    private val _recentlyPlayed = MutableStateFlow<List<Song>>(emptyList())
+    val recentlyPlayed: StateFlow<List<Song>> = _recentlyPlayed.asStateFlow()
+
+    // Plays per song id, for the Library's "Most played" sort. Derived from the
+    // same history read as the recents rail rather than a second file load.
+    private val _playCounts = MutableStateFlow<Map<String, Int>>(emptyMap())
+    val playCounts: StateFlow<Map<String, Int>> = _playCounts.asStateFlow()
+
+    // Songs sitting in the stream cache in full, so they play with no network.
+    // See ReadyOfflineRepository for why this is a state rather than a playlist.
+    private val readyOfflineRepository =
+        com.sentup.android.data.ReadyOfflineRepository(application)
+    private val _readyOffline =
+        MutableStateFlow(com.sentup.android.data.ReadyOfflineRepository.Result())
+    val readyOffline: StateFlow<com.sentup.android.data.ReadyOfflineRepository.Result> =
+        _readyOffline.asStateFlow()
+
+    /**
+     * Re-read the cache and resolve it against the play history.
+     *
+     * Pulled rather than observed: the cache has no change notification, and
+     * polling it would mean walking every key on a timer for a list nobody is
+     * looking at. The Library refreshes it on open, which is the only place it
+     * is shown.
+     */
+    fun refreshReadyOffline() {
+        viewModelScope.launch {
+            _readyOffline.value = readyOfflineRepository.load(
+                downloadedIds = downloadedSongs.value.map { it.id }.toSet()
+            )
+        }
+    }
+
+    // Albums behind the play history, for Classic Home's "Recent albums".
+    // Read from the same history load as the recents rail below.
+    private val _recentAlbums = MutableStateFlow<List<RecentAlbum>>(emptyList())
+    val recentAlbums: StateFlow<List<RecentAlbum>> = _recentAlbums.asStateFlow()
+
+    /**
+     * Whether the device has a validated connection, kept live from the
+     * default-network callback so an offline-only shelf appears when the
+     * signal goes and leaves when it comes back, not on the next refresh.
+     * Starts from [hasNetworkConnection] so the first frame is already right.
+     */
+    val isOnline: StateFlow<Boolean> = kotlinx.coroutines.flow.callbackFlow {
+        val cm = getApplication<Application>()
+            .getSystemService(android.content.Context.CONNECTIVITY_SERVICE)
+            as android.net.ConnectivityManager
+        val callback = object : android.net.ConnectivityManager.NetworkCallback() {
+            override fun onCapabilitiesChanged(
+                network: android.net.Network,
+                caps: android.net.NetworkCapabilities,
+            ) {
+                trySend(
+                    caps.hasCapability(android.net.NetworkCapabilities.NET_CAPABILITY_INTERNET) &&
+                        caps.hasCapability(android.net.NetworkCapabilities.NET_CAPABILITY_VALIDATED)
+                )
+            }
+
+            override fun onLost(network: android.net.Network) {
+                trySend(false)
+            }
+        }
+        trySend(hasNetworkConnection())
+        val registered = runCatching { cm.registerDefaultNetworkCallback(callback) }.isSuccess
+        awaitClose { if (registered) runCatching { cm.unregisterNetworkCallback(callback) } }
+    }.distinctUntilChanged().stateIn(
+        viewModelScope,
+        kotlinx.coroutines.flow.SharingStarted.WhileSubscribed(5000),
+        true
+    )
+
+    // Classic Home's top artists rail, and the photos found for them so far.
+    // Photos arrive separately and late, so the rail draws immediately with a
+    // monogram and each face fades in when its lookup lands.
+    private val _topArtists = MutableStateFlow<List<TopArtist>>(emptyList())
+    val topArtists: StateFlow<List<TopArtist>> = _topArtists.asStateFlow()
+    private val _artistPhotos = MutableStateFlow<Map<String, String>>(emptyMap())
+    val artistPhotos: StateFlow<Map<String, String>> = _artistPhotos.asStateFlow()
+    private val artistPhotoCache = com.sentup.android.data.ArtistPhotoCache(application)
+    private var artistPhotoJob: kotlinx.coroutines.Job? = null
+
+    /**
+     * Fill [artistPhotos] for [artists]: cached answers at once, then one artist
+     * search per name the cache cannot answer, one at a time.
+     *
+     * Discretionary fan-out, so it stands down during a rate-limit hold and
+     * offline, and it is capped by the rail's own length. A name is taken only
+     * when the search's top artist carries that exact name: a near miss would
+     * put a stranger's face on someone's favourite artist, and the monogram is
+     * the better answer.
+     */
+    private fun loadArtistPhotos(artists: List<TopArtist>) {
+        artistPhotoJob?.cancel()
+        val known = HashMap<String, String>()
+        val missing = mutableListOf<String>()
+        for (artist in artists) {
+            when (val hit = artistPhotoCache.lookup(artist.name)) {
+                is com.sentup.android.data.ArtistPhotoCache.Lookup.Photo -> known[artist.name] = hit.url
+                com.sentup.android.data.ArtistPhotoCache.Lookup.Miss -> Unit
+                com.sentup.android.data.ArtistPhotoCache.Lookup.Unknown -> missing += artist.name
+            }
+        }
+        _artistPhotos.value = known
+        // Fresh pref read: Local Only is flipped from the settings screen's own
+        // ThemePreferences instance.
+        if (missing.isEmpty() || themePreferences.isLocalOnlyModeEnabled()) return
+        artistPhotoJob = viewModelScope.launch {
+            for (name in missing) {
+                if (com.sentup.android.data.YouTubeRateLimit.isHeld() || !hasNetworkConnection()) return@launch
+                val match = try {
+                    youtubeRepository.searchArtists(name)
+                        .firstOrNull()
+                        ?.takeIf { it.name.trim().equals(name.trim(), ignoreCase = true) }
+                } catch (e: kotlinx.coroutines.CancellationException) {
+                    throw e
+                } catch (e: Exception) {
+                    null
+                }
+                val url = com.sentup.android.data.googleImageAtSize(match?.thumbnailUrl, 288)
+                artistPhotoCache.put(name, url)
+                if (url != null) _artistPhotos.value = _artistPhotos.value + (name to url)
+            }
+        }
+    }
+
+    fun refreshRecentlyPlayed(limit: Int = 15): kotlinx.coroutines.Job =
+        viewModelScope.launch {
+            val history = statsRepository.loadHistory() // newest first
+            _playCounts.value = history.groupingBy { it.songId }.eachCount()
+            _recentAlbums.value = recentAlbumsFrom(history)
+            val artists = topArtistsFrom(history, System.currentTimeMillis())
+            if (artists != _topArtists.value || _artistPhotos.value.isEmpty()) {
+                _topArtists.value = artists
+                loadArtistPhotos(artists)
+            }
+            val localSongs = _songs.value
+            val seen = mutableSetOf<String>()
+            val recents = mutableListOf<Song>()
+            for (entry in history) {
+                if (!seen.add(entry.songId)) continue
+                val song = if (entry.source == com.sentup.android.data.SongSource.LOCAL) {
+                    // Local files need a playable URI — resolve from the scanned library
+                    localSongs.find { it.id == entry.songId }
+                } else {
+                    Song.fromYouTube(
+                        videoId = entry.songId,
+                        title = entry.title,
+                        artist = entry.artist,
+                        album = entry.album,
+                        duration = entry.duration,
+                        thumbnailUrl = entry.thumbnailUrl
+                    )
+                }
+                if (song != null) recents.add(song)
+                if (recents.size >= limit) break
+            }
+            _recentlyPlayed.value = recents
+        }
+
+    // Video Mode State
+    /**
+     * Raw feed as fetched. Everything user-facing reads [trendingVideos]
+     * instead, which subtracts what the user asked not to see.
+     */
+    private val _trendingVideos = MutableStateFlow<List<VideoItem>>(emptyList())
+
+    /**
+     * Apply the setting immediately; in-flight requests are prevented from
+     * repopulating it.
+     *
+     * Shorts are a separate shelf with their own setting, so the shelf is
+     * loaded either way - switching recommendations off must not silently take
+     * the Shorts row away with them.
+     */
+    fun applyVideoRecommendationsPreference(enabled: Boolean) {
+        if (enabled) {
+            // Runs on every return to Home, not only when the preference
+            // changes. A feed loaded minutes ago stays, with the user's place
+            // in it, instead of being refetched and replaced.
+            if (_trendingVideos.value.isNotEmpty() && loadedRecently(videoFeedLoadedAtMs)) {
+                loadShortsFeed()
+                return
+            }
+            loadTrendingVideos()
+        } else {
+            loadShortsFeed()
+            loadSubscriptions()
+            // Home shows the shuffle now, not the date-ordered feed; that one
+            // is warmed for the Subscriptions tab on its own.
+            loadSubscriptionMix()
+            _trendingVideos.value = emptyList()
+            _isVideoLoading.value = false
+            _isVideoLoadingMore.value = false
+            videoFeedContinuation = null
+            videoFeedExhausted = true
+        }
+    }
+
+    /**
+     * The home feed with hidden videos and blocked channels removed.
+     *
+     * Filtering is a derived flow rather than a write into the raw list, so a
+     * "not interested" tap takes the item off screen on the next frame with no
+     * refetch, and Undo puts it straight back where it was. Doing it the other
+     * way - mutating the fetched list - would make undo a re-fetch, and the
+     * video would come back in a different position or not at all.
+     */
+    val trendingVideos: StateFlow<List<VideoItem>> =
+        combine(
+            _trendingVideos,
+            notInterestedRepository.hiddenVideos,
+            notInterestedRepository.blockedChannels
+        ) { videos, _, _ -> notInterestedRepository.filter(videos) }
+            .stateIn(viewModelScope, SharingStarted.Eagerly, emptyList())
+    
+    private val _historyVideos = MutableStateFlow<List<VideoItem>>(emptyList())
+    val historyVideos: StateFlow<List<VideoItem>> = _historyVideos.asStateFlow()
+    private val historyPagination = com.sentup.android.data.DemandPagination<String>()
+    val historyPageState = historyPagination.state
+    private var historyLoadJob: Job? = null
+    private var historySession: com.sentup.android.data.YouTubeSession? = null
+
+    /**
+     * Video files on the device, newest first.
+     *
+     * Loaded only once the Library asks, which is the whole gate on this
+     * feature: nothing here runs, and no permission is requested, for a user
+     * who never opens the section.
+     */
+    private val _deviceVideos =
+        MutableStateFlow<List<com.sentup.android.data.LocalVideo>>(emptyList())
+    val deviceVideos: StateFlow<List<com.sentup.android.data.LocalVideo>> =
+        _deviceVideos.asStateFlow()
+
+    /** Folder cards, derived rather than queried a second time. */
+    val deviceVideoFolders: StateFlow<List<com.sentup.android.data.LocalVideoFolder>> =
+        _deviceVideos
+            .map { com.sentup.android.data.LocalVideoRepository.foldersOf(it) }
+            .stateIn(viewModelScope, SharingStarted.Lazily, emptyList())
+
+    private val _isDeviceVideosLoading = MutableStateFlow(false)
+    val isDeviceVideosLoading: StateFlow<Boolean> = _isDeviceVideosLoading.asStateFlow()
+
+    /** True once a scan has finished, so an empty list can be told from a pending one. */
+    private val _hasScannedDeviceVideos = MutableStateFlow(false)
+    val hasScannedDeviceVideos: StateFlow<Boolean> = _hasScannedDeviceVideos.asStateFlow()
+
+    private var deviceVideosJob: Job? = null
+
+    /**
+     * Re-read the device's videos.
+     *
+     * Always a fresh query rather than a cached list: the system's media
+     * scanner runs while the app is backgrounded, so a recording made since the
+     * tab was last opened must appear on the way back to it. A scan already in
+     * flight is left alone, since the two would return the same rows.
+     */
+    fun loadDeviceVideos() {
+        if (deviceVideosJob?.isActive == true) return
+        deviceVideosJob = viewModelScope.launch {
+            _isDeviceVideosLoading.value = true
+            try {
+                _deviceVideos.value = localVideoRepository.getVideos()
+                _hasScannedDeviceVideos.value = true
+            } finally {
+                _isDeviceVideosLoading.value = false
+            }
+        }
+    }
+
+    private val _shortsFeed = MutableStateFlow<List<com.sentup.android.data.ShortsItem>>(emptyList())
+    private var shortsFeedLoadJob: Job? = null
+    private var shortsFeedGeneration = 0L
+    private val _isShortsLoading = MutableStateFlow(false)
+    val isShortsLoading = _isShortsLoading.asStateFlow()
+    private val _shortsFeedFailed = MutableStateFlow(false)
+    val shortsFeedFailed = _shortsFeedFailed.asStateFlow()
+
+    private fun clearShortsFeed() {
+        shortsFeedGeneration++
+        shortsFeedLoadJob?.cancel()
+        shortsFeedLoadJob = null
+        _shortsFeed.value = emptyList()
+        _isShortsLoading.value = false
+        _shortsFeedFailed.value = false
+    }
+
+    /**
+     * Shorts shelf minus hidden Shorts and blocked channels.
+     *
+     * A channel block reaches only the entries that name their channel -
+     * prefetched ones (see ShortsItem). The rest are caught in the player:
+     * dropped from the sequence once prefetch names them, or skipped when the
+     * one on screen turns out to be from a blocked channel.
+     */
+    val shortsFeed: StateFlow<List<com.sentup.android.data.ShortsItem>> =
+        combine(
+            _shortsFeed,
+            notInterestedRepository.hiddenVideos,
+            notInterestedRepository.blockedChannels
+        ) { shorts, _, _ ->
+            shorts.filterNot {
+                notInterestedRepository.isVideoHidden(it.videoId) ||
+                    ((it.channelId != null || it.channelName.isNotBlank()) &&
+                        notInterestedRepository.isCreatorBlocked(it.channelId, it.channelName))
+            }
+        }.stateIn(viewModelScope, SharingStarted.Eagerly, emptyList())
+    
+    private val _isHistoryLoading = MutableStateFlow(false)
+    val isHistoryLoading: StateFlow<Boolean> = _isHistoryLoading.asStateFlow()
+    
+    private val _isVideoLoading = MutableStateFlow(false)
+    val isVideoLoading: StateFlow<Boolean> = _isVideoLoading.asStateFlow()
+
+    /**
+     * True when the latest empty Home fetch failed without a validated network.
+     * Kept separate from an empty online response so the UI can offer completed
+     * downloads only when they are actually the useful fallback.
+     */
+    private val _isVideoHomeOffline = MutableStateFlow(false)
+    val isVideoHomeOffline: StateFlow<Boolean> = _isVideoHomeOffline.asStateFlow()
+
+    private val _isVideoLoadingMore = MutableStateFlow(false)
+    val isVideoLoadingMore: StateFlow<Boolean> = _isVideoLoadingMore.asStateFlow()
+
+    // Home feed paging: browse continuation token (logged-in personalized
+    // feed) or watch-history seed offset (logged-out taste-based feed).
+    private var videoFeedContinuation: String? = null
+    private var tasteSeedOffset = 0
+    private var videoFeedExhausted = false
+
+    // Videos already put in front of the user this session, so a refresh can
+    // skip them. FEwhat_to_watch barely moves between fetches - measured
+    // against the live feed (August 2026), re-requesting page 1 came back 22
+    // videos of which 16 had just been on screen - so a refresh that simply
+    // replaced the list looked like nothing had happened. Continuation pages,
+    // by contrast, were 100% new, which is what [refreshVideos] pulls from.
+    private val shownVideoIds = LinkedHashSet<String>()
+
+    // ---------------- Subscriptions tab ----------------
+
+    private val localSubscriptionsRepository =
+        com.sentup.android.data.LocalSubscriptionsRepository(application)
+
+    /** Channels from the signed-in Google account (FEchannels). */
+    private val _accountChannels = MutableStateFlow<List<com.sentup.android.data.SubscribedChannel>>(emptyList())
+
+    /** Channels followed on this device. Process-wide, so a subscribe anywhere lands here. */
+    val localSubscriptions: StateFlow<List<com.sentup.android.data.LocalSubscription>> =
+        localSubscriptionsRepository.subscriptions
+
+    val subscriptionGroups: StateFlow<List<com.sentup.android.data.SubscriptionGroup>> =
+        localSubscriptionsRepository.groups
+
+    /** Which group filters the feed, or null for everything. */
+    private val _selectedGroupId = MutableStateFlow<String?>(null)
+    val selectedGroupId: StateFlow<String?> = _selectedGroupId.asStateFlow()
+
+    /**
+     * The channel list the Subscriptions tab shows, resolved from the source
+     * setting. On "auto" both lists are merged: someone who imported a list
+     * *and* signed in wants both, and a channel followed in both places must
+     * appear once, so the merge dedupes on channel id with the local entry
+     * winning (it carries the avatar an import backfilled).
+     */
+    val subscribedChannels: StateFlow<List<com.sentup.android.data.SubscribedChannel>> =
+        combine(
+            _accountChannels,
+            localSubscriptions,
+            themePreferences.subscriptionSource
+        ) { account, local, source ->
+            // The local entry wins the merge, but the account's bell rides
+            // along: a channel followed both ways still has an account bell.
+            val accountBells = account.mapNotNull { c -> c.bell?.let { c.channelId to it } }.toMap()
+            val localAsChannels = local.map { entry ->
+                val channel = entry.toSubscribedChannel()
+                accountBells[channel.channelId]?.let { channel.copy(bell = it) } ?: channel
+            }
+            when (source) {
+                com.sentup.android.data.ThemePreferences.SUBSCRIPTIONS_LOCAL -> localAsChannels
+                com.sentup.android.data.ThemePreferences.SUBSCRIPTIONS_YOUTUBE -> account
+                else -> (localAsChannels + account).distinctBy { it.channelId }
+            }.sortedBy { it.name.lowercase() }
+        }.stateIn(viewModelScope, SharingStarted.Eagerly, emptyList())
+
+    private val bellActions = com.sentup.android.data.ChannelBellActions(application, youtubeRepository)
+
+    private val _bellWrites = MutableStateFlow<Set<String>>(emptySet())
+
+    /** Channels whose bell write is in flight; their bell is disabled until it lands. */
+    val bellWrites: StateFlow<Set<String>> = _bellWrites.asStateFlow()
+
+    /**
+     * Move an account channel's bell to [level] from the channel list.
+     * Optimistic over [_accountChannels], put back when the write does not land.
+     */
+    fun setChannelBell(channel: com.sentup.android.data.SubscribedChannel, level: com.sentup.android.data.BellLevel) {
+        val bell = channel.bell ?: return
+        val id = channel.channelId
+        if (id in _bellWrites.value) return
+        fun setBell(next: com.sentup.android.data.ChannelBell) {
+            _accountChannels.value = _accountChannels.value.map {
+                if (it.channelId == id) it.copy(bell = next) else it
+            }
+        }
+        _bellWrites.value = _bellWrites.value + id
+        setBell(bell.withLevel(level))
+        viewModelScope.launch {
+            try {
+                setBell(bellActions.change(bell, level, channel.name) ?: bell)
+            } finally {
+                _bellWrites.value = _bellWrites.value - id
+            }
+        }
+    }
+
+    private val _isSubscriptionsLoading = MutableStateFlow(false)
+    val isSubscriptionsLoading: StateFlow<Boolean> = _isSubscriptionsLoading.asStateFlow()
+
+    private val _subscriptionFeed = MutableStateFlow<List<VideoItem>>(emptyList())
+
+    /**
+     * The subscriptions feed, minus what the user asked not to see. A channel
+     * block does apply here even though the user follows the channel: the two
+     * are different statements, and someone who blocks a channel they follow
+     * has been unambiguous about it.
+     */
+    val subscriptionFeed: StateFlow<List<VideoItem>> =
+        combine(
+            _subscriptionFeed,
+            notInterestedRepository.hiddenVideos,
+            notInterestedRepository.blockedChannels
+        ) { videos, _, _ -> notInterestedRepository.filter(videos) }
+            .stateIn(viewModelScope, SharingStarted.Eagerly, emptyList())
+
+    private val _isSubscriptionFeedLoading = MutableStateFlow(false)
+    val isSubscriptionFeedLoading: StateFlow<Boolean> = _isSubscriptionFeedLoading.asStateFlow()
+
+    // A force request can arrive while a large imported list is still being
+    // fetched (for example, the import finishes during startup warm-up). The
+    // old guard dropped it outright, leaving the newly added channels absent
+    // until the user pulled manually. Coalesce those requests into one follow-
+    // up pass instead of running two hundred-channel refreshes concurrently.
+    private var subscriptionFeedRefreshPending = false
+
+    /**
+     * Whether a feed refresh has run to completion this session.
+     *
+     * The guard below used to be "is the feed non-empty", which never holds
+     * when the refresh came back with nothing - so every visit to the tab
+     * re-ran the whole one-request-per-channel fan-out. Blocked or throttled,
+     * that is a loop: empty feed, user refreshes, N more requests, deeper hold.
+     * An attempt that finished is an attempt, whatever it returned; only an
+     * explicit refresh goes again.
+     */
+    private var subscriptionFeedAttempted = false
+
+    // Paging state. Declared here rather than beside loadMoreSubscriptionFeed:
+    // the cache restore and the warm-up refresh both run from an init
+    // collector, and a property declared below that point is still unset
+    // (or is reset by its own initialiser afterwards) when they touch it.
+
+    /** Token for the account feed's next page; null once YouTube has no more. */
+    private var subscriptionFeedContinuation: String? = null
+
+    /**
+     * The feed on screen came from the disk cache, which stores videos and no
+     * token. The first load-more then fetches the account's first page for its
+     * token (and whatever is new on it) instead of a whole refresh, which for
+     * device follows is a request per channel.
+     */
+    private var subscriptionFeedTokenUnknown = false
+    private var subscriptionFeedGeneration = 0L
+
+    private val _isSubscriptionFeedLoadingMore = MutableStateFlow(false)
+    val isSubscriptionFeedLoadingMore: StateFlow<Boolean> = _isSubscriptionFeedLoadingMore.asStateFlow()
+
+    private val subscriptionFeedCache = com.sentup.android.data.SubscriptionFeedCache(application)
+    private val _subscriptionFeedUpdatedAt = MutableStateFlow<Long?>(null)
+    val subscriptionFeedUpdatedAt: StateFlow<Long?> = _subscriptionFeedUpdatedAt.asStateFlow()
+
+    private fun subscriptionFeedKey(): String =
+        listOf(
+            themePreferences.currentSubscriptionSource(),
+            sessionManager.isLoggedIn().toString(),
+            _selectedGroupId.value.orEmpty(),
+            groupFilteredLocalChannels().map { it.channelId }.sorted().joinToString(",")
+        ).joinToString("|")
+
+    /** Serve the saved feed when the refresh setting says it is still fresh. */
+    private fun restoreCachedSubscriptionFeed(): Boolean {
+        val interval = themePreferences.subscriptionRefreshMinutes()
+        if (interval == com.sentup.android.data.ThemePreferences.SUBS_REFRESH_ON_OPEN) return false
+        val snapshot = subscriptionFeedCache.read() ?: return false
+        if (snapshot.key != subscriptionFeedKey() || snapshot.videos.isEmpty()) return false
+        val age = System.currentTimeMillis() - snapshot.fetchedAtMs
+        if (interval != com.sentup.android.data.ThemePreferences.SUBS_REFRESH_MANUAL && age > interval * 60_000L) return false
+        _subscriptionFeed.value = snapshot.videos
+        resetSubscriptionFeedPaging()
+        subscriptionFeedTokenUnknown = true
+        _subscriptionFeedError.value = null
+        _subscriptionFeedUpdatedAt.value = snapshot.fetchedAtMs
+        subscriptionFeedAttempted = true
+        return true
+    }
+
+    private val _selectedChannelFeed = MutableStateFlow<List<VideoItem>>(emptyList())
+    val selectedChannelFeed: StateFlow<List<VideoItem>> = _selectedChannelFeed.asStateFlow()
+
+    private val _isSelectedChannelFeedLoading = MutableStateFlow(false)
+    val isSelectedChannelFeedLoading: StateFlow<Boolean> =
+        _isSelectedChannelFeedLoading.asStateFlow()
+
+    private val _selectedChannelFeedError = MutableStateFlow<String?>(null)
+    val selectedChannelFeedError: StateFlow<String?> = _selectedChannelFeedError.asStateFlow()
+    private var selectedChannelFeedJob: kotlinx.coroutines.Job? = null
+
+    /**
+     * "42 of 130 channels" while a local refresh runs. A device-local feed
+     * costs one request per channel, so a large list takes long enough that an
+     * indeterminate spinner reads as a hang.
+     */
+    private val _subscriptionFeedProgress = MutableStateFlow<Pair<Int, Int>?>(null)
+    val subscriptionFeedProgress: StateFlow<Pair<Int, Int>?> = _subscriptionFeedProgress.asStateFlow()
+
+    /** Set when a refresh produced nothing and the network was the reason. */
+    private val _subscriptionFeedError = MutableStateFlow<String?>(null)
+    val subscriptionFeedError: StateFlow<String?> = _subscriptionFeedError.asStateFlow()
+
+    // Notifications state
+    private val _notifications = MutableStateFlow<List<com.sentup.android.data.NotificationItem>>(emptyList())
+    val notifications: StateFlow<List<com.sentup.android.data.NotificationItem>> = _notifications.asStateFlow()
+
+    private val _isNotificationsLoading = MutableStateFlow(false)
+    val isNotificationsLoading: StateFlow<Boolean> = _isNotificationsLoading.asStateFlow()
+
+    // Declared here, beside the flow the profile-switch reset also clears,
+    // rather than down with the loader: a property that reset touches must
+    // not be initialised after the collector that runs it.
+    /** Everything known for the open inbox, hidden items included; [notifications] is this filtered. */
+    private var allNotifications: List<com.sentup.android.data.NotificationItem> = emptyList()
+
+    private val _hiddenNotificationCount = MutableStateFlow(0)
+    val hiddenNotificationCount: StateFlow<Int> = _hiddenNotificationCount.asStateFlow()
+
+    // Video library tab state. This half is the signed-in account's own
+    // playlists; the device's are merged in by [videoPlaylists] below.
+    private val _videoPlaylists = MutableStateFlow<List<com.sentup.android.data.VideoPlaylist>>(emptyList())
+
+    /**
+     * Every playlist a video can be saved into: the device's own first, then
+     * the account's.
+     *
+     * Local ones lead because they are the user's own creations and, signed
+     * out, the only ones there are - the same order the music Library merges
+     * its three kinds in. Consumers tell them apart with
+     * [com.sentup.android.data.LocalVideoPlaylistsRepository.isLocal]; nothing
+     * here may assume a playlist id addresses YouTube.
+     */
+    val videoPlaylists: StateFlow<List<com.sentup.android.data.VideoPlaylist>> = combine(
+        localVideoPlaylistsRepository.playlists,
+        _videoPlaylists,
+        hiddenPlaylistsRepository.hiddenPlaylists
+    ) { local, account, hidden ->
+        // The hide is on the playlist, not on the mode. A playlist id means
+        // the same playlist whichever list found it, so "Hide from Sentüp"
+        // covers both - the alternative is a control whose label says Sentüp and
+        // whose effect stops at one tab.
+        val hiddenIds = hidden.map { it.playlistId }.toSet()
+        (local.map { it.toVideoPlaylist() } + account).filterNot { it.playlistId in hiddenIds }
+    }.stateIn(viewModelScope, kotlinx.coroutines.flow.SharingStarted.WhileSubscribed(5000), emptyList())
+
+    private val _isVideoPlaylistsLoading = MutableStateFlow(false)
+    val isVideoPlaylistsLoading: StateFlow<Boolean> = _isVideoPlaylistsLoading.asStateFlow()
+
+    /**
+     * The device's video playlists with their videos still attached, which is
+     * what [videoPlaylists] drops on the way to [com.sentup.android.data.VideoPlaylist].
+     *
+     * Exposed so the options sheet can mark the playlists a video is already
+     * in. It stops at the device's own on purpose: the account's would need a
+     * playlist browse each, which is one request per row for a checkmark, and
+     * saving twice is a no-op on both sides anyway.
+     */
+    val localVideoPlaylists: StateFlow<List<com.sentup.android.data.LocalVideoPlaylist>> =
+        localVideoPlaylistsRepository.playlists
+
+    /**
+     * The saved playlists again, shaped for video mode's Library list and
+     * playlist page. One store feeds both modes, so anything kept in music mode
+     * is here too - see [com.sentup.android.data.SavedPlaylistsRepository].
+     *
+     * Excludes what the account already owns *on the video side*, for the
+     * reason [savedPlaylistIds] excludes the music side's: a playlist that is
+     * genuinely the user's would otherwise sit in the list twice, once as
+     * theirs and once as a reference offering to remove it from the library.
+     *
+     * Albums cross over too: they are kept by browse id ("MPRE..."), which a
+     * video-mode open resolves through [loadPlaylistVideos]'s album branch -
+     * the tracks are ordinary YouTube video ids and play as videos - rather
+     * than the playlist call an MPRE id would silently fail against.
+     *
+     * Declared here rather than beside the other saved-playlist members because
+     * it reads [_videoPlaylists], and a property initialized before the one it
+     * combines with gets null.
+     */
+    val savedVideoPlaylists: StateFlow<List<com.sentup.android.data.VideoPlaylist>> = combine(
+        savedPlaylistsRepository.savedPlaylists,
+        _videoPlaylists
+    ) { saved, accountPlaylists ->
+        val accountIds = accountPlaylists.map { it.playlistId }.toSet()
+        saved.filterNot { it.id in accountIds }.map { it.toVideoPlaylist() }
+    }.stateIn(viewModelScope, kotlinx.coroutines.flow.SharingStarted.WhileSubscribed(5000), emptyList())
+
+    /** Ids of [savedVideoPlaylists], for marking a row or a page as kept. */
+    val savedVideoPlaylistIds: StateFlow<Set<String>> = savedVideoPlaylists
+        .map { playlists -> playlists.map { it.playlistId }.toSet() }
+        .stateIn(viewModelScope, kotlinx.coroutines.flow.SharingStarted.WhileSubscribed(5000), emptySet())
+
+    /**
+     * Keep or drop a playlist found in video mode. Returns the state after the
+     * toggle, synchronous for the same reason [toggleSavedPlaylist] is.
+     */
+    fun toggleSavedVideoPlaylist(playlist: com.sentup.android.data.VideoPlaylist): Boolean =
+        savedPlaylistsRepository.toggle(com.sentup.android.data.SavedPlaylist.from(playlist))
+
+    private val _playlistVideos = MutableStateFlow<List<VideoItem>>(emptyList())
+    val playlistVideos: StateFlow<List<VideoItem>> = _playlistVideos.asStateFlow()
+    private val playlistPagination = com.sentup.android.data.DemandPagination<com.sentup.android.data.VideoPlaylistCursor>()
+    val playlistPageState = playlistPagination.state
+    private var playlistLoadJob: Job? = null
+    private var activeVideoPlaylistId: String? = null
+    private var playlistSession: com.sentup.android.data.YouTubeSession? = null
+
+    private val _isPlaylistVideosLoading = MutableStateFlow(false)
+    val isPlaylistVideosLoading: StateFlow<Boolean> = _isPlaylistVideosLoading.asStateFlow()
+
+    // When each Home loader last reached the network successfully. HomeScreen
+    // is disposed by every real navigation (a channel page, a playlist) and
+    // its startup effects run again on the way back, so without these every
+    // return to Home re-downloaded the whole account: account info, every
+    // liked-songs page (nine for a 300-song library), every library playlist
+    // page, the music home, the video feed and the Shorts shelf - about twenty
+    // requests per visit in a September 2026 report, three times in under an
+    // hour, which is the traffic that gets a device refused by the bot check.
+    // Launch paid for the account half twice on top of that: init and
+    // HomeScreen's effect both call checkYouTubeConnection, and only the
+    // in-flight job below lets the second join the first.
+    // Explicit refreshes, sign-in, sign-out and profile switches pass force.
+    //
+    // Declared above init on purpose: init calls checkYouTubeConnection, whose
+    // launch runs up to its first suspension immediately, and an initializer
+    // placed after init would reset the job it just stored.
+    private var accountLoadJob: Job? = null
+    private var accountLoadedAtMs = 0L
+    private var recommendationsLoadJob: Job? = null
+    private var recommendationsLoadedAtMs = 0L
+    private var videoFeedLoadedAtMs = 0L
+    private var shortsFeedLoadedAtMs = 0L
+
+    init {
+        observeLocalVideoHistory()
+        observeSubscriptionFeedWarmup()
+        checkYouTubeConnection()
+        observeProfileSwitches()
+    }
+
+    /**
+     * Surface a play recorded by the video player or Shorts immediately in
+     * Library. Those surfaces and this ViewModel own different repository
+     * instances, so waiting for another FEhistory fetch left the carousel
+     * stale until a pull-to-refresh. Account history remains authoritative for
+     * the rest of the list; the newest device write only moves that item to the
+     * front while YouTube's watch-stat update catches up.
+     */
+    private fun observeLocalVideoHistory() {
+        viewModelScope.launch {
+            videoHistoryRepository.history
+                .drop(1)
+                .collect { localHistory ->
+                    if (!sessionManager.isLoggedIn()) {
+                        _historyVideos.value = localHistory
+                        return@collect
+                    }
+                    val latest = localHistory.firstOrNull() ?: return@collect
+                    _historyVideos.value = listOf(latest) +
+                        _historyVideos.value.filterNot { it.videoId == latest.videoId }
+                }
+        }
+    }
+
+    /**
+     * Warm the Subscriptions feed from its real inputs, independently of the
+     * tab's composition. Local imports are already persisted and available at
+     * ViewModel construction, so a signed-out user now starts fetching their
+     * device feed as the app opens and sees it ready (or already progressing)
+     * when they visit Subscriptions.
+     *
+     * Only channel ids participate in the key. Avatar/profile backfill rewrites
+     * the same subscriptions and must not restart a potentially large feed.
+     */
+    private fun observeSubscriptionFeedWarmup() {
+        viewModelScope.launch {
+            combine(
+                localSubscriptions
+                    .map { subscriptions -> subscriptions.map { it.channelId }.sorted() }
+                    .distinctUntilChanged(),
+                themePreferences.subscriptionSource,
+                themePreferences.fastSubscriptionFeed
+            ) { localIds, source, fastMode -> Triple(localIds, source, fastMode) }
+                .distinctUntilChanged()
+                .collect { (localIds, source, _) ->
+                    if (shouldWarmSubscriptionFeed(
+                            source = source,
+                            hasLocalSubscriptions = localIds.isNotEmpty(),
+                            isLoggedIn = sessionManager.isLoggedIn()
+                        )
+                    ) {
+                        if (!restoreCachedSubscriptionFeed()) loadSubscriptionFeed(force = true)
+                    } else {
+                        _subscriptionFeed.value = emptyList()
+                        resetSubscriptionFeedPaging()
+                        _subscriptionFeedError.value = null
+                    }
+                }
+        }
+    }
+
+    /**
+     * Reload everything account-derived when the active profile changes.
+     *
+     * There is no DI, so a switch cannot reach this ViewModel directly - it
+     * watches the process-wide id instead, the same pattern the subscription
+     * and blocklist stores use. Without this the app would keep showing the
+     * previous account's feeds, playlists and name under the new identity,
+     * which is the single most visible way an account switcher can be wrong.
+     *
+     * `drop(1)` because the flow replays the current profile on subscribe and
+     * that is not a switch; `checkYouTubeConnection()` already covers startup.
+     */
+    private fun observeProfileSwitches() {
+        viewModelScope.launch {
+            com.sentup.android.data.ProfileManager(getApplication())
+                .activeProfileId
+                .drop(1)
+                .distinctUntilChanged()
+                .collect { resetForProfileChange() }
+        }
+    }
+
+    /**
+     * Drop the previous profile's state and refetch for the new one.
+     *
+     * Mirrors [logout]'s clearing - the same flows go stale for the same
+     * reason - but follows it with a reload rather than leaving the app empty.
+     */
+    private fun resetForProfileChange() {
+        resetVideoLibraryPagination()
+        youtubeRepository.clearSessionScopedInstanceCaches()
+        // Signed-in search is personalised, so serving one account's results
+        // under another is the same mistake as replaying its visitorData.
+        clearSearchCaches()
+
+        // Identity first, so the avatar and name change on the next frame
+        // rather than after the feeds have finished loading.
+        _userAvatar.value = sessionManager.getUserAvatar()
+        _userName.value = sessionManager.getUserName()
+        _isYouTubeConnected.value = sessionManager.isLoggedIn()
+
+        _youtubeSongs.value = homeRecommendationCache.load()
+        _likedSongs.value = emptyList()
+        _youtubePlaylists.value = emptyList()
+        _accountChannels.value = emptyList()
+        _subscriptionFeed.value = emptyList()
+        resetSubscriptionFeedPaging()
+
+        // Both modes are emptied, not just the visible one. Toggling modes
+        // refetches on its own (HomeScreen's LaunchedEffect(videoMode)), but
+        // the old list would stay on screen until that lands - so switching
+        // account and flipping to video mode would show the previous account's
+        // feed for as long as the fetch takes. These loaders also only assign
+        // when the result is non-empty, so clearing is what guarantees a failed
+        // refetch leaves nothing rather than the wrong account's videos.
+        _trendingVideos.value = emptyList()
+        clearShortsFeed()
+        clearSubscriptionMix()
+        clearFeedPosts()
+        _historyVideos.value = emptyList()
+        _lastHistoryRemoval.value = null
+        forgetHomeLoadTimes()
+
+        // Account-only lists the reloads below do not cover. Each is cleared
+        // and its in-flight fetch cancelled, since a response for the previous
+        // account landing afterwards would put it straight back. Groups are
+        // per profile, so a selection from the last one names nothing here.
+        videoPlaylistsJob?.cancel()
+        _isVideoPlaylistsLoading.value = false
+        _videoPlaylists.value = emptyList()
+        notificationsJob?.cancel()
+        _isNotificationsLoading.value = false
+        _notifications.value = emptyList()
+        allNotifications = emptyList()
+        _hiddenNotificationCount.value = 0
+        _selectedGroupId.value = null
+
+        // Spotlight's YouTube Music tabs are the account's own when signed in.
+        // Whatever was open is fetched again for the new profile.
+        val openBrowseTabs = _musicBrowse.value.keys.toList()
+        musicBrowseGeneration++
+        _musicBrowse.value = emptyMap()
+        openBrowseTabs.forEach { loadMusicBrowse(it, force = true) }
+
+        // Listening history, likes and searches are per profile, and so is
+        // everything built from them: the recents rail, top artists, recent
+        // albums, Most played, stats, Ready offline and the discovery shelf.
+        _searchHistory.value = searchHistoryRepository.getHistory()
+        val hadPlayHistory = playHistoryProfileId != null
+        playHistoryProfileId = null
+        _playHistory.value = emptyList()
+        if (hadPlayHistory) loadPlayHistory()
+        refreshStats()
+        refreshReadyOffline()
+        val hadDiscovery = _discoverySongs.value.isNotEmpty() ||
+            !_discoveryCollections.value.isEmpty()
+        discoveryJob?.cancel()
+        _isDiscoveryLoading.value = false
+        _discoverySongs.value = emptyList()
+        _discoveryCollections.value = com.sentup.android.data.RecommendationEngine.DiscoveryCollections()
+        viewModelScope.launch {
+            // Discovery excludes what the recents rail holds, so the rail is
+            // rebuilt for the new profile before the shelf asks.
+            refreshRecentlyPlayed().join()
+            if (hadDiscovery) loadDiscovery(force = true)
+        }
+
+        checkYouTubeConnection(force = true)
+        loadSubscriptions(force = true)
+        loadSubscriptionFeed(force = true)
+        // The video Library only asks when its sign-in state changes, which an
+        // account-to-account switch does not do.
+        if (videoPlaylistsRequested && sessionManager.isLoggedIn()) loadVideoPlaylists(force = true)
+
+        // Refresh whichever home the user is actually on. Same split the
+        // sign-in handler uses, so a switch and a fresh login behave alike.
+        // loadTrendingVideos already pulls the Shorts shelf itself.
+        if (themePreferences.videoMode.value) {
+            loadTrendingVideos()
+            loadSubscriptionMix(force = true)
+            loadYouTubeHistory()
+        } else {
+            loadYouTubeRecommendations(force = true)
+        }
+    }
+
+    /**
+     * Load the account's subscribed channel list (FEchannels). Local
+     * subscriptions need no loading - they are already in memory - so this is
+     * a no-op when the source setting excludes the account or nobody is
+     * signed in.
+     */
+    fun loadSubscriptions(force: Boolean = false) {
+        // First, and outside every guard below: imported channels have no
+        // avatar until this runs, and the guards are all about the *account*
+        // half. Behind them, a signed-out user - the exact person most likely
+        // to have imported a list - never got any pictures.
+        backfillLocalChannelProfiles()
+
+        if (_isSubscriptionsLoading.value) return
+        if (!shouldUseAccountSubscriptions()) return
+        if (_accountChannels.value.isNotEmpty() && !force) return
+        viewModelScope.launch {
+            _isSubscriptionsLoading.value = true
+            try {
+                _accountChannels.value = youtubeRepository.getSubscribedChannels()
+            } finally {
+                _isSubscriptionsLoading.value = false
+            }
+        }
+    }
+
+    /**
+     * Load the subscriptions feed, newest first.
+     *
+     * The two halves come from completely different places: YouTube builds
+     * the account feed server side in one browse call, while the device feed
+     * has to be merged from one request per followed channel. Both are pulled
+     * when the source setting asks for both, and interleaved on upload time so
+     * the result reads as one feed rather than two stacked lists.
+     */
+    /**
+     * Whether the device has a usable network right now.
+     *
+     * Used only to word a failure correctly: an empty feed on a working
+     * connection is a real empty feed, not something the user can fix by
+     * checking their wifi.
+     */
+    fun hasNetworkConnection(): Boolean = try {
+        val cm = getApplication<Application>()
+            .getSystemService(android.content.Context.CONNECTIVITY_SERVICE)
+                as android.net.ConnectivityManager
+        val caps = cm.getNetworkCapabilities(cm.activeNetwork)
+        caps?.hasCapability(android.net.NetworkCapabilities.NET_CAPABILITY_INTERNET) == true &&
+            caps.hasCapability(android.net.NetworkCapabilities.NET_CAPABILITY_VALIDATED)
+    } catch (e: Exception) {
+        // Unknown is treated as connected, so a permissions or API oddity does
+        // not turn every empty feed into a bogus "check your connection".
+        true
+    }
+
+    /**
+     * How a rate limit is worded for the user.
+     *
+     * Deliberately not the generic feed error: that one tells people to check
+     * their connection, and during a hold the connection is fine. Rounds up so
+     * "1 minute" never means "any second now", and falls back to a vague
+     * wording under a minute rather than saying "0 minutes".
+     */
+    private fun rateLimitMessage(): String {
+        val remainingMs = com.sentup.android.data.YouTubeRateLimit.remainingMs()
+        val minutes = ((remainingMs + 59_999L) / 60_000L).toInt()
+        return if (minutes <= 0) {
+            app.getString(R.string.hvm_subs_feed_rate_limited_soon)
+        } else {
+            app.resources.getQuantityString(
+                R.plurals.hvm_subs_feed_rate_limited,
+                minutes,
+                minutes,
+            )
+        }
+    }
+
+    fun loadSubscriptionFeed(force: Boolean = false) {
+        if (_isSubscriptionFeedLoading.value) {
+            if (force) subscriptionFeedRefreshPending = true
+            return
+        }
+        if (subscriptionFeedAttempted && !force) return
+        // An explicit refresh during a hold must not spend the requests either:
+        // say so instead, and leave whatever is already on screen alone.
+        if (com.sentup.android.data.YouTubeRateLimit.isHeld()) {
+            _subscriptionFeedError.value = rateLimitMessage()
+            return
+        }
+        // Claim the refresh before launching so two callers in the same main-
+        // thread frame cannot both pass the guard and start duplicate work.
+        _isSubscriptionFeedLoading.value = true
+        // A page asked for before this refresh belongs to the list it replaces.
+        subscriptionFeedGeneration++
+        _isSubscriptionFeedLoadingMore.value = false
+        viewModelScope.launch {
+            _subscriptionFeedError.value = null
+            // A refresh that was refused never ran, so it must not count as the
+            // one attempt this session gets - otherwise the tab stays stale
+            // even after the hold expires. Re-entering is free: the guard above
+            // turns a revisit during a hold back at the door.
+            var rateLimited = false
+            try {
+                val source = themePreferences.currentSubscriptionSource()
+                val useAccount = source != com.sentup.android.data.ThemePreferences.SUBSCRIPTIONS_LOCAL &&
+                    sessionManager.isLoggedIn()
+                val useLocal = source != com.sentup.android.data.ThemePreferences.SUBSCRIPTIONS_YOUTUBE
+
+                val accountPage = if (useAccount) {
+                    youtubeRepository.getSubscriptionsFeedPage()
+                } else {
+                    com.sentup.android.data.VideoFeedPage(emptyList())
+                }
+                val accountFeed = accountPage.videos
+
+                val channels = if (useLocal) groupFilteredLocalChannels() else emptyList()
+                val localFeed = if (channels.isNotEmpty()) {
+                    _subscriptionFeedProgress.value = 0 to channels.size
+                    youtubeRepository.getLocalSubscriptionsFeed(
+                        channels = channels,
+                        fastMode = themePreferences.isFastSubscriptionFeedEnabled(),
+                        // Pull-to-refresh has to actually hit the network; the
+                        // feeds are cacheable for fifteen minutes and a refresh
+                        // that silently changes nothing is worse than the
+                        // traffic it saves.
+                        forceFresh = force,
+                    ) { done, total -> _subscriptionFeedProgress.value = done to total }
+                } else emptyList()
+
+                _subscriptionFeed.value = mergeFeeds(accountFeed, localFeed)
+                subscriptionFeedContinuation = accountPage.continuation
+                subscriptionFeedTokenUnknown = false
+                if (_subscriptionFeed.value.isNotEmpty()) {
+                    subscriptionFeedCache.write(_subscriptionFeed.value, subscriptionFeedKey())
+                    _subscriptionFeedUpdatedAt.value = System.currentTimeMillis()
+                }
+                if (_subscriptionFeed.value.isEmpty() && (useAccount || channels.isNotEmpty())) {
+                    // Only blame the connection when nothing was reachable.
+                    // Channels that answer but have nothing recent are a normal
+                    // empty feed, and telling someone to check a connection that
+                    // is plainly working sends them fixing the wrong thing.
+                    _subscriptionFeedError.value = if (hasNetworkConnection()) {
+                        app.getString(R.string.hvm_subs_feed_empty)
+                    } else {
+                        app.getString(R.string.hvm_subs_feed_error)
+                    }
+                }
+            } catch (e: com.sentup.android.data.YouTubeRateLimitedException) {
+                // Not a network failure and not an empty feed. Telling someone
+                // to check a working connection sends them fixing the wrong
+                // thing; this is the one case where waiting is the fix.
+                KLog.w("HomeViewModel", "Subscription feed refresh rate limited", e)
+                rateLimited = true
+                _subscriptionFeedError.value = rateLimitMessage()
+            } catch (e: Exception) {
+                KLog.e("HomeViewModel", "Subscription feed refresh failed", e)
+                _subscriptionFeedError.value =
+                    app.getString(R.string.hvm_subs_feed_error)
+            } finally {
+                if (!rateLimited) subscriptionFeedAttempted = true
+                _subscriptionFeedProgress.value = null
+                _isSubscriptionFeedLoading.value = false
+                if (subscriptionFeedRefreshPending) {
+                    subscriptionFeedRefreshPending = false
+                    loadSubscriptionFeed(force = true)
+                }
+            }
+        }
+    }
+
+    // ---------------- Subscriptions feed paging ----------------
+    // (its state is declared beside the feed's own, above the init collectors)
+
+    private fun resetSubscriptionFeedPaging() {
+        subscriptionFeedGeneration++
+        subscriptionFeedContinuation = null
+        subscriptionFeedTokenUnknown = false
+        _isSubscriptionFeedLoadingMore.value = false
+    }
+
+    /**
+     * Append the account feed's next page as the Subscriptions tab nears its
+     * end. Only the account half pages: a device follow's feed is that
+     * channel's Atom file, which has no second page. A page that fails or comes
+     * back empty ends the paging until the next refresh, rather than being
+     * asked for again on every scroll frame.
+     */
+    fun loadMoreSubscriptionFeed() {
+        if (_isSubscriptionFeedLoading.value || _isSubscriptionFeedLoadingMore.value) return
+        if (_subscriptionFeed.value.isEmpty()) return
+        val token = subscriptionFeedContinuation
+        if (token == null && !(subscriptionFeedTokenUnknown && shouldUseAccountSubscriptions())) return
+        if (com.sentup.android.data.YouTubeRateLimit.isHeld()) return
+        val generation = subscriptionFeedGeneration
+        _isSubscriptionFeedLoadingMore.value = true
+        viewModelScope.launch {
+            try {
+                val page = if (token != null) {
+                    youtubeRepository.getVideoFeedContinuation(token)
+                } else {
+                    youtubeRepository.getSubscriptionsFeedPage()
+                }
+                if (generation != subscriptionFeedGeneration) return@launch
+                subscriptionFeedTokenUnknown = false
+                subscriptionFeedContinuation = page.continuation
+                val known = _subscriptionFeed.value.mapTo(HashSet()) { it.videoId }
+                val fresh = page.videos.filter { known.add(it.videoId) }
+                if (fresh.isNotEmpty()) _subscriptionFeed.value = _subscriptionFeed.value + fresh
+            } catch (cancelled: kotlinx.coroutines.CancellationException) {
+                throw cancelled
+            } catch (e: Exception) {
+                KLog.w("HomeViewModel", "Subscription feed page failed", e)
+                if (generation == subscriptionFeedGeneration) subscriptionFeedContinuation = null
+            } finally {
+                if (generation == subscriptionFeedGeneration) _isSubscriptionFeedLoadingMore.value = false
+            }
+        }
+    }
+
+    // ---------------- Community posts between the videos ----------------
+    //
+    // Neither FEwhat_to_watch nor FEsubscriptions carries a post [verified
+    // October 2026, signed in, WEB], so the posts Home and the Subscriptions
+    // tab scatter between videos come from the followed channels themselves: a
+    // few channels at a time in a shuffled order, one Posts-tab browse each,
+    // topped up as a feed grows. It is discretionary fan-out, so a 429 hold
+    // stands it down.
+
+    private val _feedPosts = MutableStateFlow<List<com.sentup.android.data.ChannelPost>>(emptyList())
+
+    /** Posts for the feeds, minus those from a channel the user has blocked since. */
+    val feedPosts: StateFlow<List<com.sentup.android.data.ChannelPost>> =
+        combine(_feedPosts, notInterestedRepository.blockedChannels) { posts, blocked ->
+            if (blocked.isEmpty()) posts
+            else posts.filterNot { post -> blocked.any { it.channelId == post.channelId } }
+        }.stateIn(viewModelScope, SharingStarted.Eagerly, emptyList())
+
+    private var feedPostChannelOrder: List<com.sentup.android.data.SubscribedChannel> = emptyList()
+    private var feedPostNextChannel = 0
+    private var feedPostsStarted = false
+    private var feedPostJob: Job? = null
+    private var feedPostGeneration = 0L
+
+    /**
+     * Make sure there are enough posts for a feed of [videoCount] videos: one
+     * per `FEED_VIDEOS_PER_POST`. Called by the feeds as they scroll; does nothing
+     * once the posts in hand cover the feed or every followed channel has been
+     * asked.
+     */
+    fun ensureFeedPosts(videoCount: Int) {
+        if (themePreferences.isLocalOnlyModeEnabled()) return
+        if (feedPostJob?.isActive == true) return
+        if (_feedPosts.value.size >= videoCount / com.sentup.android.ui.video.FEED_VIDEOS_PER_POST) return
+        if (feedPostsStarted && feedPostNextChannel >= feedPostChannelOrder.size) return
+        if (com.sentup.android.data.YouTubeRateLimit.isHeld()) return
+        val generation = feedPostGeneration
+        feedPostJob = viewModelScope.launch {
+            try {
+                if (!feedPostsStarted) {
+                    val channels = subscribedChannelsForMix()
+                    if (generation != feedPostGeneration) return@launch
+                    feedPostChannelOrder = channels
+                        .filterNot { notInterestedRepository.isChannelBlocked(it.channelId) }
+                        .shuffled(mixRandom)
+                    feedPostNextChannel = 0
+                    feedPostsStarted = true
+                }
+                // Plenty of channels never post, so a batch that brings nothing
+                // is followed by another rather than leaving the feed without.
+                var batchesTried = 0
+                var added = false
+                while (!added && feedPostNextChannel < feedPostChannelOrder.size &&
+                    batchesTried < FEED_POST_EMPTY_BATCH_LIMIT
+                ) {
+                    batchesTried++
+                    val batch = feedPostChannelOrder.subList(
+                        feedPostNextChannel,
+                        minOf(feedPostChannelOrder.size, feedPostNextChannel + FEED_POST_CHANNELS_PER_BATCH)
+                    )
+                    feedPostNextChannel += batch.size
+                    val fetched = batch.map { channel ->
+                        async {
+                            youtubeRepository.getChannelPosts(channel.channelId).take(FEED_POSTS_PER_CHANNEL)
+                        }
+                    }.awaitAll()
+                    if (generation != feedPostGeneration) return@launch
+                    val known = _feedPosts.value.mapTo(HashSet()) { it.postId }
+                    val fresh = fetched.flatten().filter { known.add(it.postId) }.shuffled(mixRandom)
+                    if (fresh.isNotEmpty()) {
+                        _feedPosts.value = _feedPosts.value + fresh
+                        added = true
+                    }
+                }
+            } catch (cancelled: kotlinx.coroutines.CancellationException) {
+                throw cancelled
+            } catch (e: Exception) {
+                KLog.w("HomeViewModel", "Feed posts failed", e)
+            }
+        }
+    }
+
+    /** A pull to refresh: different channels, different posts. */
+    fun refreshFeedPosts() = clearFeedPosts()
+
+    private fun clearFeedPosts() {
+        feedPostGeneration++
+        feedPostJob?.cancel()
+        feedPostChannelOrder = emptyList()
+        feedPostNextChannel = 0
+        feedPostsStarted = false
+        _feedPosts.value = emptyList()
+    }
+
+    /**
+     * The feed post whose comments are open, and that thread - the channel
+     * page's arrangement (see ChannelViewModel), for a post met in a feed.
+     */
+    private val _feedCommentsPost = MutableStateFlow<com.sentup.android.data.ChannelPost?>(null)
+    val feedCommentsPost: StateFlow<com.sentup.android.data.ChannelPost?> = _feedCommentsPost.asStateFlow()
+    val feedPostComments = com.sentup.android.ui.video.CommentThreadController(
+        repository = youtubeRepository,
+        scope = viewModelScope,
+        viaBrowse = true
+    )
+
+    fun openFeedPostComments(post: com.sentup.android.data.ChannelPost) {
+        val params = post.detailParams ?: return
+        _feedCommentsPost.value = post
+        feedPostComments.load { youtubeRepository.getPostCommentsToken(params) }
+    }
+
+    /** The post a notification is being opened on, so a second tap does not fetch it twice. */
+    private var notificationPostJob: Job? = null
+
+    /**
+     * Open the post a notification is about, in the same sheet a feed post's
+     * comments open in: the post pinned above its thread. [onResult] says
+     * whether it opened, so the caller can fall back to the post's web link.
+     */
+    fun openNotificationPost(detailParams: String, onResult: (opened: Boolean) -> Unit) {
+        notificationPostJob?.cancel()
+        notificationPostJob = viewModelScope.launch {
+            val post = youtubeRepository.getPostDetail(detailParams)
+            if (post != null) openFeedPostComments(post)
+            onResult(post != null)
+        }
+    }
+
+    /** Reload the open thread, e.g. after signing in, so its composer appears. */
+    fun reloadFeedPostComments() {
+        _feedCommentsPost.value?.let { openFeedPostComments(it) }
+    }
+
+    fun closeFeedPostComments() {
+        _feedCommentsPost.value = null
+        feedPostComments.clear()
+    }
+
+    /**
+     * Load the selected creator's Videos tab rather than filtering the recent
+     * subscriptions snapshot. The latter may contain no recent item from a
+     * channel that still has hundreds of uploads, which is not an empty feed.
+     */
+    fun loadSelectedChannelFeed(channel: com.sentup.android.data.SubscribedChannel) {
+        selectedChannelFeedJob?.cancel()
+        selectedChannelFeedJob = viewModelScope.launch {
+            _selectedChannelFeed.value = emptyList()
+            _selectedChannelFeedError.value = null
+            _isSelectedChannelFeedLoading.value = true
+            try {
+                val videos = youtubeRepository.getChannelVideos(channel)
+                _selectedChannelFeed.value = videos
+                if (videos.isEmpty()) {
+                    _selectedChannelFeedError.value =
+                        app.getString(R.string.hvm_channel_feed_error, channel.name)
+                }
+            } catch (e: Exception) {
+                KLog.e("HomeViewModel", "Selected channel feed failed", e)
+                _selectedChannelFeedError.value =
+                    app.getString(R.string.hvm_channel_feed_error, channel.name)
+            } finally {
+                _isSelectedChannelFeedLoading.value = false
+            }
+        }
+    }
+
+    fun clearSelectedChannelFeed() {
+        selectedChannelFeedJob?.cancel()
+        _selectedChannelFeed.value = emptyList()
+        _selectedChannelFeedError.value = null
+        _isSelectedChannelFeedLoading.value = false
+    }
+
+    // ---------------- Shuffled subscriptions (Home, recommendations off) ----------------
+    //
+    // With recommendations off, Home used to be the Subscriptions feed a second
+    // time: newest first, one tap from the tab that already shows exactly that.
+    // It is now a shuffle across the followed channels' whole histories (see
+    // SubscriptionMix). Pools are fetched a batch of channels at a time as the
+    // user scrolls and kept for the session, so a refresh reshuffles what is
+    // already in hand and only the next unseen channels cost requests.
+
+    private val _subscriptionMix = MutableStateFlow<List<VideoItem>>(emptyList())
+
+    /** The shuffled Home feed minus what the user asked not to see. */
+    val subscriptionMix: StateFlow<List<VideoItem>> =
+        combine(
+            _subscriptionMix,
+            notInterestedRepository.hiddenVideos,
+            notInterestedRepository.blockedChannels
+        ) { videos, _, _ -> notInterestedRepository.filter(videos) }
+            .stateIn(viewModelScope, SharingStarted.Eagerly, emptyList())
+
+    private val _isSubscriptionMixLoading = MutableStateFlow(false)
+    val isSubscriptionMixLoading: StateFlow<Boolean> = _isSubscriptionMixLoading.asStateFlow()
+
+    private val _isSubscriptionMixLoadingMore = MutableStateFlow(false)
+    val isSubscriptionMixLoadingMore: StateFlow<Boolean> = _isSubscriptionMixLoadingMore.asStateFlow()
+
+    /** Pools already fetched this session, by channel id. Main-thread only. */
+    private val mixPools = LinkedHashMap<String, com.sentup.android.data.ChannelMixPool>()
+    private val mixShownIds = HashSet<String>()
+    private var mixChannelOrder: List<com.sentup.android.data.SubscribedChannel> = emptyList()
+    private var mixNextChannel = 0
+    private var mixExhausted = false
+    private var mixJob: Job? = null
+    private var mixLoadedAtMs = 0L
+    private var mixGeneration = 0L
+    private val mixRandom = kotlin.random.Random(System.nanoTime())
+
+    /**
+     * Build or rebuild the shuffled Home feed.
+     *
+     * Not forced, it stands when it already has videos from the last ten
+     * minutes, like every other Home loader. Forced - a pull to refresh, a
+     * profile switch, recommendations just turned off - it reshuffles: channel
+     * order and picks start again, while pools already fetched are reused.
+     */
+    fun loadSubscriptionMix(force: Boolean = false) {
+        if (themePreferences.areVideoRecommendationsEnabled()) return
+        if (themePreferences.isLocalOnlyModeEnabled()) return
+        if (!force && mixJob?.isActive == true) return
+        if (!force && _subscriptionMix.value.isNotEmpty() && loadedRecently(mixLoadedAtMs)) return
+        mixJob?.cancel()
+        _isSubscriptionMixLoadingMore.value = false
+        val generation = ++mixGeneration
+        _isSubscriptionMixLoading.value = true
+        mixJob = viewModelScope.launch {
+            try {
+                val channels = subscribedChannelsForMix()
+                if (generation != mixGeneration) return@launch
+                // Pools for channels no longer followed are dropped, so an
+                // unfollow does not keep a creator in the shuffle.
+                val followed = channels.mapTo(HashSet()) { it.channelId }
+                mixPools.keys.retainAll(followed)
+                mixChannelOrder = channels.shuffled(mixRandom)
+                mixNextChannel = 0
+                mixShownIds.clear()
+                mixExhausted = channels.isEmpty()
+                val page = nextMixPage(generation)
+                if (generation != mixGeneration) return@launch
+                _subscriptionMix.value = page
+                if (page.isNotEmpty()) mixLoadedAtMs = System.currentTimeMillis()
+            } catch (cancelled: kotlinx.coroutines.CancellationException) {
+                throw cancelled
+            } catch (e: Exception) {
+                KLog.w("HomeViewModel", "Subscription mix failed", e)
+            } finally {
+                if (generation == mixGeneration) _isSubscriptionMixLoading.value = false
+            }
+        }
+    }
+
+    /** Append the next shuffled page as the user reaches the end of Home. */
+    fun loadMoreSubscriptionMix() {
+        if (themePreferences.areVideoRecommendationsEnabled()) return
+        if (mixExhausted || _subscriptionMix.value.isEmpty()) return
+        if (mixJob?.isActive == true) return
+        val generation = mixGeneration
+        _isSubscriptionMixLoadingMore.value = true
+        mixJob = viewModelScope.launch {
+            try {
+                val page = nextMixPage(generation)
+                if (generation != mixGeneration) return@launch
+                if (page.isNotEmpty()) _subscriptionMix.value = _subscriptionMix.value + page
+            } catch (cancelled: kotlinx.coroutines.CancellationException) {
+                throw cancelled
+            } catch (e: Exception) {
+                KLog.w("HomeViewModel", "Subscription mix page failed", e)
+            } finally {
+                if (generation == mixGeneration) _isSubscriptionMixLoadingMore.value = false
+            }
+        }
+    }
+
+    /**
+     * One page: the next [MIX_CHANNELS_PER_PAGE] channels in this shuffle's
+     * order, fetching pools only for the ones not already held. Once every
+     * channel has had its turn, pages keep drawing unseen videos from the pools
+     * in hand at no network cost, until nothing unseen is left.
+     */
+    private suspend fun nextMixPage(generation: Long): List<VideoItem> {
+        val order = mixChannelOrder
+        if (order.isEmpty()) {
+            mixExhausted = true
+            return emptyList()
+        }
+        val page = mutableListOf<VideoItem>()
+        // A batch whose channels all come back empty (a new channel, a failed
+        // browse) must not end the feed while later channels could fill it.
+        var batchesTried = 0
+        while (page.isEmpty() && mixNextChannel < order.size && batchesTried < MIX_EMPTY_BATCH_LIMIT) {
+            batchesTried++
+            val batch = order.subList(mixNextChannel, minOf(order.size, mixNextChannel + MIX_CHANNELS_PER_PAGE))
+            mixNextChannel += batch.size
+            fetchMissingMixPools(batch)
+            if (generation != mixGeneration) return emptyList()
+            val pools = batch.mapNotNull { mixPools[it.channelId] }
+            page += com.sentup.android.data.SubscriptionMix.buildPage(pools, mixShownIds, mixRandom)
+        }
+        if (page.isEmpty() && mixNextChannel >= order.size) {
+            // Every channel has had a turn: keep shuffling what is in hand.
+            val pools = order.mapNotNull { mixPools[it.channelId] }.shuffled(mixRandom)
+            page += com.sentup.android.data.SubscriptionMix.buildPage(pools, mixShownIds, mixRandom)
+            if (!com.sentup.android.data.SubscriptionMix.hasUnseen(pools, mixShownIds + page.map { it.videoId })) {
+                mixExhausted = true
+            }
+        }
+        page.mapTo(mixShownIds) { it.videoId }
+        if (page.isEmpty()) mixExhausted = true
+        return page
+    }
+
+    /**
+     * Fetch pools for [channels] not yet held, [MIX_FETCH_CONCURRENCY] at a
+     * time. Discretionary fan-out, so a 429 hold stands it down: the batch
+     * stops and the channels without pools simply contribute nothing this
+     * page rather than being retried in a loop.
+     */
+    private suspend fun fetchMissingMixPools(channels: List<com.sentup.android.data.SubscribedChannel>) {
+        val missing = channels.filter { it.channelId !in mixPools }
+        if (missing.isEmpty()) return
+        if (com.sentup.android.data.YouTubeRateLimit.isHeld()) return
+        val gate = kotlinx.coroutines.sync.Semaphore(MIX_FETCH_CONCURRENCY)
+        val fetched = kotlinx.coroutines.coroutineScope {
+            missing.map { channel ->
+                async {
+                    gate.acquire()
+                    try {
+                        if (com.sentup.android.data.YouTubeRateLimit.isHeld()) null
+                        else youtubeRepository.getChannelMixPool(channel)
+                    } catch (cancelled: kotlinx.coroutines.CancellationException) {
+                        throw cancelled
+                    } catch (e: Exception) {
+                        KLog.w("HomeViewModel", "Mix pool failed for ${channel.channelId}", e)
+                        null
+                    } finally {
+                        gate.release()
+                    }
+                }
+            }.awaitAll()
+        }
+        // Stored only when something came back: an empty pool from a failed
+        // browse would otherwise hide the channel for the rest of the session.
+        fetched.filterNotNull().filterNot { it.isEmpty }.forEach { mixPools[it.channelId] = it }
+    }
+
+    /**
+     * The channels the mix draws from: the same list the Subscriptions tab
+     * shows, resolved from the source setting. An account whose channel list
+     * has not arrived yet is waited for rather than treated as following
+     * nobody, which would end the feed before it started.
+     */
+    private suspend fun subscribedChannelsForMix(): List<com.sentup.android.data.SubscribedChannel> {
+        if (shouldUseAccountSubscriptions() && _accountChannels.value.isEmpty()) {
+            if (_isSubscriptionsLoading.value) {
+                _isSubscriptionsLoading.first { !it }
+            } else {
+                _isSubscriptionsLoading.value = true
+                try {
+                    _accountChannels.value = youtubeRepository.getSubscribedChannels()
+                } finally {
+                    _isSubscriptionsLoading.value = false
+                }
+            }
+        }
+        val account = if (shouldUseAccountSubscriptions()) _accountChannels.value else emptyList()
+        val local = if (themePreferences.currentSubscriptionSource() !=
+            com.sentup.android.data.ThemePreferences.SUBSCRIPTIONS_YOUTUBE
+        ) localSubscriptions.value.map { it.toSubscribedChannel() } else emptyList()
+        return (local + account).distinctBy { it.channelId }
+    }
+
+    private fun clearSubscriptionMix() {
+        mixGeneration++
+        mixJob?.cancel()
+        mixPools.clear()
+        mixShownIds.clear()
+        mixChannelOrder = emptyList()
+        mixNextChannel = 0
+        mixExhausted = false
+        mixLoadedAtMs = 0L
+        _subscriptionMix.value = emptyList()
+        _isSubscriptionMixLoading.value = false
+        _isSubscriptionMixLoadingMore.value = false
+    }
+
+    /**
+     * Interleaves the account feed and the device feed on upload time.
+     *
+     * The account feed carries no exact timestamp (InnerTube only says "3 days
+     * ago"), so its items are placed by parsing that prose. It is deliberately
+     * coarse, but stacking one list on top of the other would be worse: a
+     * month-old account upload would sit above this morning's local one.
+     */
+    private fun mergeFeeds(accountFeed: List<VideoItem>, localFeed: List<VideoItem>): List<VideoItem> {
+        if (localFeed.isEmpty()) return accountFeed
+        if (accountFeed.isEmpty()) return localFeed
+        val now = System.currentTimeMillis()
+        return (accountFeed + localFeed)
+            .distinctBy { it.videoId }
+            .sortedByDescending {
+                it.publishedAtMs ?: VideoItem.parseRelativeTime(it.uploadedDate, now) ?: Long.MIN_VALUE
+            }
+    }
+
+    /** Local channels the selected group allows through, or all of them. */
+    private fun groupFilteredLocalChannels(): List<com.sentup.android.data.LocalSubscription> =
+        localSubscriptionsRepository.channelsInGroup(_selectedGroupId.value)
+
+    private fun shouldUseAccountSubscriptions(): Boolean =
+        themePreferences.currentSubscriptionSource() !=
+            com.sentup.android.data.ThemePreferences.SUBSCRIPTIONS_LOCAL &&
+            sessionManager.isLoggedIn()
+
+    /** Filter the feed by a group. Passing null clears the filter. */
+    fun selectSubscriptionGroup(groupId: String?) {
+        if (_selectedGroupId.value == groupId) return
+        _selectedGroupId.value = groupId
+        loadSubscriptionFeed(force = true)
+    }
+
+    /**
+     * Fills in names and avatars for imported channels, which arrive with a
+     * name at best and never a picture. Capped per run inside the repository,
+     * so a large library fills in over a few visits instead of one burst of
+     * hundreds of channel browses.
+     */
+    fun backfillLocalChannelProfiles() {
+        val pending = localSubscriptions.value.filter { it.avatarUrl.isNullOrBlank() }
+        if (pending.isEmpty()) return
+        // A channel browse each, and nobody asked for them - exactly the
+        // discretionary work a hold exists to stand down. Pictures can wait.
+        if (com.sentup.android.data.YouTubeRateLimit.isHeld()) return
+        viewModelScope.launch {
+            val updated = youtubeRepository.fetchMissingChannelProfiles(pending)
+            localSubscriptionsRepository.updateProfiles(updated)
+        }
+    }
+
+    /** Drop a locally followed channel. Account subscriptions are untouched. */
+    fun unsubscribeLocally(channelId: String) {
+        localSubscriptionsRepository.unsubscribe(channelId)
+        _subscriptionFeed.value = _subscriptionFeed.value.filterNot { it.channelId == channelId }
+    }
+
+    fun isLocallySubscribed(channelId: String?): Boolean =
+        localSubscriptionsRepository.isSubscribed(channelId)
+
+    // ---------------- Subscription import / export ----------------
+
+    private val _isImportingSubscriptions = MutableStateFlow(false)
+    val isImportingSubscriptions: StateFlow<Boolean> = _isImportingSubscriptions.asStateFlow()
+
+    /** "resolved 40 of 220" while an import runs. */
+    private val _importProgress = MutableStateFlow<Pair<Int, Int>?>(null)
+    val importProgress: StateFlow<Pair<Int, Int>?> = _importProgress.asStateFlow()
+
+    /**
+     * Imports a subscription file - NewPipe/PipePipe JSON, a NewPipe-family
+     * backup archive, Takeout CSV or OPML, sniffed rather than asked for.
+     *
+     * Reading happens through the content resolver because the file arrives as
+     * a SAF uri, which is not a path and cannot be opened as one. Bytes rather
+     * than text, since a backup archive is a zipped database and decoding one
+     * as UTF-8 first would corrupt it. The whole run is one merge into the
+     * existing list: importing twice, or importing a second device's export,
+     * adds what is missing and touches nothing else.
+     */
+    fun importSubscriptions(
+        uri: android.net.Uri,
+        onResult: (com.sentup.android.data.SubscriptionImportResult) -> Unit
+    ) {
+        if (_isImportingSubscriptions.value) return
+        viewModelScope.launch {
+            _isImportingSubscriptions.value = true
+            _importProgress.value = null
+            try {
+                val imported = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+                    val cacheDir = getApplication<Application>().cacheDir
+                    val source = java.io.File(cacheDir, "subscription-import.source")
+                    val database = java.io.File(cacheDir, "subscription-import.db")
+                    try {
+                        val opened = getApplication<Application>().contentResolver
+                            .openInputStream(uri) ?: return@withContext null
+                        opened.use { input ->
+                            com.sentup.android.data.SubscriptionTransfer.copyImport(input, source)
+                        }
+                        if (source.length() == 0L) null else {
+                            com.sentup.android.data.SubscriptionTransfer.read(source, database)
+                        }
+                    } finally {
+                        source.delete()
+                        database.delete()
+                    }
+                }
+                if (imported == null) {
+                    onResult(
+                        com.sentup.android.data.SubscriptionImportResult(
+                            0, 0, 0, error = app.getString(R.string.hvm_import_empty)
+                        )
+                    )
+                    return@launch
+                }
+
+                val entries = imported.channels
+                val foreign = imported.foreignServiceEntries
+                if (entries.isEmpty()) {
+                    onResult(
+                        com.sentup.android.data.SubscriptionImportResult(
+                            0, 0, 0, foreign,
+                            error = if (foreign > 0) {
+                                app.getString(R.string.hvm_import_foreign)
+                            } else {
+                                app.getString(R.string.hvm_import_no_channels)
+                            }
+                        )
+                    )
+                    return@launch
+                }
+
+                val (resolved, unresolved) = youtubeRepository.resolveImportedChannels(entries) { done, total ->
+                    _importProgress.value = done to total
+                }
+                val alreadyPresent = resolved.count { localSubscriptionsRepository.isSubscribed(it.channelId) }
+                val added = localSubscriptionsRepository.importAll(resolved)
+
+                // Groups come from Sentüp's own export, or from the feed groups
+                // inside a NewPipe-family backup - never from the JSON export,
+                // which has never carried them.
+                imported.groups.forEach { group ->
+                    val existing = subscriptionGroups.value.firstOrNull { it.name.equals(group.name, true) }
+                    if (existing == null) {
+                        localSubscriptionsRepository.createGroup(group.name, group.channelIds)
+                    } else {
+                        localSubscriptionsRepository.setGroupChannels(
+                            existing.id,
+                            existing.channelIds + group.channelIds
+                        )
+                    }
+                }
+
+                onResult(
+                    com.sentup.android.data.SubscriptionImportResult(
+                        added = added,
+                        alreadyPresent = alreadyPresent,
+                        unresolved = unresolved,
+                        skippedOtherService = foreign
+                    )
+                )
+                backfillLocalChannelProfiles()
+            } catch (e: Exception) {
+                KLog.e("HomeViewModel", "Subscription import failed", e)
+                onResult(
+                    com.sentup.android.data.SubscriptionImportResult(
+                        0, 0, 0, error = app.getString(R.string.hvm_import_read)
+                    )
+                )
+            } finally {
+                _importProgress.value = null
+                _isImportingSubscriptions.value = false
+            }
+        }
+    }
+
+    /**
+     * Copies the signed-in account's subscriptions onto the device, so they
+     * survive signing out - the main reason someone would want a local copy
+     * while still having an account.
+     */
+    fun importSubscriptionsFromAccount(
+        onResult: (com.sentup.android.data.SubscriptionImportResult) -> Unit
+    ) {
+        if (_isImportingSubscriptions.value) return
+        if (!sessionManager.isLoggedIn()) {
+            onResult(
+                com.sentup.android.data.SubscriptionImportResult(
+                    0, 0, 0, error = app.getString(R.string.sm_sign_in_first)
+                )
+            )
+            return
+        }
+        viewModelScope.launch {
+            _isImportingSubscriptions.value = true
+            try {
+                val channels = youtubeRepository.getSubscribedChannels()
+                if (channels.isEmpty()) {
+                    onResult(
+                        com.sentup.android.data.SubscriptionImportResult(
+                            0, 0, 0, error = app.getString(R.string.hvm_copy_empty)
+                        )
+                    )
+                    return@launch
+                }
+                _accountChannels.value = channels
+                val asLocal = channels.map {
+                    com.sentup.android.data.LocalSubscription(
+                        channelId = it.channelId,
+                        name = it.name,
+                        avatarUrl = it.avatarUrl
+                    )
+                }
+                val alreadyPresent = asLocal.count { localSubscriptionsRepository.isSubscribed(it.channelId) }
+                val added = localSubscriptionsRepository.importAll(asLocal)
+                onResult(
+                    com.sentup.android.data.SubscriptionImportResult(
+                        added = added,
+                        alreadyPresent = alreadyPresent,
+                        unresolved = 0
+                    )
+                )
+            } catch (e: Exception) {
+                KLog.e("HomeViewModel", "Account subscription copy failed", e)
+                onResult(
+                    com.sentup.android.data.SubscriptionImportResult(
+                        0, 0, 0, error = app.getString(R.string.hvm_network)
+                    )
+                )
+            } finally {
+                _isImportingSubscriptions.value = false
+            }
+        }
+    }
+
+    /**
+     * Writes the local subscriptions to [uri] in the NewPipe-compatible shape,
+     * so the file imports cleanly into NewPipe, PipePipe and Tubular as well
+     * as back into Sentüp.
+     */
+    fun exportSubscriptions(uri: android.net.Uri, onResult: (Boolean) -> Unit) {
+        viewModelScope.launch {
+            val ok = kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+                try {
+                    val json = com.sentup.android.data.SubscriptionTransfer.buildExportJson(
+                        subscriptions = localSubscriptions.value,
+                        groups = subscriptionGroups.value,
+                        appVersionName = com.sentup.android.BuildConfig.VERSION_NAME
+                    )
+                    getApplication<Application>().contentResolver
+                        .openOutputStream(uri)?.use { it.write(json.toByteArray(Charsets.UTF_8)) }
+                    true
+                } catch (e: Exception) {
+                    KLog.e("HomeViewModel", "Subscription export failed", e)
+                    false
+                }
+            }
+            onResult(ok)
+        }
+    }
+
+    // ---------------- Subscription groups ----------------
+
+    fun createSubscriptionGroup(name: String, channelIds: List<String> = emptyList()) {
+        if (name.isBlank()) return
+        localSubscriptionsRepository.createGroup(name, channelIds)
+    }
+
+    fun renameSubscriptionGroup(groupId: String, name: String) {
+        if (name.isBlank()) return
+        localSubscriptionsRepository.renameGroup(groupId, name)
+    }
+
+    fun deleteSubscriptionGroup(groupId: String) {
+        localSubscriptionsRepository.deleteGroup(groupId)
+        if (_selectedGroupId.value == groupId) selectSubscriptionGroup(null)
+    }
+
+    fun toggleChannelInGroup(groupId: String, channelId: String) {
+        localSubscriptionsRepository.toggleChannelInGroup(groupId, channelId)
+        if (_selectedGroupId.value == groupId) loadSubscriptionFeed(force = true)
+    }
+
+    /** Wipes every local subscription and group. Account subscriptions survive. */
+    fun clearLocalSubscriptions() {
+        localSubscriptionsRepository.clearAll()
+        _selectedGroupId.value = null
+        loadSubscriptionFeed(force = true)
+    }
+
+    private var videoPlaylistsJob: kotlinx.coroutines.Job? = null
+
+    /** Whether anything has asked for [videoPlaylists] yet, so a profile switch knows to ask again. */
+    private var videoPlaylistsRequested = false
+
+    /** Load the user's YouTube playlists for the video Library tab. Requires login. */
+    fun loadVideoPlaylists(force: Boolean = false) {
+        videoPlaylistsRequested = true
+        if (_isVideoPlaylistsLoading.value) return
+        if (_videoPlaylists.value.isNotEmpty() && !force) return
+        videoPlaylistsJob = viewModelScope.launch {
+            _isVideoPlaylistsLoading.value = true
+            try {
+                _videoPlaylists.value = youtubeRepository.getVideoPlaylists()
+            } finally {
+                _isVideoPlaylistsLoading.value = false
+            }
+        }
+    }
+
+    /**
+     * Load one playlist's videos (also Watch Later "WL" / Liked videos "LL").
+     *
+     * A local playlist is already in memory, so it is served straight from the
+     * store rather than through a fetch that would fail signed out. It still
+     * goes through the same [_playlistVideos] state, which is what lets
+     * `VideoPlaylistDetail` snapshot it into a [com.sentup.android.data.VideoQueue]
+     * without knowing which kind it opened.
+     */
+    fun loadPlaylistVideos(playlistId: String) {
+        playlistLoadJob?.cancel()
+        playlistPagination.reset()
+        activeVideoPlaylistId = playlistId
+        playlistSession = sessionManager.captureSession()
+        _playlistVideos.value = emptyList()
+        _isPlaylistVideosLoading.value = false
+        if (com.sentup.android.data.LocalVideoPlaylistsRepository.isLocal(playlistId)) {
+            _playlistVideos.value = localVideoPlaylistsRepository.videosOf(playlistId)
+            return
+        }
+        // A music-mode device playlist opened from the video Library; see
+        // musicPlaylistsForVideo.
+        playlistRepository.userPlaylists.value.firstOrNull { it.id == playlistId }?.let { playlist ->
+            _playlistVideos.value = playlist.songs
+                .filter { it.source == SongSource.YOUTUBE }
+                .map { it.toVideoItem() }
+            return
+        }
+        val request = playlistPagination.first()
+        _isPlaylistVideosLoading.value = true
+        fetchVideoPlaylistPage(playlistId, request)
+    }
+
+    fun loadMorePlaylistVideos(playlistId: String) {
+        if (activeVideoPlaylistId != playlistId) return
+        val request = playlistPagination.more() ?: return
+        fetchVideoPlaylistPage(playlistId, request)
+    }
+
+    private fun fetchVideoPlaylistPage(
+        playlistId: String,
+        request: com.sentup.android.data.DemandPagination.Request<com.sentup.android.data.VideoPlaylistCursor>
+    ) {
+        val session = playlistSession
+        playlistLoadJob = viewModelScope.launch {
+            try {
+                val page = if (playlistId.startsWith("MPRE")) {
+                    com.sentup.android.data.VideoPlaylistPage(
+                        youtubeRepository.getAlbumSongs(playlistId).map { song ->
+                            VideoItem(videoId = song.id, title = song.title, channelName = song.artist,
+                                thumbnailUrl = song.thumbnailUrl ?: song.highResThumbnailUrl,
+                                duration = song.duration / 1000, viewCount = "")
+                        })
+                } else youtubeRepository.getPlaylistVideosPage(playlistId, request.continuation, session)
+                if (!playlistPagination.isCurrent(request)) return@launch
+                if (page == null) {
+                    playlistPagination.fail(request)
+                } else if (playlistPagination.complete(request, page.continuation)) {
+                    // Playlist duplicates are distinct occurrences; never deduplicate by video id.
+                    _playlistVideos.value = if (request.continuation == null) page.videos
+                        else _playlistVideos.value + page.videos
+                }
+                _isPlaylistVideosLoading.value = false
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                if (playlistPagination.isCurrent(request)) {
+                    playlistPagination.fail(request)
+                    _isPlaylistVideosLoading.value = false
+                }
+            } finally {
+                if (playlistPagination.isCurrent(request)) {
+                    playlistPagination.cancel(request)
+                    _isPlaylistVideosLoading.value = false
+                }
+            }
+        }
+    }
+
+    fun stopPlaylistVideoPagination(playlistId: String) {
+        if (activeVideoPlaylistId == playlistId) playlistLoadJob?.cancel()
+    }
+
+    private fun resetVideoLibraryPagination() {
+        historyLoadJob?.cancel()
+        playlistLoadJob?.cancel()
+        historyPagination.reset()
+        playlistPagination.reset()
+        historySession = null
+        playlistSession = null
+        activeVideoPlaylistId = null
+        _isHistoryLoading.value = false
+        _isPlaylistVideosLoading.value = false
+        _playlistVideos.value = emptyList()
+    }
+
+    /**
+     * Create a playlist from the video Library tab.
+     *
+     * [onDevice] picks the store. It is forced true signed out, because the
+     * YouTube path needs a session and a create that silently does nothing is
+     * exactly the failure this whole change exists to remove.
+     */
+    fun createVideoPlaylist(name: String, onDevice: Boolean = !isYouTubeConnected.value) {
+        val trimmed = name.trim()
+        if (trimmed.isEmpty()) return
+        viewModelScope.launch {
+            if (onDevice || !isYouTubeConnected.value) {
+                localVideoPlaylistsRepository.create(trimmed)
+            } else if (youtubeRepository.createYouTubePlaylist(trimmed, music = false) != null) {
+                loadVideoPlaylists(force = true)
+            }
+        }
+    }
+
+    /**
+     * Delete a playlist. The local store owns its own list, so there is nothing
+     * to roll back there; the account path stays optimistic-and-restore.
+     */
+    fun deleteVideoPlaylist(playlistId: String) {
+        if (com.sentup.android.data.LocalVideoPlaylistsRepository.isLocal(playlistId)) {
+            viewModelScope.launch { localVideoPlaylistsRepository.delete(playlistId) }
+            return
+        }
+        val previous = _videoPlaylists.value
+        _videoPlaylists.value = previous.filterNot { it.playlistId == playlistId }
+        viewModelScope.launch {
+            if (!youtubeRepository.deleteYouTubePlaylist(playlistId, music = false)) {
+                _videoPlaylists.value = previous
+            }
+        }
+    }
+
+    /**
+     * Show [videos] as the open local playlist's order and keep it: a sort or
+     * the undo of one. [persist] false is a drag in progress, which only
+     * moves the rows on screen until [persistLocalVideoOrder] when it settles.
+     */
+    fun setLocalVideoPlaylistOrder(playlistId: String, videos: List<VideoItem>, persist: Boolean = true) {
+        if (!com.sentup.android.data.LocalVideoPlaylistsRepository.isLocal(playlistId)) return
+        _playlistVideos.value = videos
+        if (persist) viewModelScope.launch { localVideoPlaylistsRepository.setVideos(playlistId, videos) }
+    }
+
+    /** Move one row of the open local playlist on screen; see [persistLocalVideoOrder]. */
+    fun moveLocalVideo(playlistId: String, from: Int, to: Int) {
+        val current = _playlistVideos.value
+        if (from !in current.indices || to !in current.indices || from == to) return
+        setLocalVideoPlaylistOrder(
+            playlistId,
+            current.toMutableList().apply { add(to, removeAt(from)) },
+            persist = false
+        )
+    }
+
+    /** Keep the open local playlist's on-screen order, at the end of a drag. */
+    fun persistLocalVideoOrder(playlistId: String) {
+        if (!com.sentup.android.data.LocalVideoPlaylistsRepository.isLocal(playlistId)) return
+        val videos = _playlistVideos.value
+        viewModelScope.launch { localVideoPlaylistsRepository.setVideos(playlistId, videos) }
+    }
+
+    /** Write a local video playlist out as m3u8. */
+    suspend fun exportLocalVideoPlaylist(videos: List<VideoItem>, uri: android.net.Uri): Boolean =
+        kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+            runCatching {
+                getApplication<Application>().contentResolver.openOutputStream(uri, "wt")?.use {
+                    it.write(com.sentup.android.data.PlaylistTransfer.buildVideoM3u(videos).toByteArray(Charsets.UTF_8))
+                } != null
+            }.getOrDefault(false)
+        }
+
+    /**
+     * Import playlists into video mode: m3u/m3u8 and NewPipe/PipePipe backups
+     * become local video playlists, and bookmarked YouTube playlists are saved
+     * to the library both modes share. The video counterpart of
+     * [importPlaylists]; entries with no YouTube id (device files, other
+     * services) are counted as missing, since a video playlist cannot hold them.
+     */
+    suspend fun importVideoPlaylists(uri: android.net.Uri): PlaylistImportResult? =
+        kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+            val app = getApplication<Application>()
+            val source = java.io.File(app.cacheDir, "video_playlist_import.src")
+            val scratch = java.io.File(app.cacheDir, "video_playlist_import.db")
+            try {
+                app.contentResolver.openInputStream(uri)?.use { SubscriptionTransfer.copyImport(it, source) }
+                    ?: return@withContext null
+                val fallbackName = uri.lastPathSegment?.substringAfterLast('/')?.substringBeforeLast('.')
+                    ?.ifBlank { null } ?: "Imported playlist"
+                val file = com.sentup.android.data.PlaylistTransfer.read(source, scratch, fallbackName)
+                if (file.playlists.isEmpty() && file.remote.isEmpty()) return@withContext null
+                var videos = 0
+                var missing = 0
+                var created = 0
+                file.playlists.forEach { playlist ->
+                    val items = playlist.tracks.mapNotNull { t ->
+                        val id = t.videoId ?: run { missing++; return@mapNotNull null }
+                        VideoItem(
+                            videoId = id,
+                            title = t.title,
+                            channelName = t.artist,
+                            thumbnailUrl = "https://i.ytimg.com/vi/$id/hqdefault.jpg",
+                            duration = t.durationMs / 1000,
+                            viewCount = ""
+                        )
+                    }
+                    val saved = localVideoPlaylistsRepository.createWithVideos(playlist.name, items)
+                    if (saved != null && saved.second > 0) {
+                        created++
+                        videos += saved.second
+                    } else if (saved != null) {
+                        localVideoPlaylistsRepository.delete(saved.first)
+                    }
+                }
+                var savedRemote = 0
+                file.remote.forEach { r ->
+                    if (savedPlaylistsRepository.savedPlaylists.value.none { it.id == r.playlistId }) {
+                        savedPlaylistsRepository.save(
+                            com.sentup.android.data.SavedPlaylist(
+                                id = r.playlistId,
+                                url = "https://www.youtube.com/playlist?list=${r.playlistId}",
+                                name = r.name,
+                                uploaderName = r.uploader,
+                                thumbnailUrl = r.thumbnailUrl,
+                                itemCount = r.itemCount,
+                            )
+                        )
+                        savedRemote++
+                    }
+                }
+                PlaylistImportResult(created, videos, savedRemote, missing, file.foreignServiceEntries)
+            } catch (e: Exception) {
+                if (e is kotlinx.coroutines.CancellationException) throw e
+                KLog.w("HomeViewModel", "Video playlist import failed", e)
+                null
+            } finally {
+                source.delete()
+                scratch.delete()
+            }
+        }
+
+    /** Rename a playlist held on this device. */
+    fun renameLocalVideoPlaylist(playlistId: String, name: String) {
+        if (!com.sentup.android.data.LocalVideoPlaylistsRepository.isLocal(playlistId)) return
+        viewModelScope.launch { localVideoPlaylistsRepository.rename(playlistId, name) }
+    }
+
+    /**
+     * Remove a video from a playlist, Watch Later ("WL") or Liked videos
+     * ("LL", removes the like). Optimistic removal, restored on failure.
+     */
+    fun removePlaylistVideo(playlistId: String, video: VideoItem) {
+        val previous = _playlistVideos.value
+        _playlistVideos.value = previous.filterNot { it.videoId == video.videoId }
+        if (com.sentup.android.data.LocalVideoPlaylistsRepository.isLocal(playlistId)) {
+            viewModelScope.launch {
+                localVideoPlaylistsRepository.removeVideo(playlistId, video.videoId)
+            }
+            return
+        }
+        viewModelScope.launch {
+            if (!youtubeRepository.removeFromYouTubePlaylist(playlistId, video.videoId, music = false)) {
+                _playlistVideos.value = previous
+            }
+        }
+    }
+
+    /**
+     * Add a video to a playlist. Reports the outcome on the main thread so the
+     * save sheet can show inline feedback.
+     *
+     * Three targets, decided here rather than at the five call sites that open
+     * the sheet: a local playlist, the account's Watch Later, and any other
+     * account playlist. Signed out "WL" is the device's Watch Later, created on
+     * first use - the pinned hero row used to post to an endpoint that answers
+     * 200 without a session and does nothing, so the sheet reported a save that
+     * had not happened.
+     */
+    fun addVideoToPlaylist(playlistId: String, video: VideoItem, onResult: (Boolean) -> Unit) {
+        viewModelScope.launch {
+            onResult(saveVideoToPlaylist(playlistId, video))
+        }
+    }
+
+    /** Account playlists holding the video a save sheet is open on. */
+    private val videoPlaylistMembership =
+        com.sentup.android.data.PlaylistMembership(youtubeRepository, viewModelScope)
+    val accountPlaylistsContainingVideo: StateFlow<Set<String>> = videoPlaylistMembership.containing
+
+    /** One account lookup per sheet open. */
+    fun loadVideoPlaylistMembership(videoId: String) = videoPlaylistMembership.load(videoId)
+
+    /** Untick a video in the save sheet; the mirror of adding it. */
+    fun removeVideoFromPlaylist(playlistId: String, video: VideoItem, onResult: (Boolean) -> Unit) {
+        viewModelScope.launch {
+            val local = com.sentup.android.data.LocalVideoPlaylistsRepository
+            val ok = when {
+                local.isLocal(playlistId) -> {
+                    localVideoPlaylistsRepository.removeVideo(playlistId, video.videoId)
+                    true
+                }
+                playlistId == "WL" && !isYouTubeConnected.value -> {
+                    localVideoPlaylistsRepository.removeVideo(local.WATCH_LATER_ID, video.videoId)
+                    true
+                }
+                else -> youtubeRepository.removeFromYouTubePlaylist(playlistId, video.videoId, music = false)
+                    .also { if (it) videoPlaylistMembership.record(playlistId, video.videoId, false) }
+            }
+            onResult(ok)
+        }
+    }
+
+    /** Create a playlist on the device, from the save sheet. */
+    fun createLocalVideoPlaylist(name: String, onCreated: (String?) -> Unit) {
+        viewModelScope.launch { onCreated(localVideoPlaylistsRepository.create(name)) }
+    }
+
+    /** Mirrored by `VideoPlayerViewModel.addVideoToPlaylist`; keep them in step. */
+    private suspend fun saveVideoToPlaylist(playlistId: String, video: VideoItem): Boolean {
+        val local = com.sentup.android.data.LocalVideoPlaylistsRepository
+        return when {
+            local.isLocal(playlistId) ->
+                localVideoPlaylistsRepository.addVideo(playlistId, video)
+            playlistId == "WL" && !isYouTubeConnected.value ->
+                localVideoPlaylistsRepository.addVideo(
+                    localVideoPlaylistsRepository.ensureWatchLater(),
+                    video
+                )
+            else ->
+                youtubeRepository.addToYouTubePlaylist(playlistId, video.videoId, music = false)
+                    .also { if (it) videoPlaylistMembership.record(playlistId, video.videoId, true) }
+        }
+    }
+
+    private var notificationsJob: kotlinx.coroutines.Job? = null
+
+    private val notificationHistory by lazy {
+        com.sentup.android.data.NotificationHistoryStore(app)
+    }
+
+    /**
+     * Load the notification inbox. Requires login.
+     *
+     * What this device remembers is shown at once and the fresh inbox is
+     * folded into it when it arrives. The profile is read before the request
+     * and checked after it, so an inbox that lands after a switch is neither
+     * shown to nor remembered for the profile switched to.
+     */
+    fun loadNotifications(force: Boolean = false) {
+        if (_isNotificationsLoading.value) return
+        if (_notifications.value.isNotEmpty() && !force) return
+        notificationsJob = viewModelScope.launch {
+            _isNotificationsLoading.value = true
+            try {
+                val profileId = com.sentup.android.data.ProfileManager.activeProfileId(app)
+                if (allNotifications.isEmpty()) {
+                    publishNotifications(
+                        profileId,
+                        withContext(Dispatchers.IO) { notificationHistory.remembered(profileId) }
+                    )
+                }
+                val fresh = youtubeRepository.getNotifications()
+                if (com.sentup.android.data.ProfileManager.activeProfileId(app) != profileId) return@launch
+                // An empty answer is as likely a failed request as an empty
+                // inbox, and must not present the remembered items as gone.
+                if (fresh.isNotEmpty()) {
+                    publishNotifications(
+                        profileId,
+                        withContext(Dispatchers.IO) { notificationHistory.merge(profileId, fresh) }
+                    )
+                }
+            } finally {
+                _isNotificationsLoading.value = false
+            }
+        }
+    }
+
+    private fun publishNotifications(
+        profileId: String,
+        items: List<com.sentup.android.data.NotificationItem>,
+    ) {
+        val hidden = notificationHistory.hiddenIds(profileId)
+        allNotifications = items
+        _notifications.value = items.filterNot { it.id in hidden }
+        _hiddenNotificationCount.value = items.count { it.id in hidden }
+    }
+
+    /** Take one notification out of the inbox on this device. YouTube is not told. */
+    fun hideNotification(item: com.sentup.android.data.NotificationItem) {
+        if (item.id.isBlank()) return
+        val profileId = com.sentup.android.data.ProfileManager.activeProfileId(app)
+        notificationHistory.hide(profileId, item.id)
+        publishNotifications(profileId, allNotifications)
+    }
+
+    fun restoreHiddenNotifications() {
+        val profileId = com.sentup.android.data.ProfileManager.activeProfileId(app)
+        notificationHistory.restoreHidden(profileId)
+        publishNotifications(profileId, allNotifications)
+    }
+    
+    // --- Download Actions ---
+    
+    fun toggleDownload(song: Song) {
+        viewModelScope.launch {
+            if (downloadRepository.isDownloaded(song.id)) {
+                downloadRepository.deleteDownload(song.id)
+            } else {
+                downloadRepository.downloadSong(song)
+            }
+        }
+    }
+    
+    fun isDownloaded(songId: String): Boolean {
+        return downloadRepository.isDownloaded(songId)
+    }
+    
+    fun isDownloading(songId: String): Boolean {
+        return downloadingIds.value.contains(songId)
+    }
+    
+    fun isLocalOriginal(song: Song): Boolean {
+        return downloadRepository.isLocalOriginal(song)
+    }
+
+    fun loadSongs(excludedFolders: Set<String> = emptySet(), manualScan: Boolean = false) {
+        viewModelScope.launch {
+            _songs.value = localRepository.getSongs(excludedFolders, manualScan)
+        }
+    }
+    
+    /**
+     * Get all available music folders for the folder exclusion UI.
+     */
+    suspend fun getAvailableFolders(): List<FolderInfo> {
+        return localRepository.getAvailableFolders()
+    }
+
+    private fun loadedRecently(atMs: Long): Boolean =
+        atMs != 0L && System.currentTimeMillis() - atMs in 0 until HOME_REVISIT_REFRESH_MS
+
+    private fun forgetHomeLoadTimes() {
+        accountLoadedAtMs = 0L
+        recommendationsLoadedAtMs = 0L
+        videoFeedLoadedAtMs = 0L
+        shortsFeedLoadedAtMs = 0L
+    }
+
+    fun checkYouTubeConnection(force: Boolean = false) {
+        if (!force && accountLoadJob?.isActive == true) return
+        if (force) accountLoadJob?.cancel()
+        accountLoadJob = viewModelScope.launch {
+            _isYouTubeConnected.value = sessionManager.isLoggedIn()
+            if (_isYouTubeConnected.value) {
+                if (!force && loadedRecently(accountLoadedAtMs)) {
+                    _userAvatar.value = sessionManager.getUserAvatar()
+                    _userName.value = sessionManager.getUserName()
+                    return@launch
+                }
+                youtubeRepository.fetchAccountInfo()
+                _userAvatar.value = sessionManager.getUserAvatar()
+                _userName.value = sessionManager.getUserName()
+                loadLibraryData()
+            }
+        }
+    }
+
+    private suspend fun loadLibraryData() {
+        try {
+            _likedSongs.value = youtubeRepository.getLikedMusic()
+            _youtubePlaylists.value = youtubeRepository.getUserPlaylists()
+            accountLoadedAtMs = System.currentTimeMillis()
+        } catch (e: kotlinx.coroutines.CancellationException) {
+            throw e
+        } catch (e: Exception) { }
+    }
+
+    /**
+     * Put a fetched Home list on screen and in the cache. A refresh the user
+     * asked for [rotate]s it first, so it leads with songs that have not led
+     * this session; an ordinary load keeps YouTube's order. Either way the
+     * songs that end up leading are remembered for the next refresh.
+     *
+     * @return false when the fetch had nothing usable and Home was left alone.
+     */
+    private fun publishHomeRecommendations(fetched: List<Song>, rotate: Boolean): Boolean {
+        val pool = usableHomeRecommendations(
+            listOf(fetched),
+            limit = com.sentup.android.data.HOME_RECOMMENDATION_POOL
+        )
+        val ordered = if (rotate) {
+            com.sentup.android.data.rotateHomeRecommendations(pool, recentHomeLeads.toList())
+        } else pool
+        val recs = usableHomeRecommendations(listOf(ordered))
+        if (recs.isEmpty()) return false
+        val leads = recs.take(com.sentup.android.data.HOME_LEAD_SIZE).map { it.id }
+        recentHomeLeads.removeAll(leads.toSet())
+        recentHomeLeads.addAll(leads)
+        while (recentHomeLeads.size > com.sentup.android.data.HOME_RECOMMENDATION_POOL) {
+            recentHomeLeads.removeFirst()
+        }
+        _youtubeSongs.value = recs
+        homeRecommendationCache.save(recs)
+        return true
+    }
+
+    fun loadYouTubeRecommendations(force: Boolean = false) {
+        if (!force &&
+            (recommendationsLoadJob?.isActive == true || loadedRecently(recommendationsLoadedAtMs))
+        ) return
+        recommendationsLoadJob = viewModelScope.launch {
+            _isLoading.value = true
+            try {
+                // Not logged in: personalize from the local taste profile
+                // (play history, likes, searches). Falls back to trending
+                // internally when there's no listening data yet.
+                val fetched = if (sessionManager.isLoggedIn()) {
+                    youtubeRepository.getRecommendations()
+                } else {
+                    recommendationEngine.getHomeRecommendations(
+                        limit = com.sentup.android.data.HOME_RECOMMENDATION_POOL
+                    )
+                }
+                if (publishHomeRecommendations(fetched, rotate = false)) {
+                    recommendationsLoadedAtMs = System.currentTimeMillis()
+                }
+            } catch (e: Exception) {
+                // The feed keeps whatever it already had - both branches above
+                // only assign a non-empty result - so a failure here is not
+                // destructive and does not warrant tearing the screen down.
+                // It does have to be visible in a bug report though, which is
+                // what this was missing.
+                KLog.e("HomeViewModel", "Home recommendations failed to load", e)
+            } finally {
+                _isLoading.value = false
+            }
+        }
+    }
+
+    /**
+     * Search results, kept briefly so moving between the category chips is not
+     * a request each way.
+     *
+     * One cache per result type, all cleared together on a profile switch:
+     * signed-in search is personalised, so serving one account's results under
+     * another is the same mistake as replaying its visitorData.
+     */
+    private val songSearchCache = com.sentup.android.data.SearchResultsCache<Song>()
+    private val artistSearchCache =
+        com.sentup.android.data.SearchResultsCache<com.sentup.android.data.ArtistItem>()
+    private val albumSearchCache =
+        com.sentup.android.data.SearchResultsCache<com.sentup.android.data.PlaylistDisplayItem>()
+    private val playlistSearchCache =
+        com.sentup.android.data.SearchResultsCache<com.sentup.android.data.PlaylistDisplayItem>()
+    private val videoSearchCache = com.sentup.android.data.SearchResultsCache<VideoItem>()
+    private val videoPlaylistSearchCache =
+        com.sentup.android.data.SearchResultsCache<com.sentup.android.data.VideoPlaylist>()
+    private val channelSearchCache =
+        com.sentup.android.data.SearchResultsCache<com.sentup.android.data.SubscribedChannel>()
+
+    /** Case and surrounding space are not a different search. */
+    private fun searchKey(query: String, vararg parts: String): String =
+        (listOf(query.trim().lowercase()) + parts).joinToString("|")
+
+    private fun videoSearchKey(
+        query: String,
+        dateFilter: com.sentup.android.data.VideoSearchDateFilter,
+        sort: com.sentup.android.data.VideoSearchSort
+    ) = searchKey(query, dateFilter.name, sort.name)
+
+    /**
+     * Whether this exact search can be answered without the network.
+     *
+     * The search screen asks so it can skip both its typing debounce and its
+     * spinner: a category switch that resolves from memory should feel like a
+     * tab, not like a new search.
+     */
+    fun hasCachedSearch(
+        query: String,
+        videoMode: Boolean,
+        category: String,
+        dateFilter: com.sentup.android.data.VideoSearchDateFilter =
+            com.sentup.android.data.VideoSearchDateFilter.ANY,
+        sort: com.sentup.android.data.VideoSearchSort =
+            com.sentup.android.data.VideoSearchSort.RELEVANCE
+    ): Boolean {
+        if (query.isBlank()) return false
+        val key = searchKey(query)
+        return if (videoMode) {
+            when (category) {
+                "VIDEOS" -> videoSearchCache.has(videoSearchKey(query, dateFilter, sort))
+                "PLAYLISTS" -> videoPlaylistSearchCache.has(key)
+                "CHANNELS" -> channelSearchCache.has(key)
+                else -> false
+            }
+        } else {
+            when (category) {
+                "SONGS" -> songSearchCache.has(key)
+                // Music mode's Videos tab is video search with default filters.
+                "VIDEOS" -> videoSearchCache.has(videoSearchKey(
+                    query,
+                    com.sentup.android.data.VideoSearchDateFilter.ANY,
+                    com.sentup.android.data.VideoSearchSort.RELEVANCE,
+                ))
+                "ARTISTS" -> artistSearchCache.has(key)
+                "ALBUMS" -> albumSearchCache.has(key)
+                "PLAYLISTS" -> playlistSearchCache.has(key)
+                else -> false
+            }
+        }
+    }
+
+    /** Drop every cached search. Called on a profile switch. */
+    private fun clearSearchCaches() {
+        songSearchCache.clear()
+        artistSearchCache.clear()
+        albumSearchCache.clear()
+        playlistSearchCache.clear()
+        videoSearchCache.clear()
+        videoPlaylistSearchCache.clear()
+        channelSearchCache.clear()
+    }
+
+    suspend fun searchYouTube(query: String): List<Song> {
+        if (query.isBlank()) return emptyList()
+        val key = searchKey(query)
+        songSearchCache.get(key)?.let { return it }
+        return try {
+            youtubeRepository.search(query).also { songSearchCache.put(key, it) }
+        } catch (e: kotlinx.coroutines.CancellationException) {
+            // A superseded query must not answer with "nothing found": its
+            // caller would write this over the results of the query that
+            // replaced it.
+            throw e
+        } catch (e: Exception) {
+            KLog.e("HomeViewModel", "Song search failed for \"$query\"", e)
+            emptyList()
+        }
+    }
+
+    suspend fun loadMoreResults(query: String): List<Song> {
+        if (query.isBlank()) return emptyList()
+        return try {
+            // Appended rather than replaced: the repository's continuation
+            // cursor has moved on, so a cache still holding only the first page
+            // would, after a tab switch, show one page while the next load
+            // returned the page after the last one fetched.
+            youtubeRepository.searchNext(query).also {
+                songSearchCache.append(searchKey(query), it)
+            }
+        } catch (e: kotlinx.coroutines.CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            KLog.e("HomeViewModel", "Song search next page failed for \"$query\"", e)
+            emptyList()
+        }
+    }
+
+    suspend fun getLikedMusic(): List<Song> {
+        return _likedSongs.value
+    }
+
+    suspend fun getUserPlaylists(): List<com.sentup.android.data.PlaylistDisplayItem> {
+        return userPlaylists.value
+    }
+
+    suspend fun fetchPlaylistSongs(playlistId: String): List<Song> {
+        val downloadedPlaylist = downloadRepository.playlistStore.playlists.value.find { it.id == playlistId }
+        val offlineSongs = downloadedPlaylist?.offlineSongs(downloadRepository.downloadedSongs.value).orEmpty()
+        if (downloadedPlaylist != null &&
+            (!hasNetworkConnection() || themePreferences.isLocalOnlyModeEnabled())) {
+            return offlineSongs
+        }
+        // "Liked Songs" is assembled locally so it works without a YouTube
+        // login: stored metadata + YT-account likes + liked local songs.
+        if (playlistId == "LM" || playlistId == "VLLM") {
+            val manuallyLiked = likedSongsRepository.likedSongs.value
+            val likedIds = likedSongsRepository.getAllLikedSongIds()
+            val likedLocalSongs = _songs.value.filter { it.id in likedIds }
+            val ytLiked = _likedSongs.value.ifEmpty {
+                if (sessionManager.isLoggedIn()) {
+                    try {
+                        youtubeRepository.getLikedMusic()
+                    } catch (e: kotlinx.coroutines.CancellationException) {
+                        throw e
+                    } catch (e: Exception) {
+                        KLog.e("HomeViewModel", "Account liked songs could not be read", e)
+                        emptyList()
+                    }
+                } else emptyList()
+            }
+            return (manuallyLiked + ytLiked + likedLocalSongs).distinctBy { it.id }
+        }
+
+        // Check local first
+        val localPlaylist = playlistRepository.userPlaylists.value.find { it.id == playlistId }
+        if (localPlaylist != null) {
+            return localPlaylist.songs
+        }
+        // A video-mode device playlist opened from the music Library: its
+        // videos play as songs. There is nothing upstream to fetch.
+        if (com.sentup.android.data.LocalVideoPlaylistsRepository.isLocal(playlistId)) {
+            return localVideoPlaylistsRepository.videosOf(playlistId).map { video ->
+                Song.fromYouTube(
+                    video.videoId, video.title, video.channelName.ifBlank { UNKNOWN_ARTIST }, "",
+                    video.duration * 1000L, video.thumbnailUrl
+                )
+            }
+        }
+        // Fallback to the explicit download snapshot when the live list is unavailable.
+        return try {
+            youtubeRepository.getPlaylist(playlistId).ifEmpty { offlineSongs }
+        } catch (e: kotlinx.coroutines.CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            offlineSongs
+        }
+
+    }
+    
+
+    
+    /**
+     * Search Wrapper Functions for UI
+     */
+    suspend fun searchArtists(query: String): List<ArtistItem> {
+        if (query.isBlank()) return emptyList()
+        val key = searchKey(query)
+        artistSearchCache.get(key)?.let { return it }
+        return try {
+            youtubeRepository.searchArtists(query).also { artistSearchCache.put(key, it) }
+        } catch (e: kotlinx.coroutines.CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            KLog.e("HomeViewModel", "Artist search failed for \"$query\"", e)
+            emptyList()
+        }
+    }
+
+    suspend fun searchAlbums(query: String): List<PlaylistDisplayItem> {
+        if (query.isBlank()) return emptyList()
+        val key = searchKey(query)
+        albumSearchCache.get(key)?.let { return it }
+        return try {
+            youtubeRepository.searchAlbums(query).also { albumSearchCache.put(key, it) }
+        } catch (e: kotlinx.coroutines.CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            KLog.e("HomeViewModel", "Album search failed for \"$query\"", e)
+            emptyList()
+        }
+    }
+
+    suspend fun searchPlaylists(query: String): List<PlaylistDisplayItem> {
+        if (query.isBlank()) return emptyList()
+        val key = searchKey(query)
+        playlistSearchCache.get(key)?.let { return it }
+        return try {
+            youtubeRepository.searchPlaylists(query).also { playlistSearchCache.put(key, it) }
+        } catch (e: kotlinx.coroutines.CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            KLog.e("HomeViewModel", "Playlist search failed for \"$query\"", e)
+            emptyList()
+        }
+    }
+
+    /**
+     * Search for songs by a specific artist on YouTube Music.
+     */
+    suspend fun searchArtistSongs(artistName: String): List<Song> {
+        return try {
+            youtubeRepository.search(artistName)
+        } catch (e: kotlinx.coroutines.CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            KLog.e("HomeViewModel", "Artist songs search failed for \"$artistName\"", e)
+            emptyList()
+        }
+    }
+
+    suspend fun getArtistDetails(artistId: String): Pair<List<Song>, List<PlaylistDisplayItem>> {
+        return try {
+            youtubeRepository.getArtistDetails(artistId)
+        } catch (e: kotlinx.coroutines.CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            KLog.e("HomeViewModel", "Artist details failed for \"$artistId\"", e)
+            Pair(emptyList(), emptyList())
+        }
+    }
+
+    suspend fun getArtistPage(artistId: String): com.sentup.android.data.ArtistPage? {
+        return try {
+            youtubeRepository.getArtistPage(artistId)
+        } catch (e: kotlinx.coroutines.CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            null
+        }
+    }
+
+    /**
+     * The album page a Recent albums card opens, or null when there is none to
+     * open: a device album, or a streaming play whose release could not be
+     * resolved. Plays recorded before the history kept release ids cost one
+     * music /next call here, on the tap rather than for every card.
+     */
+    suspend fun resolveRecentAlbum(album: RecentAlbum): PlaylistDisplayItem? {
+        if (album.source == com.sentup.android.data.SongSource.LOCAL) return null
+        val id = album.albumId ?: getSongAlbumRef(album.songId)?.albumId ?: return null
+        return PlaylistDisplayItem(
+            name = album.title,
+            url = "https://music.youtube.com/browse/$id",
+            uploaderName = album.artist,
+            thumbnailUrl = album.artwork,
+        )
+    }
+
+    /**
+     * What a Recent albums card plays when it has no page to open. A device
+     * album is the library's tracks under that name, in album order; a
+     * streaming one that would not resolve is the songs heard from it.
+     */
+    fun recentAlbumQueue(album: RecentAlbum): List<Song> {
+        if (album.source == com.sentup.android.data.SongSource.LOCAL) {
+            return _songs.value
+                .filter {
+                    it.source == com.sentup.android.data.SongSource.LOCAL &&
+                        it.album.trim().equals(album.title, ignoreCase = true)
+                }
+                .sortedWith(compareBy<Song>({ it.discNumber ?: Int.MAX_VALUE }, { it.trackNumber ?: Int.MAX_VALUE }))
+        }
+        return album.tracks.map {
+            Song.fromYouTube(
+                videoId = it.songId,
+                title = it.title,
+                artist = it.artist,
+                album = it.album,
+                duration = it.duration,
+                thumbnailUrl = it.thumbnailUrl
+            )
+        }
+    }
+
+    /** Resolve the album behind a YouTube song id (one music /next call). */
+    suspend fun getSongAlbumRef(videoId: String): com.sentup.android.data.SongAlbumRef? {
+        return try {
+            youtubeRepository.getSongAlbumRef(videoId)
+        } catch (e: kotlinx.coroutines.CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            null
+        }
+    }
+
+    /** Related-songs radio seeded from a YouTube video id (works logged out). */
+    suspend fun getRadioSongs(videoId: String): List<Song> {
+        return try {
+            youtubeRepository.getRelatedSongs(videoId)
+        } catch (e: Exception) {
+            emptyList()
+        }
+    }
+    
+    fun logout() {
+        resetVideoLibraryPagination()
+        clearShortsFeed()
+        sessionManager.clearSession()
+        _isYouTubeConnected.value = false
+        _userAvatar.value = null
+        _userName.value = null
+        homeRecommendationCache.clear()
+        // Same reason as on a profile switch: results fetched with a session
+        // must not survive it.
+        clearSearchCaches()
+        _youtubeSongs.value = emptyList()
+        _likedSongs.value = emptyList()
+        _youtubePlaylists.value = emptyList()
+        forgetHomeLoadTimes()
+        accountLoadJob?.cancel()
+        clearSubscriptionMix()
+        clearFeedPosts()
+        // The Subscriptions tab no longer empties itself on sign-out - local
+        // subscriptions outlive the session - so the account's half has to be
+        // dropped explicitly, or it would sit there unreachable and stale.
+        _accountChannels.value = emptyList()
+        _subscriptionFeed.value = emptyList()
+        resetSubscriptionFeedPaging()
+        loadSubscriptionFeed(force = true)
+        loadYouTubeRecommendations(force = true)
+    }
+
+    fun refresh(excludedFolders: Set<String> = emptySet(), manualScan: Boolean = false) {
+        viewModelScope.launch {
+            _isLoading.value = true
+            try {
+                _isYouTubeConnected.value = sessionManager.isLoggedIn()
+                if (_isYouTubeConnected.value) {
+                    // Fetch account info and avatar sync
+                    youtubeRepository.fetchAccountInfo()
+                    _userAvatar.value = sessionManager.getUserAvatar()
+                    
+                    // Personalized recommendations, led by songs that have
+                    // not led yet: YouTube answers a refresh with the same
+                    // list, and the same three covers read as nothing having
+                    // happened.
+                    if (publishHomeRecommendations(youtubeRepository.getRecommendations(), rotate = true)) {
+                        recommendationsLoadedAtMs = System.currentTimeMillis()
+                    }
+
+                    // Update library data
+                    _likedSongs.value = youtubeRepository.getLikedMusic()
+                    _youtubePlaylists.value = youtubeRepository.getUserPlaylists()
+                    accountLoadedAtMs = System.currentTimeMillis()
+                } else if (_youtubeSongs.value.isNotEmpty()) {
+                    // Logged-out YouTube mode: refresh the taste-based feed too.
+                    // (Gated on a non-empty feed so local-only users don't pay
+                    // for network searches on every pull-to-refresh.)
+                    publishHomeRecommendations(
+                        recommendationEngine.getHomeRecommendations(
+                        limit = com.sentup.android.data.HOME_RECOMMENDATION_POOL
+                    ), rotate = true
+                    )
+                }
+                // Reload local songs with exclusions and playlists
+                playlistRepository.refreshPlaylists()
+                _songs.value = localRepository.getSongs(excludedFolders, manualScan)
+            } catch (e: Exception) {
+                // Silently fail
+            } finally {
+                _isLoading.value = false
+            }
+        }
+    }
+
+    // ============== VIDEO MODE FUNCTIONS ==============
+
+    /**
+     * Load trending/recommended videos for video mode home screen.
+     * Also refreshes the Shorts shelf in parallel.
+     */
+    private var videoHomeLoadJob: Job? = null
+    private var videoHomeRequest: kotlinx.coroutines.Deferred<com.sentup.android.data.VideoFeedPage>? = null
+    private var videoHomeLoadGeneration = 0L
+
+    /**
+     * One page of the video feed, or null if it did not arrive in time.
+     *
+     * The request is started on the ViewModel's own scope rather than inside
+     * the timeout, because [YouTubeRepository.getTrendingVideos] can reach a
+     * blocking extractor and a coroutine timeout does not return while an
+     * uninterruptible child is still inside one - the same non-fix docs/playback-streams.md
+     * describes for music resolution. Detached, the deadline
+     * actually fires and the caller can put the downloaded videos up while the
+     * orphan finishes against its own client timeouts.
+     *
+     * An outstanding request is joined rather than duplicated, so repeated
+     * pulls on a slow connection cannot pile network work on the server that is
+     * already not answering.
+     */
+    private suspend fun requestVideoFeedPage(): com.sentup.android.data.VideoFeedPage? {
+        val request = videoHomeRequest?.takeIf { it.isActive }
+            ?: viewModelScope.async(kotlinx.coroutines.Dispatchers.IO) {
+                youtubeRepository.getTrendingVideos()
+            }.also { videoHomeRequest = it }
+        return kotlinx.coroutines.withTimeoutOrNull(VIDEO_FEED_DEADLINE_MS) { request.await() }
+    }
+
+    fun loadTrendingVideos() {
+        val generation = ++videoHomeLoadGeneration
+        videoHomeLoadJob?.cancel()
+        if (!hasNetworkConnection() || themePreferences.isLocalOnlyModeEnabled()) {
+            _isVideoHomeOffline.value = true
+            _isVideoLoading.value = false
+            return
+        }
+        loadShortsFeed()
+        if (!themePreferences.areVideoRecommendationsEnabled()) {
+            _isVideoLoading.value = false
+            return
+        }
+        videoHomeLoadJob = viewModelScope.launch {
+            _isVideoLoading.value = true
+            try {
+                // The request belongs to the ViewModel, not the timeout scope:
+                // blocking NewPipe calls cannot hold the UI's deadline open.
+                // Reuse an outstanding request so repeated refreshes cannot
+                // accumulate network work while that call finishes.
+                val page = requestVideoFeedPage()
+                if (!themePreferences.areVideoRecommendationsEnabled()) return@launch
+                if (page != null && page.videos.isNotEmpty()) {
+                    _isVideoHomeOffline.value = false
+                    _trendingVideos.value = page.videos
+                    videoFeedLoadedAtMs = System.currentTimeMillis()
+                    videoFeedContinuation = page.continuation
+                    tasteSeedOffset = 6
+                    videoFeedExhausted = false
+                    rememberShown(page.videos)
+                } else {
+                    _isVideoHomeOffline.value = page == null || !hasNetworkConnection()
+                }
+            } catch (cancelled: kotlinx.coroutines.CancellationException) {
+                throw cancelled
+            } catch (e: Exception) {
+                _isVideoHomeOffline.value = true
+            } finally {
+                if (generation == videoHomeLoadGeneration) _isVideoLoading.value = false
+            }
+        }
+    }
+
+    // ---------------- "Don't recommend this" ----------------
+
+    /** The most recent hide/block, for the app-wide undo snackbar. */
+    val lastNotInterested: StateFlow<com.sentup.android.data.NotInterestedRepository.UndoableAction?> =
+        notInterestedRepository.lastAction
+
+    val hiddenVideos: StateFlow<List<com.sentup.android.data.NotInterestedRepository.HiddenVideo>> =
+        notInterestedRepository.hiddenVideos
+
+    val blockedChannels: StateFlow<List<com.sentup.android.data.BlockedChannel>> =
+        notInterestedRepository.blockedChannels
+
+    /** Hide one video from every recommendation feed. */
+    fun markNotInterested(video: VideoItem) {
+        notInterestedActions.hideVideo(video, viewModelScope)
+        topUpFeedAfterFiltering()
+    }
+
+    /** Stop recommending anything from this video's channel. */
+    fun blockChannelFor(video: VideoItem) {
+        notInterestedActions.blockChannel(video, viewModelScope)
+        topUpFeedAfterFiltering()
+    }
+
+    /**
+     * Music mode's two dismissals. Local only - see [NotInterestedActions] -
+     * and both land in the same store and the same undo snackbar the video
+     * ones use, so there is one place to review them and one gesture to take
+     * them back.
+     */
+    fun hideSong(song: Song) = notInterestedActions.hideSong(song)
+
+    fun blockArtist(song: Song) = notInterestedActions.blockArtist(song)
+
+    fun unhideVideo(videoId: String) = notInterestedRepository.unhideVideo(videoId)
+
+    fun unblockChannel(channelId: String, name: String) =
+        notInterestedRepository.unblockChannel(channelId, name)
+
+    fun clearHiddenVideos() = notInterestedRepository.clearHiddenVideos()
+
+    fun clearBlockedChannels() = notInterestedRepository.clearBlockedChannels()
+
+    /**
+     * Fetch another page when filtering has left too little on screen.
+     *
+     * Blocking a prolific channel can take a dozen items out of a twenty-item
+     * grid at once. Load-more normally fires on scroll, but there is nothing
+     * left to scroll after a cut like that, so the feed would just sit there
+     * looking broken until the user pulled to refresh.
+     */
+    private fun topUpFeedAfterFiltering() {
+        val raw = _trendingVideos.value
+        if (raw.isEmpty()) return
+        // Recomputed here rather than read off [trendingVideos]: the block was
+        // written to the repository a moment ago, but the derived flow emits
+        // asynchronously, so its current value is still the pre-block list and
+        // the check would decide there was plenty left.
+        if (notInterestedRepository.filter(raw).size < FEED_TOP_UP_THRESHOLD) {
+            loadMoreTrendingVideos()
+        }
+    }
+
+    /**
+     * Record videos as seen, keeping the newest [SHOWN_VIDEO_MEMORY] ids.
+     * Bounded because the set only exists to keep consecutive refreshes from
+     * repeating themselves, not to be a second watch history.
+     */
+    private fun rememberShown(videos: List<VideoItem>) {
+        videos.forEach { shownVideoIds.add(it.videoId) }
+        while (shownVideoIds.size > SHOWN_VIDEO_MEMORY) {
+            shownVideoIds.remove(shownVideoIds.first())
+        }
+    }
+
+    /**
+     * Load the next page of the video home feed. Called when the grid scrolls
+     * near its end (last ~5 items). Logged in this follows the InnerTube
+     * browse continuation; logged out it mines older watch-history seeds for
+     * more related videos. No-op while a load is already running or once the
+     * feed is exhausted.
+     */
+    fun loadMoreTrendingVideos() {
+        if (!themePreferences.areVideoRecommendationsEnabled()) return
+        if (_isVideoHomeOffline.value || _isVideoLoading.value || _isVideoLoadingMore.value || videoFeedExhausted) return
+        if (_trendingVideos.value.isEmpty()) return
+
+        viewModelScope.launch {
+            _isVideoLoadingMore.value = true
+            try {
+                val token = videoFeedContinuation
+                val newVideos: List<VideoItem>
+                if (token != null) {
+                    val page = youtubeRepository.getVideoFeedContinuation(token)
+                    videoFeedContinuation = page.continuation
+                    newVideos = page.videos
+                    if (page.videos.isEmpty() && page.continuation == null) {
+                        videoFeedExhausted = true
+                    }
+                } else {
+                    newVideos = youtubeRepository.getTasteBasedVideos(tasteSeedOffset)
+                    tasteSeedOffset += 6
+                    if (newVideos.isEmpty()) {
+                        videoFeedExhausted = true
+                    }
+                }
+
+                val onScreen = _trendingVideos.value.mapTo(HashSet()) { it.videoId }
+                val fresh = newVideos.filterNot { it.videoId in onScreen }
+                if (!themePreferences.areVideoRecommendationsEnabled()) return@launch
+                if (fresh.isNotEmpty()) {
+                    _trendingVideos.value = _trendingVideos.value + fresh
+                    rememberShown(fresh)
+                }
+            } catch (e: Exception) {
+                // Handle error silently; the next scroll will retry
+            } finally {
+                _isVideoLoadingMore.value = false
+            }
+        }
+    }
+
+    /**
+     * Load the Shorts shelf (personalized when logged in, search-seeded
+     * otherwise). No-op unless the user enabled the Home shelf — fresh pref read,
+     * since the settings screen toggles through its own ThemePreferences
+     * instance. Failures leave the previous shelf in place.
+     */
+    fun loadShortsFeed(force: Boolean = false) {
+        if (!themePreferences.isShortsEnabled() || shortsFeedLoadJob?.isActive == true) return
+        if (!force && _shortsFeed.value.isNotEmpty() && loadedRecently(shortsFeedLoadedAtMs)) return
+        if (themePreferences.isLocalOnlyModeEnabled()) return
+        if (!hasNetworkConnection()) {
+            _shortsFeedFailed.value = true
+            return
+        }
+        val generation = ++shortsFeedGeneration
+        val profileId = com.sentup.android.data.ProfileManager(app).activeProfileId.value
+        val session = sessionManager.captureSession()
+        fun isCurrent(): Boolean = generation == shortsFeedGeneration &&
+            com.sentup.android.data.ProfileManager(app).activeProfileId.value == profileId &&
+            (if (session != null) sessionManager.currentSession(session) != null
+             else sessionManager.captureSession() == null)
+        _isShortsLoading.value = true
+        _shortsFeedFailed.value = false
+        shortsFeedLoadJob = viewModelScope.launch {
+            try {
+                val shorts = youtubeRepository.getShortsFeed()
+                if (isCurrent() && themePreferences.isShortsEnabled()) {
+                    _shortsFeed.value = shorts
+                    shortsFeedLoadedAtMs = System.currentTimeMillis()
+                }
+            } catch (cancelled: kotlinx.coroutines.CancellationException) {
+                throw cancelled
+            } catch (e: Exception) {
+                if (isCurrent()) _shortsFeedFailed.value = true
+                KLog.w("HomeViewModel", "Shorts refresh failed", e)
+            } finally {
+                if (generation == shortsFeedGeneration) _isShortsLoading.value = false
+            }
+        }
+    }
+
+    /**
+     * Load user's watch history. Logged in: YouTube account history
+     * (falling back to local). Logged out: locally persisted history.
+     */
+    /** A history entry just removed, kept so the snackbar can put it back. */
+    data class HistoryRemoval(val video: VideoItem, val at: Int, val id: Long)
+
+    private val _lastHistoryRemoval = MutableStateFlow<HistoryRemoval?>(null)
+    val lastHistoryRemoval: StateFlow<HistoryRemoval?> = _lastHistoryRemoval.asStateFlow()
+
+    /**
+     * Take one video out of the watch history.
+     *
+     * The list on screen is updated first and without waiting: the store write
+     * is synchronous and local, and a row that lingers for a frame after being
+     * removed is the thing this feature exists to fix.
+     */
+    fun removeVideoFromHistory(video: VideoItem) {
+        val at = _historyVideos.value.indexOfFirst { it.videoId == video.videoId }
+        _historyVideos.value = _historyVideos.value.filterNot { it.videoId == video.videoId }
+        videoHistoryRepository.removeVideo(video.videoId)
+        // A fresh id every time, so removing two entries in a row re-shows the
+        // snackbar instead of the second one silently doing nothing.
+        _lastHistoryRemoval.value =
+            HistoryRemoval(video, at.coerceAtLeast(0), System.currentTimeMillis())
+    }
+
+    /** Put the last removed entry back where it was. */
+    fun undoHistoryRemoval() {
+        val removal = _lastHistoryRemoval.value ?: return
+        _lastHistoryRemoval.value = null
+        videoHistoryRepository.restoreVideo(removal.video, removal.at)
+        val current = _historyVideos.value.toMutableList()
+        if (current.none { it.videoId == removal.video.videoId }) {
+            current.add(removal.at.coerceIn(0, current.size), removal.video)
+        }
+        _historyVideos.value = current
+    }
+
+    fun clearHistoryRemoval() {
+        _lastHistoryRemoval.value = null
+    }
+
+    /**
+     * Empty Sentüp's watch history.
+     *
+     * Local only, and the confirmation dialog says so: deleting the account's
+     * history needs YouTube's own per-item tokens, and a control that silently
+     * left youtube.com untouched would be the more damaging half of a promise
+     * it could not keep.
+     */
+    fun clearVideoHistory() {
+        historyLoadJob?.cancel()
+        historyPagination.reset()
+        _isHistoryLoading.value = false
+        videoHistoryRepository.clearHistory()
+        _historyVideos.value = emptyList()
+        _lastHistoryRemoval.value = null
+    }
+
+    /** True when this entry has already been taken out of history. */
+    fun isRemovedFromHistory(videoId: String): Boolean =
+        videoHistoryRepository.isRemoved(videoId)
+
+    /** Library and refresh request one page only, irrespective of account age. */
+    fun loadYouTubeHistory() {
+        if (historyLoadJob?.isActive == true) return
+        historySession = sessionManager.captureSession()
+        if (historySession == null) {
+            historyPagination.reset()
+            _isHistoryLoading.value = false
+            _historyVideos.value = videoHistoryRepository.getHistory()
+            return
+        }
+        val request = historyPagination.first()
+        _isHistoryLoading.value = true
+        fetchHistoryPage(request)
+    }
+
+    fun loadMoreYouTubeHistory() {
+        val request = historyPagination.more() ?: return
+        fetchHistoryPage(request)
+    }
+
+    private fun fetchHistoryPage(request: com.sentup.android.data.DemandPagination.Request<String>) {
+        val session = historySession
+        historyLoadJob = viewModelScope.launch {
+            try {
+                val page = youtubeRepository.getWatchHistoryPage(request.continuation, session)
+                if (!historyPagination.isCurrent(request)) return@launch
+                if (page == null) {
+                    historyPagination.fail(request)
+                    if (_historyVideos.value.isEmpty()) _historyVideos.value = videoHistoryRepository.getHistory()
+                } else if (historyPagination.complete(request, page.continuation)) {
+                    // The history screen keys rows by video id, so every page is
+                    // deduplicated, including the first.
+                    val visible = videoHistoryRepository.withoutRemoved(page.videos)
+                    _historyVideos.value = if (request.continuation == null) {
+                        visible.ifEmpty { videoHistoryRepository.getHistory() }
+                            .distinctBy { it.videoId }
+                    } else (_historyVideos.value + visible).distinctBy { it.videoId }
+                }
+                _isHistoryLoading.value = false
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                if (historyPagination.isCurrent(request)) {
+                    historyPagination.fail(request)
+                    _isHistoryLoading.value = false
+                }
+            } finally {
+                if (historyPagination.isCurrent(request)) {
+                    historyPagination.cancel(request)
+                    _isHistoryLoading.value = false
+                }
+            }
+        }
+    }
+
+    fun stopHistoryPagination() {
+        // The initial page is also the root's preview; only cancel detail-page appends.
+        if (!_isHistoryLoading.value) historyLoadJob?.cancel()
+    }
+
+    /**
+     * Search for videos (for video mode search).
+     * [dateFilter] restricts results to the chosen upload-date window,
+     * [sort] picks the result order.
+     */
+    suspend fun searchVideos(
+        query: String,
+        dateFilter: com.sentup.android.data.VideoSearchDateFilter = com.sentup.android.data.VideoSearchDateFilter.ANY,
+        sort: com.sentup.android.data.VideoSearchSort = com.sentup.android.data.VideoSearchSort.RELEVANCE
+    ): List<VideoItem> {
+        if (query.isBlank()) return emptyList()
+        // The filters are part of the search, not a view of it, so they are
+        // part of the key: the same words with a different date window is a
+        // different question and has to reach the network.
+        val key = videoSearchKey(query, dateFilter, sort)
+        videoSearchCache.get(key)?.let { return it }
+        return try {
+            youtubeRepository.searchVideos(query, dateFilter, sort)
+                .also { videoSearchCache.put(key, it) }
+        } catch (e: kotlinx.coroutines.CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            KLog.e("HomeViewModel", "Video search failed for \"$query\"", e)
+            emptyList()
+        }
+    }
+
+    /** Next page for the same query, date window and sort as the displayed list. */
+    suspend fun loadMoreVideoResults(
+        query: String,
+        dateFilter: com.sentup.android.data.VideoSearchDateFilter = com.sentup.android.data.VideoSearchDateFilter.ANY,
+        sort: com.sentup.android.data.VideoSearchSort = com.sentup.android.data.VideoSearchSort.RELEVANCE
+    ): List<VideoItem> {
+        if (query.isBlank()) return emptyList()
+        return try {
+            youtubeRepository.searchVideosNext(query, dateFilter, sort).also { more ->
+                val key = videoSearchKey(query, dateFilter, sort)
+                videoSearchCache.get(key)?.let { existing ->
+                    videoSearchCache.put(key, (existing + more).distinctBy { it.videoId })
+                }
+            }
+        } catch (e: kotlinx.coroutines.CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            KLog.e("HomeViewModel", "Video search next page failed for \"$query\"", e)
+            emptyList()
+        }
+    }
+
+    /**
+     * Search for YouTube playlists (for video mode search).
+     */
+    suspend fun searchVideoPlaylists(query: String): List<com.sentup.android.data.VideoPlaylist> {
+        if (query.isBlank()) return emptyList()
+        val key = searchKey(query)
+        videoPlaylistSearchCache.get(key)?.let { return it }
+        return try {
+            youtubeRepository.searchVideoPlaylists(query)
+                .also { videoPlaylistSearchCache.put(key, it) }
+        } catch (e: kotlinx.coroutines.CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            KLog.e("HomeViewModel", "Video playlist search failed for \"$query\"", e)
+            emptyList()
+        }
+    }
+
+    /**
+     * A creator's channel identity - banner, avatar, verified tick, subscriber
+     * count - for the music artist page.
+     *
+     * One browse, and the artist page's only reason to make it: it is what lets
+     * the same musician look like the same person whichever mode you arrive
+     * from. Returns null for anything that is not a channel id, which is the
+     * common case in a local library where the "artist" is a tag on a file.
+     */
+    suspend fun getChannelHeader(
+        channelId: String
+    ): com.sentup.android.data.ChannelHeader? {
+        if (!channelId.startsWith("UC")) return null
+        return try {
+            youtubeRepository.getChannelPage(channelId)?.header
+        } catch (e: kotlinx.coroutines.CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            KLog.e("HomeViewModel", "Channel header failed for \"$channelId\"", e)
+            null
+        }
+    }
+
+    /** Search for channels (video mode's Channels filter). */
+    suspend fun searchChannels(query: String): List<com.sentup.android.data.SubscribedChannel> {
+        if (query.isBlank()) return emptyList()
+        val key = searchKey(query)
+        channelSearchCache.get(key)?.let { return it }
+        return try {
+            youtubeRepository.searchChannels(query).also { channelSearchCache.put(key, it) }
+        } catch (e: kotlinx.coroutines.CancellationException) {
+            throw e
+        } catch (e: Exception) {
+            KLog.e("HomeViewModel", "Channel search failed for \"$query\"", e)
+            emptyList()
+        }
+    }
+
+    /**
+     * Refresh video mode content.
+     */
+    /**
+     * Pull-to-refresh for the video home feed.
+     *
+     * Deliberately not a plain re-run of [loadTrendingVideos]. YouTube's
+     * FEwhat_to_watch page 1 is close to static between fetches, so replacing
+     * the list with it showed the user the videos they had just scrolled past
+     * and the refresh read as broken. Measured against the live feed in August
+     * 2026: a page-1 refetch returned 22 videos, 16 of them already on screen,
+     * while the continuation returned an entire page of new ones.
+     *
+     * So this takes whatever page 1 offers that is genuinely new, then walks
+     * forward through the feed until there is a screenful of unseen videos.
+     * When the feed really is exhausted it falls back to page 1 rather than
+     * emptying the screen.
+     */
+    fun refreshVideos() {
+        // The same refusal the initial load makes, for the same reason: a pull
+        // with no connection should answer with the downloads immediately
+        // rather than spin over them until a network call times out.
+        if (!hasNetworkConnection() || themePreferences.isLocalOnlyModeEnabled()) {
+            _isVideoHomeOffline.value = true
+            _isVideoLoading.value = false
+            return
+        }
+        loadShortsFeed(force = true)
+        if (!themePreferences.areVideoRecommendationsEnabled()) {
+            loadSubscriptions(force = true)
+            // A pull on the shuffled Home is a reshuffle, and it fetches pools
+            // only for channels not already held this session.
+            loadSubscriptionMix(force = true)
+            return
+        }
+        viewModelScope.launch {
+            _isVideoLoading.value = true
+            try {
+                // Bounded and detached exactly as the initial load is - a
+                // blocking extraction cannot hold this deadline open from
+                // inside, so the request cannot be a child of the timeout.
+                val page = requestVideoFeedPage()
+                if (!themePreferences.areVideoRecommendationsEnabled()) return@launch
+                if (page == null || page.videos.isEmpty()) {
+                    // Nothing new to show. Say offline only when there is also
+                    // nothing already on screen, so a refresh that comes back
+                    // empty does not replace a working feed with downloads.
+                    if (_trendingVideos.value.isEmpty()) {
+                        _isVideoHomeOffline.value = page == null || !hasNetworkConnection()
+                    }
+                    return@launch
+                }
+                // Reached the feed, so whatever put the offline list up is over.
+                // Without this a refresh could load videos into a screen that
+                // went on showing downloads until the tab was rebuilt.
+                _isVideoHomeOffline.value = false
+
+                val fresh = mutableListOf<VideoItem>()
+                val batchIds = HashSet<String>()
+                fun takeUnseen(videos: List<VideoItem>) {
+                    videos.forEach { video ->
+                        if (video.videoId !in shownVideoIds && batchIds.add(video.videoId)) {
+                            fresh += video
+                        }
+                    }
+                }
+                takeUnseen(page.videos)
+
+                var continuation = page.continuation
+                var pagesWalked = 0
+                while (fresh.size < MIN_FRESH_VIDEOS_ON_REFRESH &&
+                    pagesWalked < MAX_REFRESH_PAGES
+                ) {
+                    val token = continuation
+                    val more = if (token != null) {
+                        val next = youtubeRepository.getVideoFeedContinuation(token)
+                        continuation = next.continuation
+                        next.videos
+                    } else {
+                        // Logged out there is no token: page the taste-based
+                        // feed by seed window instead, wrapping back to the
+                        // newest history entries once the seeds run out.
+                        tasteSeedOffset += 6
+                        val seeded = youtubeRepository.getTasteBasedVideos(tasteSeedOffset)
+                        if (seeded.isEmpty()) {
+                            tasteSeedOffset = 0
+                            youtubeRepository.getTasteBasedVideos(0)
+                        } else {
+                            seeded
+                        }
+                    }
+                    pagesWalked++
+                    if (more.isEmpty()) break
+                    takeUnseen(more)
+                }
+
+                // Everything the feed has to offer is already seen. Showing
+                // page 1 again beats showing nothing.
+                val result = fresh.ifEmpty { page.videos }
+                _trendingVideos.value = result
+                videoFeedContinuation = continuation
+                videoFeedExhausted = false
+                rememberShown(result)
+            } catch (e: Exception) {
+                // Handle error silently; the list keeps its previous contents
+            } finally {
+                _isVideoLoading.value = false
+            }
+        }
+    }
+
+    // ============= PASTED YOUTUBE LINK RESOLUTION =============
+
+    /**
+     * Resolve a pasted YouTube video link into displayable metadata via a
+     * single watch-next call (title, channel, view count — the same data the
+     * video player enriches from). Returns null when the video can't be
+     * loaded (bad id, private video, offline).
+     */
+    suspend fun resolveVideoFromLink(videoId: String): VideoItem? {
+        return try {
+            youtubeRepository.getWatchNextData(videoId).updatedVideoItem
+        } catch (e: Exception) {
+            null
+        }
+    }
+
+    /** Resolve a pasted playlist link into songs (music mode). */
+    suspend fun resolvePlaylistSongsFromLink(playlistId: String): List<Song> {
+        return try {
+            youtubeRepository.getPlaylist(playlistId)
+        } catch (e: Exception) {
+            emptyList()
+        }
+    }
+
+    /** Resolve a pasted playlist link into videos (video mode). */
+    suspend fun resolvePlaylistVideosFromLink(playlistId: String): List<VideoItem> {
+        return try {
+            youtubeRepository.getPlaylistVideos(playlistId)
+        } catch (e: Exception) {
+            emptyList()
+        }
+    }
+
+    // ============= PLAYLIST MANAGEMENT =============
+    
+    /** Accent colors for a generated cover - see [playlistCoverSeeds]. */
+    private fun coverSeedColors(): Pair<Int, Int>? = playlistCoverSeeds(getApplication())
+
+    fun createLocalPlaylist(name: String, description: String?) {
+        viewModelScope.launch {
+            playlistRepository.createPlaylist(name, description, coverSeedColors())
+        }
+    }
+
+    /** Replace a local playlist's artwork with an image the user picked. */
+    fun setLocalPlaylistCover(playlistId: String, source: android.net.Uri) {
+        viewModelScope.launch {
+            playlistRepository.setCustomCover(playlistId, source)
+        }
+    }
+
+    /**
+     * Awaited variant for the playlist studio: the chosen cover is applied
+     * before the new playlist's page opens, so it never flashes the generated
+     * artwork first.
+     */
+    suspend fun applyLocalPlaylistCover(playlistId: String, source: android.net.Uri) {
+        playlistRepository.setCustomCover(playlistId, source)
+    }
+
+    /** Drop a chosen cover and go back to the generated one. */
+    fun resetLocalPlaylistCover(playlistId: String) {
+        viewModelScope.launch {
+            playlistRepository.resetCoverToGenerated(playlistId, coverSeedColors())
+        }
+    }
+
+
+    /**
+     * Copy a playlist that is not the user's own into one that is - a real
+     * local playlist they can rename, reorder, add to and delete from.
+     *
+     * This is deliberately not what the Save button does, and the two must not
+     * be folded together. Saving keeps a *reference*: the playlist is re-fetched
+     * live on every open, so it stays whatever its author makes it. That is the
+     * right default and the reason saving exists. A copy is the opposite trade,
+     * taken knowingly: it freezes the tracklist at this moment and never
+     * updates again, in exchange for being editable. Someone who wants to prune
+     * a 200-track playlist down to the 20 they like has no other way to do it.
+     *
+     * Duplicates are dropped rather than carried over. A YouTube playlist may
+     * legitimately list the same video twice, but a local playlist cannot
+     * represent that - [PlaylistRepository.removeSongFromPlaylist] filters by
+     * id, so removing one copy would silently remove all of them, which is a
+     * bug the user would meet while doing the editing this copy exists for.
+     *
+     * The cover is generated from the name like any other local playlist, not
+     * lifted from the original: this is the user's playlist now, and the
+     * original's artwork belongs to whoever published it.
+     *
+     * @return the new playlist's id, or null if there was nothing to copy.
+     */
+    /**
+     * Upload a local playlist to the YouTube Music account (it stays local
+     * too). Only YouTube songs can travel; device files are counted and left
+     * out. The account library is re-read afterwards so the copy shows up.
+     */
+    suspend fun uploadLocalPlaylistToYouTube(
+        name: String,
+        description: String?,
+        songs: List<Song>,
+    ): Pair<com.sentup.android.data.youtube.PlaylistUpload?, Int> {
+        val ids = songs.filter { it.source == com.sentup.android.data.SongSource.YOUTUBE }
+            .map { it.id }
+            .distinct()
+        val skipped = songs.size - songs.count { it.source == com.sentup.android.data.SongSource.YOUTUBE }
+        val result = youtubeRepository.uploadPlaylist(name, description, ids)
+        if (result != null) {
+            runCatching { _youtubePlaylists.value = youtubeRepository.getUserPlaylists() }
+        }
+        return result to skipped
+    }
+
+    suspend fun copyPlaylistToLocal(
+        name: String,
+        description: String?,
+        songs: List<Song>
+    ): String? {
+        val tracks = songs.distinctBy { it.id }
+        if (tracks.isEmpty()) return null
+        val id = playlistRepository.createPlaylist(name, description, coverSeedColors())
+        playlistRepository.replacePlaylistSongs(id, tracks)
+        return id
+    }
+
+    fun addSongToLocalPlaylist(playlistId: String, song: Song) {
+        viewModelScope.launch {
+            playlistRepository.addSongToPlaylist(playlistId, song)
+        }
+    }
+
+    /**
+     * Append a selection of songs to a local playlist in one write, skipping
+     * anything already in it. Suspend rather than fire-and-forget because the
+     * import screen reports how many songs actually landed.
+     */
+    suspend fun addSongsToLocalPlaylist(playlistId: String, songs: List<Song>): Int =
+        playlistRepository.addSongsToPlaylist(playlistId, songs)
+
+    /**
+     * Add a picked selection to a playlist the user owns: one batch write for
+     * a device playlist, one `edit_playlist` per song for one on the account.
+     * The account has no place for a device file, so those are left out there.
+     * One request per song rather than several actions in one, because only
+     * the single-action form of that call has been probed.
+     *
+     * @return how many songs landed.
+     */
+    suspend fun addSongsToPlaylist(playlistId: String, songs: List<Song>): Int {
+        if (playlistRepository.userPlaylists.value.any { it.id == playlistId }) {
+            return playlistRepository.addSongsToPlaylist(playlistId, songs)
+        }
+        var added = 0
+        for (song in songs.distinctBy { it.id }) {
+            if (song.source != com.sentup.android.data.SongSource.YOUTUBE) continue
+            val ok = try {
+                youtubeRepository.addToYouTubePlaylist(playlistId, song.id, music = true)
+            } catch (e: kotlinx.coroutines.CancellationException) {
+                throw e
+            } catch (e: Exception) {
+                false
+            }
+            if (ok) added++
+        }
+        return added
+    }
+
+    /**
+     * Create a local playlist already holding [songs] - the playlist studio's
+     * create action. Unlike [copyPlaylistToLocal] an empty selection is a
+     * valid outcome: naming a playlist first and filling it later is exactly
+     * what the flow allows.
+     *
+     * @return the new playlist's id.
+     */
+    suspend fun createLocalPlaylistWithSongs(
+        name: String,
+        description: String?,
+        songs: List<Song>
+    ): String {
+        val id = playlistRepository.createPlaylist(
+            name.trim(),
+            description?.trim()?.takeIf { it.isNotEmpty() },
+            coverSeedColors()
+        )
+        val tracks = songs.distinctBy { it.id }
+        if (tracks.isNotEmpty()) playlistRepository.replacePlaylistSongs(id, tracks)
+        return id
+    }
+
+    data class PlaylistImportResult(
+        val playlists: Int,
+        val songs: Int,
+        val saved: Int,
+        val missing: Int,
+        val foreign: Int,
+    )
+
+    /** Null means the file was not a format we read. */
+    suspend fun importPlaylists(uri: android.net.Uri): PlaylistImportResult? =
+        kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+            val app = getApplication<Application>()
+            val source = java.io.File(app.cacheDir, "playlist_import.src")
+            val scratch = java.io.File(app.cacheDir, "playlist_import.db")
+            try {
+                app.contentResolver.openInputStream(uri)?.use { SubscriptionTransfer.copyImport(it, source) }
+                    ?: return@withContext null
+                val fallbackName = uri.lastPathSegment?.substringAfterLast('/')?.substringBeforeLast('.')
+                    ?.ifBlank { null } ?: "Imported playlist"
+                val file = com.sentup.android.data.PlaylistTransfer.read(source, scratch, fallbackName)
+                if (file.playlists.isEmpty() && file.remote.isEmpty()) return@withContext null
+                val device = _songs.value.filter { it.source == SongSource.LOCAL }
+                val byPath = device.mapNotNull { s -> s.filePath?.lowercase()?.let { it to s } }.toMap()
+                val byName = device.mapNotNull { s ->
+                    s.filePath?.substringAfterLast('/')?.lowercase()?.let { it to s }
+                }.toMap()
+                var songs = 0
+                var missing = 0
+                var created = 0
+                file.playlists.forEach { playlist ->
+                    val resolved = playlist.tracks.mapNotNull { t ->
+                        when {
+                            t.videoId != null -> Song.fromYouTube(
+                                t.videoId, t.title, t.artist.ifBlank { UNKNOWN_ARTIST }, "", t.durationMs,
+                                "https://i.ytimg.com/vi/${t.videoId}/hqdefault.jpg"
+                            )
+                            t.path != null -> {
+                                val key = t.path.replace('\\', '/').lowercase()
+                                byPath[key] ?: byName[key.substringAfterLast('/')]
+                            }
+                            else -> null
+                        } ?: run { missing++; null }
+                    }.distinctBy { it.id }
+                    if (resolved.isNotEmpty()) {
+                        createLocalPlaylistWithSongs(playlist.name, null, resolved)
+                        created++
+                        songs += resolved.size
+                    }
+                }
+                var saved = 0
+                file.remote.forEach { r ->
+                    if (savedPlaylistsRepository.savedPlaylists.value.none { it.id == r.playlistId }) {
+                        savedPlaylistsRepository.save(
+                            com.sentup.android.data.SavedPlaylist(
+                                id = r.playlistId,
+                                url = "https://www.youtube.com/playlist?list=${r.playlistId}",
+                                name = r.name,
+                                uploaderName = r.uploader,
+                                thumbnailUrl = r.thumbnailUrl,
+                                itemCount = r.itemCount,
+                            )
+                        )
+                        saved++
+                    }
+                }
+                PlaylistImportResult(created, songs, saved, missing, file.foreignServiceEntries)
+            } catch (e: Exception) {
+                if (e is kotlinx.coroutines.CancellationException) throw e
+                KLog.w("HomeViewModel", "Playlist import failed", e)
+                null
+            } finally {
+                source.delete()
+                scratch.delete()
+            }
+        }
+
+    suspend fun exportLocalPlaylist(songs: List<Song>, uri: android.net.Uri): Boolean =
+        kotlinx.coroutines.withContext(kotlinx.coroutines.Dispatchers.IO) {
+            runCatching {
+                getApplication<Application>().contentResolver.openOutputStream(uri, "wt")?.use {
+                    it.write(com.sentup.android.data.PlaylistTransfer.buildM3u(songs).toByteArray(Charsets.UTF_8))
+                } != null
+            }.getOrDefault(false)
+        }
+
+    /**
+     * What the playlist studio seeds its suggestion chips from: recency-ranked
+     * favorites (as playable [Song]s), top artists and recent searches. Built
+     * on demand rather than held as state - it reads the whole play history
+     * and only the studio ever needs it.
+     */
+    data class PlaylistSeedProfile(
+        val favorites: List<Song>,
+        val topArtists: List<String>,
+        val recentSearches: List<String>
+    )
+
+    suspend fun buildPlaylistSeedProfile(): PlaylistSeedProfile {
+        val profile = recommendationEngine.buildTasteProfile()
+        return PlaylistSeedProfile(
+            favorites = profile.topSongs.map { entry ->
+                Song.fromYouTube(
+                    videoId = entry.songId,
+                    title = entry.title,
+                    artist = entry.artist,
+                    album = entry.album,
+                    duration = entry.duration,
+                    thumbnailUrl = entry.thumbnailUrl
+                )
+            },
+            topArtists = profile.topArtists,
+            recentSearches = profile.recentSearches
+        )
+    }
+
+    fun updateLocalPlaylist(playlistId: String, name: String, description: String?) {
+        viewModelScope.launch {
+            playlistRepository.updatePlaylist(playlistId, name, description, coverSeedColors())
+        }
+    }
+
+    fun deleteLocalPlaylist(playlistId: String) {
+        viewModelScope.launch {
+            playlistRepository.deletePlaylist(playlistId)
+        }
+    }
+
+    fun moveSongInLocalPlaylist(playlistId: String, fromIndex: Int, toIndex: Int) {
+        viewModelScope.launch {
+            playlistRepository.moveSongInPlaylist(playlistId, fromIndex, toIndex)
+        }
+    }
+
+    /**
+     * Looks up lengths for YouTube songs saved without one (added from lists
+     * that carried none) and stores them. Capped per open; the rest fill in on
+     * later visits.
+     */
+    suspend fun backfillLocalPlaylistDurations(playlistId: String, songs: List<Song>): Map<String, Long> {
+        val missing = songs.filter { it.source == SongSource.YOUTUBE && it.duration <= 0 }
+            .distinctBy { it.id }
+            .take(MAX_DURATION_BACKFILL)
+        if (missing.isEmpty() || com.sentup.android.data.YouTubeRateLimit.isHeld()) return emptyMap()
+        val found = mutableMapOf<String, Long>()
+        missing.chunked(3).forEach { batch ->
+            kotlinx.coroutines.coroutineScope {
+                batch.map { song ->
+                    async { song.id to (youtubeRepository.getSongFromPanel(song.id)?.duration ?: 0L) }
+                }.awaitAll()
+            }.filter { it.second > 0 }.forEach { found[it.first] = it.second }
+        }
+        playlistRepository.updateSongDurations(playlistId, found)
+        return found
+    }
+
+    fun replaceLocalPlaylistSongs(playlistId: String, songs: List<Song>) {
+        viewModelScope.launch {
+            playlistRepository.replacePlaylistSongs(playlistId, songs)
+        }
+    }
+
+    // --- YouTube Music playlist editing (music.youtube.com side) ---
+
+    /** Rename a YouTube Music playlist; the local list entry updates on success. */
+    fun renameYouTubePlaylist(playlistId: String, name: String, description: String?) {
+        val trimmed = name.trim()
+        if (trimmed.isEmpty()) return
+        viewModelScope.launch {
+            val ok = youtubeRepository.renameYouTubePlaylist(
+                playlistId, trimmed, music = true, description = description
+            )
+            if (ok) {
+                _youtubePlaylists.value = _youtubePlaylists.value.map {
+                    if (it.id == playlistId) it.copy(name = trimmed, description = description) else it
+                }
+            }
+        }
+    }
+
+    /** Delete a YouTube Music playlist. Optimistic removal, restored on failure. */
+    fun deleteYouTubePlaylist(playlistId: String) {
+        val previous = _youtubePlaylists.value
+        _youtubePlaylists.value = previous.filterNot { it.id == playlistId }
+        viewModelScope.launch {
+            if (!youtubeRepository.deleteYouTubePlaylist(playlistId, music = true)) {
+                _youtubePlaylists.value = previous
+            }
+        }
+    }
+
+    /** Remove a song from a YouTube Music playlist ("LM" removes the like). */
+    fun removeSongFromYouTubePlaylist(playlistId: String, song: Song) {
+        viewModelScope.launch {
+            youtubeRepository.removeFromYouTubePlaylist(playlistId, song.id, music = true)
+        }
+    }
+
+    /**
+     * Per-row playlist item ids (videoId -> occurrence-ordered setVideoIds)
+     * needed to reorder a YouTube Music playlist. A list is required because
+     * the same video may appear more than once; empty when signed out/failure.
+     */
+    suspend fun fetchYouTubePlaylistSetVideoIds(playlistId: String): Map<String, List<String>> =
+        youtubeRepository.getPlaylistSetVideoIds(playlistId)
+
+    /**
+     * Move a row of a YouTube Music playlist before the row identified by
+     * successorSetVideoId (null appends at the end). Returns false when the
+     * server rejected the move so the caller can resync.
+     */
+    suspend fun moveSongInYouTubePlaylist(
+        playlistId: String,
+        setVideoId: String,
+        successorSetVideoId: String?
+    ): Boolean = youtubeRepository.moveInYouTubePlaylist(
+        playlistId, setVideoId, successorSetVideoId, music = true
+    )
+
+    // Stats
+    private val statsRepository = com.sentup.android.data.StatsRepository(application)
+    private val _globalStats = MutableStateFlow(com.sentup.android.data.GlobalStats())
+    val globalStats: StateFlow<com.sentup.android.data.GlobalStats> = _globalStats.asStateFlow()
+
+    // Plays per day for the last 7 days, keyed "M/d" (see StatsRepository.getDailyPlays)
+    private val _dailyPlays = MutableStateFlow<Map<String, Int>>(emptyMap())
+    val dailyPlays: StateFlow<Map<String, Int>> = _dailyPlays.asStateFlow()
+
+    fun refreshStats() {
+        viewModelScope.launch {
+            _globalStats.value = statsRepository.getGlobalStats()
+            _dailyPlays.value = statsRepository.getDailyPlays()
+        }
+    }
+
+    // ---------------- Listening history ----------------
+
+    // The raw play log, newest first - what the listening history screen shows.
+    // Distinct from recentlyPlayed, which is the same source deduplicated down
+    // to one card per song for the Library rail.
+    private val _playHistory =
+        MutableStateFlow<List<com.sentup.android.data.PlayHistoryEntry>>(emptyList())
+    val playHistory: StateFlow<List<com.sentup.android.data.PlayHistoryEntry>> =
+        _playHistory.asStateFlow()
+
+    private val _isPlayHistoryLoading = MutableStateFlow(false)
+    val isPlayHistoryLoading: StateFlow<Boolean> = _isPlayHistoryLoading.asStateFlow()
+
+    /**
+     * The profile [_playHistory] was read for. Undo writes a whole list back,
+     * so a list read for one profile must never be restored into another's.
+     */
+    private var playHistoryProfileId: String? = null
+
+    private fun activeProfileIdNow(): String =
+        com.sentup.android.data.ProfileManager.requireActiveProfileId(getApplication())
+
+    fun loadPlayHistory() {
+        viewModelScope.launch {
+            _isPlayHistoryLoading.value = true
+            playHistoryProfileId = activeProfileIdNow()
+            _playHistory.value = statsRepository.loadHistory()
+            _isPlayHistoryLoading.value = false
+        }
+    }
+
+    /**
+     * Remove one play, or every play of a song when [allPlaysOfSong] is set.
+     *
+     * [onRemoved] receives the list as it was beforehand, which is what Undo
+     * needs: removing a song's whole run takes an unknown number of entries
+     * with it, and putting them back in order is not something a single entry
+     * can describe.
+     */
+    fun removePlayHistoryEntry(
+        songId: String,
+        timestamp: Long,
+        allPlaysOfSong: Boolean = false,
+        onRemoved: (List<com.sentup.android.data.PlayHistoryEntry>) -> Unit = {}
+    ) {
+        viewModelScope.launch {
+            val before = _playHistory.value
+            _playHistory.value = if (allPlaysOfSong) {
+                statsRepository.removeAllPlaysOf(songId)
+            } else {
+                statsRepository.removeEntry(songId, timestamp)
+            }
+            onRemoved(before)
+            // The rail, the "Most played" sort and the stats screen all read the
+            // same file. Leaving them stale is how a song deleted from history
+            // stays visible one screen over.
+            refreshRecentlyPlayed()
+            refreshStats()
+        }
+    }
+
+    fun restorePlayHistory(entries: List<com.sentup.android.data.PlayHistoryEntry>) {
+        if (playHistoryProfileId != activeProfileIdNow()) return
+        viewModelScope.launch {
+            statsRepository.restoreHistory(entries)
+            _playHistory.value = entries
+            refreshRecentlyPlayed()
+            refreshStats()
+        }
+    }
+
+    fun clearPlayHistory() {
+        viewModelScope.launch {
+            statsRepository.clearHistory()
+            _playHistory.value = emptyList()
+            refreshRecentlyPlayed()
+            refreshStats()
+        }
+    }
+
+    // --- Search History Actions ---
+
+    fun addToSearchHistory(query: String) {
+        if (query.isBlank()) return
+        searchHistoryRepository.addQuery(query)
+        _searchHistory.value = searchHistoryRepository.getHistory()
+    }
+
+    fun removeFromSearchHistory(query: String) {
+        searchHistoryRepository.removeQuery(query)
+        _searchHistory.value = searchHistoryRepository.getHistory()
+    }
+
+    fun clearSearchHistory() {
+        searchHistoryRepository.clearHistory()
+        _searchHistory.value = emptyList()
+    }
+
+    private companion object {
+        /** Ids kept in [shownVideoIds] before the oldest are forgotten. */
+        const val SHOWN_VIDEO_MEMORY = 400
+
+        /**
+         * How few visible items it takes for a "not interested" to trigger a
+         * top-up page. Roughly one screen of the grid - below that there is
+         * nothing left to scroll, so the usual scroll-triggered load-more
+         * would never fire.
+         */
+        const val FEED_TOP_UP_THRESHOLD = 8
+
+        /** A refresh stops walking the feed once it has this many new videos. */
+        /**
+         * How long video Home waits for its feed before showing what is on the
+         * device instead.
+         *
+         * Long enough that an ordinary slow connection still fills the feed,
+         * short enough that a dead one does not hold an empty screen. The
+         * request is not cancelled when this expires - it is detached - so a
+         * page that arrives late is still there for the next pull.
+         */
+        const val VIDEO_FEED_DEADLINE_MS = 8_000L
+
+        const val MIN_FRESH_VIDEOS_ON_REFRESH = 15
+
+        /**
+         * Cap on continuation fetches per refresh. The live feed ran out of
+         * continuation tokens after roughly 50 videos, so this bounds a refresh
+         * at about that depth instead of hammering the API.
+         */
+        const val MAX_REFRESH_PAGES = 3
+
+        /**
+         * How long a Home load stands when the user comes back to Home without
+         * asking for a refresh. [judgement] Long enough to cover browsing a
+         * channel or playlist and returning; short enough that likes and
+         * playlists changed elsewhere appear within a session.
+         */
+        const val HOME_REVISIT_REFRESH_MS = 10 * 60 * 1000L
+
+        /**
+         * Channels whose pools a page of the shuffled Home draws on. Each new
+         * channel costs two browse requests, so a page is at most sixteen, the
+         * same order as one page of the recommendation feed plus its Shorts.
+         */
+        const val MIX_CHANNELS_PER_PAGE = 8
+
+        /** Pool fetches in flight at once; below the subscriptions feed's six. */
+        const val MIX_FETCH_CONCURRENCY = 4
+
+        /** Consecutive empty channel batches one page will try before giving up. */
+        const val MIX_EMPTY_BATCH_LIMIT = 3
+
+        /** Channels asked for posts at once; each is one browse of about half a megabyte. */
+        const val FEED_POST_CHANNELS_PER_BATCH = 3
+
+        /** Posts taken from one channel, so no creator fills the feed's post slots alone. */
+        const val FEED_POSTS_PER_CHANNEL = 2
+
+        /** Consecutive post-less channel batches one top-up will try before giving up. */
+        const val FEED_POST_EMPTY_BATCH_LIMIT = 3
+
+        /** Byline of a video-mode playlist shown in the music Library. */
+        const val CROSS_MODE_VIDEO_SUBTITLE = "Video playlist · On this device"
+
+        /** Byline of a music-mode playlist shown in the video Library. */
+        const val CROSS_MODE_MUSIC_SUBTITLE = "Music playlist · On this device"
+    }
+}
