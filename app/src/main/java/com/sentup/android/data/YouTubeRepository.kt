@@ -261,6 +261,12 @@ class YouTubeRepository(private val context: Context) {
         val target = pageId?.trim()?.takeIf { it.isNotBlank() }
         if (sessionManager.activePageId() == target) return false
         sessionManager.savePageId(target)
+        // A brand channel's logged_in=0 no longer marks the profile expired (see
+        // YouTubeHttp.noteSessionState), but a flag left by an older build or an
+        // in-flight brand response could still linger; clear it optimistically on
+        // the switch. A genuinely dead primary session is re-flagged by the next
+        // primary logged_in=0 response, so clearing here cannot hide a real one.
+        sessionManager.setSessionExpired(false)
         AccountSwitcher(context).invalidateForProfileChange()
         return true
     }

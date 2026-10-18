@@ -110,10 +110,18 @@ internal class YouTubeHttp(
     fun noteSessionState(body: String, session: YouTubeSession?) {
         if (session == null) return
         val match = LOGGED_IN_TRACKING_PARAM.find(body) ?: return
+        val loggedIn = match.groupValues[1] != "0"
+        // A brand channel (carried as X-Goog-PageId) can answer logged_in=0 even
+        // while the underlying account session is perfectly valid, which used to
+        // badge the whole profile as "session expired" the moment the user came
+        // back to their primary channel. Only the primary channel's verdict is
+        // allowed to mark the session dead; a logged_in=1 from anywhere still
+        // heals the flag.
+        if (!loggedIn && session.pageId != null) return
         // Against the session the request went out with, not whoever is active
         // now: a response that outlives an account switch used to badge the
         // profile the user had just switched to as expired.
-        sessionManager.noteSessionExpired(session, match.groupValues[1] == "0")
+        sessionManager.noteSessionExpired(session, !loggedIn)
     }
 
     private companion object {
