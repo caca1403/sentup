@@ -168,7 +168,6 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
 import com.sentup.android.data.SponsorSegment
-import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.input.pointer.positionChanged
 import androidx.compose.ui.input.pointer.util.VelocityTracker
@@ -1329,34 +1328,16 @@ fun PortraitPlayerContent(
                             onClick = onOpenChapters
                         )
                     }
-                    // YouTube-style timeline: no floating pill behind the bar,
-                    // just the thin seek line over a soft bottom scrim.
-                    Box(modifier = Modifier.fillMaxWidth()) {
-                        Box(
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .height(56.dp)
-                                .align(Alignment.BottomCenter)
-                                .background(
-                                    Brush.verticalGradient(
-                                        colors = listOf(
-                                            Color.Transparent,
-                                            Color.Black.copy(alpha = 0.40f),
-                                        )
-                                    )
-                                )
-                        )
+                    PlayerChromePanel(contentPadding = androidx.compose.foundation.layout.PaddingValues(start = 14.dp, end = 14.dp, top = 6.dp, bottom = 6.dp)) {
                         Row(
-                            modifier = Modifier
-                                .fillMaxWidth()
-                                .padding(horizontal = 12.dp),
+                            modifier = Modifier.fillMaxWidth(),
                             verticalAlignment = Alignment.CenterVertically,
                             horizontalArrangement = Arrangement.spacedBy(10.dp)
                         ) {
                             if (!isLive) {
                                 Text(
                                     text = formatDuration(currentPosition),
-                                    color = Color.White,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
                                     style = MaterialTheme.typography.labelMedium.copy(
                                         fontFamily = FontFamily.Monospace,
                                         fontSize = 13.sp
@@ -1387,12 +1368,12 @@ fun PortraitPlayerContent(
                                         duration, currentPosition, liveTargetOffsetMs
                                     ),
                                     onClick = onSeekToLive,
-                                    contentTint = Color.White
+                                    contentTint = MaterialTheme.colorScheme.onSurface
                                 )
                             } else {
                                 Text(
                                     text = formatDuration(duration),
-                                    color = Color.White,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
                                     style = MaterialTheme.typography.labelMedium.copy(
                                         fontFamily = FontFamily.Monospace,
                                         fontSize = 13.sp
@@ -1545,13 +1526,7 @@ internal fun PlayerSeekBar(
     // One rail language everywhere: the texture is the surface's own variant
     // at partial opacity, never a solid grey slab, and the unwatched run stays
     // quieter than the buffered one ahead of it.
-    // Netflix-şık: a clearly visible rail. Over the video (dark) the surface's
-    // own variant is nearly black and the track vanished into a lone dot, so the
-    // unwatched run is the surface's on-color at low alpha instead - legible on
-    // both the video and a light tonal panel.
-    val inactiveTrackColor = MaterialTheme.colorScheme.onSurface.copy(
-        alpha = if (onTonalSurface) 0.30f else 0.38f
-    )
+    val inactiveTrackColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.6f)
     val tickColor = if (onTonalSurface) {
         MaterialTheme.colorScheme.onSurface.copy(alpha = 0.85f)
     } else {
@@ -1593,7 +1568,7 @@ internal fun PlayerSeekBar(
     // finger holds it or the video is paused - the position is then the thing
     // the eye is after, and a 13dp dot is not.
     val thumbRadiusDp by androidx.compose.animation.core.animateFloatAsState(
-        targetValue = if (isScrubbing) 11f else 5f,
+        targetValue = if (isScrubbing || !isPlaying) 9.5f else 6.5f,
         animationSpec = androidx.compose.animation.core.tween(durationMillis = 140),
         label = "seekThumbSize"
     )
@@ -1670,7 +1645,7 @@ internal fun PlayerSeekBar(
                         drawLine(
                             color = trackPrimary,
                             start = Offset(cap, centerY),
-                            end = Offset(thumbX(displayedProgress), centerY),
+                            end = Offset(thumbX(sliderState.value), centerY),
                             strokeWidth = trackStroke,
                             cap = StrokeCap.Round
                         )
@@ -1747,12 +1722,12 @@ internal fun PlayerSeekBar(
                         // The thumb, last so it sits above every mark on the
                         // line: a small disc in the palette that grows - with a
                         // halo - while held or paused.
-                        val thumbCenter = Offset(thumbX(displayedProgress), centerY)
+                        val thumbCenter = Offset(thumbX(sliderState.value), centerY)
                         drawCircle(
                             color = trackPrimary.copy(
-                                alpha = if (isScrubbing) 0.18f else 0f
+                                alpha = if (isScrubbing || !isPlaying) 0.18f else 0f
                             ),
-                            radius = if (isScrubbing) 14.dp.toPx() else 0f,
+                            radius = if (isScrubbing || !isPlaying) 13.dp.toPx() else 0f,
                             center = thumbCenter
                         )
                         drawCircle(
