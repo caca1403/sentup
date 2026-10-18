@@ -4,6 +4,16 @@ Sentüp is licensed under the [GNU General Public License v3.0](LICENSE). The op
 
 This file credits work that shaped Sentüp's own code without being a dependency of it.
 
+## Koda (base project)
+
+Sentüp is **based on [Koda](https://github.com/Ivorisnoob/Koda)** by
+[@Ivorisnoob](https://github.com/Ivorisnoob), an open-source Android client for
+YouTube, licensed under the **GNU GPL v3.0**. Sentüp started from Koda's
+codebase and has since been substantially modified and extended (analytics and
+charts, the single-flow library, rule-based Explore and its channel picker, the
+equalizer mark, and more). It remains a GPL-3.0 derivative, and the upstream is
+credited here as the license requires.
+
 ## Smooth motion (video frame interpolation)
 
 Smooth motion's engine is `app/src/main/java/com/sentup/android/service/ComputeMotionEngine.kt`, hosted in Media3's video pipeline by `FrameInterpolationShaderProgram.kt` and governed by `FrameInterpolation.kt` in the same package.

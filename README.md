@@ -108,6 +108,11 @@ v3.0** — see [LICENSE](LICENSE). Third-party work it builds on is credited in
 [THIRD_PARTY_NOTICES.md](THIRD_PARTY_NOTICES.md). The in-app **Settings → About
 → Open-source licences** screen lists every bundled library.
 
+**Based on [Koda](https://github.com/Ivorisnoob/Koda)** by
+[@Ivorisnoob](https://github.com/Ivorisnoob) (GPL-3.0). Sentüp started from
+Koda's codebase and has since been substantially modified and extended; both
+projects stay under GPL-3.0.
+
 ## ⚠️ Disclaimer / Sorumluluk reddi
 
 Sentüp **YouTube ile bağlantılı veya YouTube tarafından onaylanmış değildir.**
