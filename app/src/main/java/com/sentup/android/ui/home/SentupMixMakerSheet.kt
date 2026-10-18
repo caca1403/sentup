@@ -72,18 +72,28 @@ internal fun SentupMixMakerSheet(
     var searching by remember { mutableStateOf(false) }
     var results by remember { mutableStateOf<List<ArtistItem>>(emptyList()) }
     var perArtist by remember { mutableStateOf(15) }
+    var windowDays by remember { mutableStateOf(0) }
     var name by remember { mutableStateOf("") }
     var creating by remember { mutableStateOf(false) }
     val defaultName = stringResource(R.string.mixmaker_default_name)
 
-    LaunchedEffect(Unit) {
+    LaunchedEffect(windowDays) {
+        val cutoff =
+            if (windowDays == 0) 0L else System.currentTimeMillis() - windowDays * 86_400_000L
         val plays = withContext(Dispatchers.IO) { StatsRepository(context).loadHistory() }
+        // Group case-insensitively and show the most-used spelling: "gripin"
+        // and "Gripin" are one artist, and listing both was the "same artist
+        // three times" bug. The chosen window trims how far back to look.
         historyArtists = plays.asSequence()
-            .filter { it.artist.isNotBlank() }
-            .groupingBy { it.artist }.eachCount()
-            .entries.sortedByDescending { it.value }
+            .filter { it.artist.isNotBlank() && it.timestamp >= cutoff }
+            .groupBy { it.artist.trim().lowercase() }
+            .map { (_, entries) ->
+                val spelling = entries.groupingBy { it.artist.trim() }.eachCount()
+                    .maxByOrNull { it.value }?.key.orEmpty()
+                spelling to entries.size
+            }
+            .sortedByDescending { it.second }
             .take(12)
-            .map { it.key to it.value }
     }
 
     // Debounced so every keystroke is not a search request.
@@ -218,6 +228,27 @@ internal fun SentupMixMakerSheet(
                 }
             }
 
+            FlowRow(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                verticalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                Text(
+                    stringResource(R.string.mixmaker_window),
+                    style = MaterialTheme.typography.labelLarge,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                )
+                listOf(7, 30, 90, 0).forEach { days ->
+                    MakerChip(
+                        selected = windowDays == days,
+                        label = if (days == 0) stringResource(R.string.mixmaker_window_all)
+                        else String.format(stringResource(R.string.mixmaker_window_days), days),
+                        badge = null,
+                        onClick = { windowDays = days }
+                    )
+                }
+            }
+
             Row(
                 horizontalArrangement = Arrangement.spacedBy(8.dp),
                 verticalAlignment = Alignment.CenterVertically
@@ -251,15 +282,19 @@ internal fun SentupMixMakerSheet(
                     creating = true
                     val chosen = picked
                     val chosenPer = perArtist
+                    val chosenWindow = windowDays
                     val chosenName = name.trim().ifBlank {
                         defaultName +
                             if (chosen.isEmpty()) ""
                             else " · " + chosen.take(2).joinToString(" / ") { it.name }
                     }
                     scope.launch {
+                        val cutoff =
+                            if (chosenWindow == 0) 0L
+                            else System.currentTimeMillis() - chosenWindow * 86_400_000L
                         val plays = withContext(Dispatchers.IO) {
                             StatsRepository(context).loadHistory()
-                        }
+                        }.filter { it.timestamp >= cutoff }
                         val queue: List<Song> = if (chosen.isEmpty()) {
                             plays.asSequence()
                                 .groupBy { it.songId }
@@ -293,7 +328,7 @@ internal fun SentupMixMakerSheet(
                                     .distinctBy { it.id }
                                     .take(chosenPer)
                             }
-                            per.shuffled()
+                            per.distinctBy { it.id }.shuffled()
                         }
                         if (queue.isEmpty()) {
                             Toast.makeText(

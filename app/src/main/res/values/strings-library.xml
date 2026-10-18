@@ -41,6 +41,9 @@
     <string name="mixmaker_artists_recent">From your plays</string>
     <string name="mixmaker_picked">Selected</string>
     <string name="mixmaker_per_artist">Songs per artist</string>
+    <string name="mixmaker_window">History window</string>
+    <string name="mixmaker_window_days">%d days</string>
+    <string name="mixmaker_window_all">All time</string>
     <string name="browse_charts_title">Charts</string>
     <string name="home_discovery_title">Fresh for you</string>
     <string name="explore_discover_trending">Happening now</string>

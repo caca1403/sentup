@@ -37,6 +37,9 @@
     <string name="mixmaker_artists_recent">Çaldıklarından</string>
     <string name="mixmaker_picked">Seçilenler</string>
     <string name="mixmaker_per_artist">Sanatçı başına şarkı</string>
+    <string name="mixmaker_window">Geçmiş süresi</string>
+    <string name="mixmaker_window_days">%d gün</string>
+    <string name="mixmaker_window_all">Tümü</string>
     <string name="browse_charts_title">Çartlar</string>
     <string name="home_discovery_title">Sana taze</string>
     <string name="explore_discover_trending">Şu an olan biten</string>
