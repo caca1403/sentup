@@ -96,7 +96,9 @@ android {
             // widgets, media session and sign-in state during testing.
             applicationIdSuffix = ".debug"
             versionNameSuffix = "-debug"
-            manifestPlaceholders["appLabel"] = "Sentüp Debug"
+            // The launcher label stays "Sentüp" (the localized app_name); the
+            // debug marker lives only in the suffixes above, not in the name.
+            manifestPlaceholders["appLabel"] = "@string/app_name"
         }
         release {
             signingConfig = signingConfigs.getByName("release")

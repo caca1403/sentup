@@ -72,16 +72,15 @@
             android:windowSoftInputMode="adjustResize"
             android:supportsPictureInPicture="true"
             android:theme="@style/Theme.App.Starting">
-            <intent-filter>
-                <action android:name="android.intent.action.MAIN" />
-                <!--
-                    Without this category the app is installable and startable
-                    by explicit intent, and invisible: no home-screen icon, and
-                    a launcher has no activity to start. MAIN alone is not a
-                    launcher entry.
-                -->
-                <category android:name="android.intent.category.LAUNCHER" />
-            </intent-filter>
+            <!--
+                No MAIN/LAUNCHER filter here on purpose. The dynamic app-icon
+                feature drives the home-screen icon through the .MainActivity*
+                activity aliases (the manifest enables exactly one - the default),
+                and AppIcon.applyIcon toggles only those aliases. A launcher
+                filter on MainActivity itself added a second, permanent home-screen
+                icon next to the active alias. MainActivity is still started by
+                explicit intent (widgets, shortcuts, deep links) and by the alias.
+            -->
 
             <!--
                 Android's share sheet. A mime type is the only filter the
