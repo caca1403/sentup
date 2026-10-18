@@ -6,7 +6,10 @@ If you find a security issue in Sentüp, please report it privately rather than
 in a public issue, so users can be protected before details spread.
 
 Open a **private security advisory** on GitHub:
-<https://github.com/caca1403/sentup-android/security/advisories/new>
+<https://github.com/caca1403/sentup/security/advisories/new>
+
+…or email **cayircagatay337@gmail.com**. General bug reports and feature
+suggestions can also be sent to that address.
 
 Please include:
 - A description and the affected version(s).

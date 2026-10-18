@@ -1,5 +1,8 @@
 blank_issues_enabled: false
 contact_links:
+  - name: Report by email
+    url: mailto:cayircagatay337@gmail.com?subject=Sent%C3%BCp%20%E2%80%94%20Hata%20%C3%B6neri%20bildirimi
+    about: Hata ve öneri bildirimlerini doğrudan e-posta ile göndermek için.
   - name: Discussions
     url: https://github.com/caca1403/sentup/discussions
     about: Questions, help with a problem and general discussion. Faster than an issue for anything that is not a bug report.

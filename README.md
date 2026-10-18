@@ -12,7 +12,7 @@
 <p align="center">
   <a href="#-features"><img alt="Platform" src="https://img.shields.io/badge/platform-Android%2011%2B-3DDC84?logo=android&logoColor=white"/></a>
   <a href="LICENSE"><img alt="License" src="https://img.shields.io/badge/license-GPL--3.0-blue"/></a>
-  <a href="https://github.com/caca1403/sentup-android/releases"><img alt="Release" src="https://img.shields.io/github/v/release/caca1403/sentup-android?label=release"/></a>
+  <a href="https://github.com/caca1403/sentup/releases"><img alt="Release" src="https://img.shields.io/github/v/release/caca1403/sentup?label=release"/></a>
   <a href="#-build-it--kurulum"><img alt="Build" src="https://img.shields.io/badge/build-Gradle-informational?logo=gradle"/></a>
 </p>
 
@@ -48,7 +48,7 @@ eder: aynı abonelikler, aynı geçmiş, aynı indirmeler — istediğin gibi ok
 
 ## 📥 Kurulum / Install
 
-En hızlı yol: [Releases](https://github.com/caca1403/sentup-android/releases)
+En hızlı yol: [Releases](https://github.com/caca1403/sentup/releases)
 sayfasından APK'yı indir ve kur (Android 11 / API 30 ve üzeri).
 
 > Dağıtılan APK **debug** imzalıdır; kendi cihazın için yeterlidir.
@@ -57,8 +57,8 @@ sayfasından APK'yı indir ve kur (Android 11 / API 30 ve üzeri).
 
 ```bash
 # Gereksinim: JDK 17+, Android SDK (API 30+)
-git clone https://github.com/caca1403/sentup-android.git
-cd sentup-android
+git clone https://github.com/caca1403/sentup.git
+cd sentup
 ./gradlew assembleDebug
 # APK -> app/build/outputs/apk/debug/
 ```

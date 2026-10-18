@@ -8,8 +8,8 @@ Thanks for your interest in improving Sentüp! This is an open-source
 1. Install **JDK 17+** and the **Android SDK** (platform 30+).
 2. Clone and build:
    ```bash
-   git clone https://github.com/caca1403/sentup-android.git
-   cd sentup-android
+   git clone https://github.com/caca1403/sentup.git
+   cd sentup
    ./gradlew assembleDebug
    ```
 3. Run the checks before opening a pull request:
