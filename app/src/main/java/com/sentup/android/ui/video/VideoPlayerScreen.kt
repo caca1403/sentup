@@ -1526,7 +1526,13 @@ internal fun PlayerSeekBar(
     // One rail language everywhere: the texture is the surface's own variant
     // at partial opacity, never a solid grey slab, and the unwatched run stays
     // quieter than the buffered one ahead of it.
-    val inactiveTrackColor = MaterialTheme.colorScheme.surfaceVariant.copy(alpha = 0.6f)
+    // Netflix-şık: a clearly visible rail. Over the video (dark) the surface's
+    // own variant is nearly black and the track vanished into a lone dot, so the
+    // unwatched run is the surface's on-color at low alpha instead - legible on
+    // both the video and a light tonal panel.
+    val inactiveTrackColor = MaterialTheme.colorScheme.onSurface.copy(
+        alpha = if (onTonalSurface) 0.30f else 0.38f
+    )
     val tickColor = if (onTonalSurface) {
         MaterialTheme.colorScheme.onSurface.copy(alpha = 0.85f)
     } else {
@@ -1568,7 +1574,7 @@ internal fun PlayerSeekBar(
     // finger holds it or the video is paused - the position is then the thing
     // the eye is after, and a 13dp dot is not.
     val thumbRadiusDp by androidx.compose.animation.core.animateFloatAsState(
-        targetValue = if (isScrubbing || !isPlaying) 9.5f else 6.5f,
+        targetValue = if (isScrubbing || !isPlaying) 12f else 8f,
         animationSpec = androidx.compose.animation.core.tween(durationMillis = 140),
         label = "seekThumbSize"
     )
@@ -1627,7 +1633,7 @@ internal fun PlayerSeekBar(
                 Box {
                     Canvas(modifier = Modifier.matchParentSize()) {
                         val centerY = size.height / 2f
-                        val trackStroke = 4.dp.toPx()
+                        val trackStroke = 6.dp.toPx()
                         // Inset by half the stroke so both round caps stay
                         // inside the slot at 0% and 100%.
                         val cap = trackStroke / 2f
@@ -1656,7 +1662,7 @@ internal fun PlayerSeekBar(
                             // seek bar's right edge (most visible once the
                             // whole video was cached). Map the buffer onto an
                             // inset centerline so both caps remain inside it.
-                            val strokeWidth = 4.dp.toPx()
+                            val strokeWidth = 6.dp.toPx()
                             val capRadius = strokeWidth / 2f
                             val drawableWidth = (size.width - strokeWidth).coerceAtLeast(0f)
                             val startX = capRadius + displayedProgress.coerceIn(0f, 1f) * drawableWidth
@@ -1727,7 +1733,7 @@ internal fun PlayerSeekBar(
                             color = trackPrimary.copy(
                                 alpha = if (isScrubbing || !isPlaying) 0.18f else 0f
                             ),
-                            radius = if (isScrubbing || !isPlaying) 13.dp.toPx() else 0f,
+                            radius = if (isScrubbing || !isPlaying) 16.dp.toPx() else 0f,
                             center = thumbCenter
                         )
                         drawCircle(
