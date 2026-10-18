@@ -9,6 +9,7 @@ import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.fillMaxWidth
 import androidx.compose.foundation.layout.padding
+import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -22,6 +23,8 @@ import androidx.compose.material3.Icon
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.OutlinedTextField
+import androidx.compose.foundation.text.KeyboardOptions
+import androidx.compose.ui.text.input.KeyboardType
 import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
@@ -71,7 +74,8 @@ internal fun SentupMixMakerSheet(
     var query by remember { mutableStateOf("") }
     var searching by remember { mutableStateOf(false) }
     var results by remember { mutableStateOf<List<ArtistItem>>(emptyList()) }
-    var perArtist by remember { mutableStateOf(15) }
+    var perArtistText by remember { mutableStateOf("15") }
+    val perArtist = perArtistText.toIntOrNull()?.coerceIn(1, 500) ?: 15
     var windowDays by remember { mutableStateOf(0) }
     var name by remember { mutableStateOf("") }
     var creating by remember { mutableStateOf(false) }
@@ -249,23 +253,34 @@ internal fun SentupMixMakerSheet(
                 }
             }
 
-            Row(
+            FlowRow(
+                modifier = Modifier.fillMaxWidth(),
                 horizontalArrangement = Arrangement.spacedBy(8.dp),
-                verticalAlignment = Alignment.CenterVertically
+                verticalArrangement = Arrangement.spacedBy(8.dp)
             ) {
                 Text(
                     stringResource(R.string.mixmaker_per_artist),
                     style = MaterialTheme.typography.labelLarge,
                     color = MaterialTheme.colorScheme.onSurfaceVariant
                 )
-                listOf(10, 15, 25).forEach { n ->
+                listOf(10, 15, 25, 50).forEach { n ->
                     MakerChip(
                         selected = perArtist == n,
                         label = "$n",
                         badge = null,
-                        onClick = { perArtist = n }
+                        onClick = { perArtistText = n.toString() }
                     )
                 }
+                // The count is freely settable, not just the presets; a number
+                // larger than an artist's own songs simply takes them all.
+                OutlinedTextField(
+                    value = perArtistText,
+                    onValueChange = { v -> perArtistText = v.filter { it.isDigit() }.take(3) },
+                    singleLine = true,
+                    keyboardOptions = KeyboardOptions(keyboardType = KeyboardType.Number),
+                    modifier = Modifier.width(84.dp),
+                    textStyle = MaterialTheme.typography.bodyMedium
+                )
             }
 
             OutlinedTextField(
