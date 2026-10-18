@@ -7,6 +7,8 @@ import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Box
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.ExperimentalLayoutApi
+import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.PaddingValues
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
@@ -1324,22 +1326,27 @@ private fun ExploreAxisSection(title: String, content: @Composable () -> Unit) {
  * than as a suggestion. Loose chips, tight gaps - the connected-strip shape
  * these used to sit in read as one control cut into slices.
  */
+@OptIn(ExperimentalLayoutApi::class)
 @Composable
 private fun ExploreChoiceRow(
     labels: List<String>,
     selectedIndex: Int,
     onSelect: (Int) -> Unit
 ) {
-    Row(
+    // Content-sized pills that wrap to the next line, instead of one equal
+    // column per answer. Turkish labels ("4 dakikadan kısa") do not fit in a
+    // 1/6-width pill, and squeezing them there turned the row into unreadable
+    // "En ye… / Her uzunlu…" fragments.
+    FlowRow(
         modifier = Modifier
             .fillMaxWidth()
             .padding(horizontal = 16.dp, vertical = 6.dp),
-        horizontalArrangement = Arrangement.spacedBy(8.dp)
+        horizontalArrangement = Arrangement.spacedBy(8.dp),
+        verticalArrangement = Arrangement.spacedBy(8.dp)
     ) {
         labels.forEachIndexed { index, label ->
             val selected = selectedIndex == index
             Surface(
-                modifier = Modifier.weight(1f),
                 shape = CircleShape,
                 color = if (selected) {
                     MaterialTheme.colorScheme.primary
@@ -1349,19 +1356,18 @@ private fun ExploreChoiceRow(
                 contentColor = if (selected) {
                     MaterialTheme.colorScheme.onPrimary
                 } else {
-                    MaterialTheme.colorScheme.onSurfaceVariant
+                    MaterialTheme.colorScheme.onSurface
                 },
                 onClick = { onSelect(index) }
             ) {
                 Box(
-                    modifier = Modifier.padding(vertical = 10.dp, horizontal = 6.dp),
+                    modifier = Modifier.padding(vertical = 10.dp, horizontal = 14.dp),
                     contentAlignment = Alignment.Center
                 ) {
                     Text(
                         text = label,
                         style = MaterialTheme.typography.labelLarge,
                         fontWeight = if (selected) FontWeight.SemiBold else FontWeight.Medium,
-                        textAlign = TextAlign.Center,
                         maxLines = 2,
                         overflow = TextOverflow.Ellipsis
                     )
