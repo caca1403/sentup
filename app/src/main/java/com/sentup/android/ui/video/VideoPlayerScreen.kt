@@ -168,6 +168,7 @@ import androidx.compose.ui.draw.clip
 import androidx.compose.ui.geometry.Offset
 import androidx.compose.ui.geometry.Size
 import com.sentup.android.data.SponsorSegment
+import androidx.compose.ui.graphics.Brush
 import androidx.compose.ui.input.pointer.pointerInput
 import androidx.compose.ui.input.pointer.positionChanged
 import androidx.compose.ui.input.pointer.util.VelocityTracker
@@ -1328,16 +1329,34 @@ fun PortraitPlayerContent(
                             onClick = onOpenChapters
                         )
                     }
-                    PlayerChromePanel(contentPadding = androidx.compose.foundation.layout.PaddingValues(start = 14.dp, end = 14.dp, top = 6.dp, bottom = 6.dp)) {
+                    // YouTube-style timeline: no floating pill behind the bar,
+                    // just the thin seek line over a soft bottom scrim.
+                    Box(modifier = Modifier.fillMaxWidth()) {
+                        Box(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .height(56.dp)
+                                .align(Alignment.BottomCenter)
+                                .background(
+                                    Brush.verticalGradient(
+                                        colors = listOf(
+                                            Color.Transparent,
+                                            Color.Black.copy(alpha = 0.40f),
+                                        )
+                                    )
+                                )
+                        )
                         Row(
-                            modifier = Modifier.fillMaxWidth(),
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(horizontal = 12.dp),
                             verticalAlignment = Alignment.CenterVertically,
                             horizontalArrangement = Arrangement.spacedBy(10.dp)
                         ) {
                             if (!isLive) {
                                 Text(
                                     text = formatDuration(currentPosition),
-                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    color = Color.White,
                                     style = MaterialTheme.typography.labelMedium.copy(
                                         fontFamily = FontFamily.Monospace,
                                         fontSize = 13.sp
@@ -1368,12 +1387,12 @@ fun PortraitPlayerContent(
                                         duration, currentPosition, liveTargetOffsetMs
                                     ),
                                     onClick = onSeekToLive,
-                                    contentTint = MaterialTheme.colorScheme.onSurface
+                                    contentTint = Color.White
                                 )
                             } else {
                                 Text(
                                     text = formatDuration(duration),
-                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    color = Color.White,
                                     style = MaterialTheme.typography.labelMedium.copy(
                                         fontFamily = FontFamily.Monospace,
                                         fontSize = 13.sp
@@ -1651,7 +1670,7 @@ internal fun PlayerSeekBar(
                         drawLine(
                             color = trackPrimary,
                             start = Offset(cap, centerY),
-                            end = Offset(thumbX(sliderState.value), centerY),
+                            end = Offset(thumbX(displayedProgress), centerY),
                             strokeWidth = trackStroke,
                             cap = StrokeCap.Round
                         )
@@ -1728,7 +1747,7 @@ internal fun PlayerSeekBar(
                         // The thumb, last so it sits above every mark on the
                         // line: a small disc in the palette that grows - with a
                         // halo - while held or paused.
-                        val thumbCenter = Offset(thumbX(sliderState.value), centerY)
+                        val thumbCenter = Offset(thumbX(displayedProgress), centerY)
                         drawCircle(
                             color = trackPrimary.copy(
                                 alpha = if (isScrubbing) 0.18f else 0f

@@ -123,12 +123,17 @@ fun PlayerChromePanel(
     contentPadding: PaddingValues = PaddingValues(start = 16.dp, end = 16.dp, top = 10.dp, bottom = 12.dp),
     content: @Composable () -> Unit
 ) {
-    val shape = playerPanelShape()
+    // YouTube-style timeline: the raised floating pill is gone. A soft bottom
+    // scrim keeps the readout legible over any frame while the bar hugs the
+    // bottom of the picture, instead of a card that reads as a second UI layer.
     Box(
         modifier = modifier
             .then(if (fillWidth) Modifier.fillMaxWidth() else Modifier)
-            .sentupCard(shape = shape, elevation = 2)
-            .sentupSpecularEdge(shape)
+            .background(
+                androidx.compose.ui.graphics.Brush.verticalGradient(
+                    colors = listOf(Color.Transparent, Color.Black.copy(alpha = 0.45f))
+                )
+            )
             .padding(contentPadding)
     ) {
         content()
