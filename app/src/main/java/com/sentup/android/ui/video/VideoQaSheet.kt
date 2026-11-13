@@ -67,6 +67,14 @@ fun VideoQaSheet(
     val keyMoments = remember(chapters, cues) {
         VideoQaEngine.extractKeyMoments(chapters = chapters, cues = cues)
     }
+    val summaryPoints = remember(title, description, chapters, cues) {
+        VideoQaEngine.summarizeVideo(
+            title = title,
+            description = description,
+            chapters = chapters,
+            cues = cues
+        )
+    }
 
     ModalBottomSheet(onDismissRequest = onDismiss) {
         Column(
@@ -129,6 +137,46 @@ fun VideoQaSheet(
                     shape = RoundedCornerShape(SentupRadii.pill)
                 ) {
                     Text(stringResource(R.string.vp_ask_video_btn))
+                }
+            }
+
+            if (summaryPoints.isNotEmpty()) {
+                Text(
+                    text = "Otomatik Video Özeti",
+                    style = MaterialTheme.typography.titleSmall,
+                    fontWeight = FontWeight.SemiBold,
+                )
+                summaryPoints.forEach { pt ->
+                    Surface(
+                        shape = RoundedCornerShape(12.dp),
+                        color = MaterialTheme.colorScheme.surfaceContainerLow,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clickable(enabled = pt.timestampMs != null) {
+                                pt.timestampMs?.let {
+                                    onSeekToMs(it)
+                                    onDismiss()
+                                }
+                            }
+                    ) {
+                        Column(
+                            modifier = Modifier.padding(12.dp),
+                            verticalArrangement = Arrangement.spacedBy(2.dp)
+                        ) {
+                            pt.timestampMs?.let { ts ->
+                                Text(
+                                    text = formatQaTime(ts),
+                                    style = MaterialTheme.typography.labelSmall,
+                                    fontWeight = FontWeight.Bold,
+                                    color = MaterialTheme.colorScheme.primary
+                                )
+                            }
+                            Text(
+                                text = pt.text,
+                                style = MaterialTheme.typography.bodySmall,
+                            )
+                        }
+                    }
                 }
             }
 

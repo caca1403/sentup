@@ -25,6 +25,62 @@ object VideoQaEngine {
         val timestampMs: Long
     )
 
+    data class SummaryPoint(
+        val text: String,
+        val timestampMs: Long?
+    )
+
+    /**
+     * Generates a concise extractive summary using TF-IDF centrality across
+     * transcript windows, chapters, and description lines — zero LLM required.
+     */
+    fun summarizeVideo(
+        title: String,
+        description: String?,
+        chapters: List<VideoChapter>,
+        cues: List<VttCue>,
+        limit: Int = 4
+    ): List<SummaryPoint> {
+        val candidates = buildList {
+            cues.chunked(4).forEach { chunk ->
+                val text = chunk.joinToString(" ") { it.text.trim() }.trim()
+                if (text.length >= 24) add(SummaryPoint(text = text, timestampMs = chunk.first().startMs))
+            }
+            if (isEmpty() && chapters.isNotEmpty()) {
+                chapters.forEach { add(SummaryPoint(text = it.title, timestampMs = it.startMs)) }
+            }
+            if (isEmpty() && !description.isNullOrBlank()) {
+                description.lineSequence()
+                    .map { it.trim() }
+                    .filter { it.length >= 20 && !it.startsWith("http", ignoreCase = true) }
+                    .take(limit)
+                    .forEach { add(SummaryPoint(text = it, timestampMs = null)) }
+            }
+        }
+        if (candidates.size <= limit) return candidates
+
+        val allTokens = candidates.map { tokenize(it.text) }
+        val df = mutableMapOf<String, Int>()
+        allTokens.forEach { tokens ->
+            tokens.distinct().forEach { t -> df[t] = (df[t] ?: 0) + 1 }
+        }
+        val titleTokens = tokenize(title).toSet()
+        val n = candidates.size.toDouble()
+        return candidates.mapIndexed { idx, point ->
+            val tokens = allTokens[idx]
+            val tfidfSum = tokens.sumOf { t ->
+                val freq = df[t] ?: 1
+                ln(1.0 + n / freq) + if (t in titleTokens) 0.5 else 0.0
+            }
+            val score = tfidfSum / tokens.size.coerceAtLeast(1)
+            Triple(idx, point, score)
+        }
+            .sortedByDescending { it.third }
+            .take(limit)
+            .sortedBy { it.first }
+            .map { it.second }
+    }
+
     fun answerQuestion(
         question: String,
         title: String,

@@ -1,8 +1,11 @@
 package com.sentup.android.ui.video
 
+import android.widget.Toast
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
 import androidx.compose.foundation.layout.Column
+import androidx.compose.foundation.layout.ExperimentalLayoutApi
+import androidx.compose.foundation.layout.FlowRow
 import androidx.compose.foundation.layout.Row
 import androidx.compose.foundation.layout.Spacer
 import androidx.compose.foundation.layout.fillMaxWidth
@@ -16,11 +19,13 @@ import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.rounded.Add
 import androidx.compose.material.icons.rounded.Bookmarks
 import androidx.compose.material.icons.rounded.Close
+import androidx.compose.material.icons.rounded.ContentCopy
 import androidx.compose.material.icons.rounded.DeleteOutline
 import androidx.compose.material.icons.rounded.Repeat
 import androidx.compose.material.icons.rounded.Search
 import androidx.compose.material3.Button
 import androidx.compose.material3.ExperimentalMaterial3Api
+import androidx.compose.material3.FilterChip
 import androidx.compose.material3.Icon
 import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
@@ -28,6 +33,7 @@ import androidx.compose.material3.ModalBottomSheet
 import androidx.compose.material3.OutlinedButton
 import androidx.compose.material3.OutlinedTextField
 import androidx.compose.material3.Surface
+import androidx.compose.material3.Switch
 import androidx.compose.material3.Tab
 import androidx.compose.material3.TabRow
 import androidx.compose.material3.Text
@@ -41,30 +47,37 @@ import androidx.compose.runtime.remember
 import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
+import androidx.compose.ui.platform.LocalClipboardManager
 import androidx.compose.ui.platform.LocalContext
+import androidx.compose.ui.text.AnnotatedString
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
 import com.sentup.android.data.VideoChapter
 import com.sentup.android.data.VttCue
 
-@OptIn(ExperimentalMaterial3Api::class)
+@OptIn(ExperimentalMaterial3Api::class, ExperimentalLayoutApi::class)
 @Composable
 fun VideoPowerToolsSheet(
     videoId: String,
     videoTitle: String,
     currentPositionMs: Long,
     durationMs: Long,
+    playbackSpeed: Float,
+    focusModeEnabled: Boolean,
     subtitles: List<VttCue>,
     chapters: List<VideoChapter>,
     abLoopStartMs: Long?,
     abLoopEndMs: Long?,
     onSetAbLoopStart: (Long?) -> Unit,
     onSetAbLoopEnd: (Long?) -> Unit,
+    onSetPlaybackSpeed: (Float) -> Unit,
+    onToggleFocusMode: (Boolean) -> Unit,
     onSeekTo: (Long) -> Unit,
     onDismiss: () -> Unit,
 ) {
     val context = LocalContext.current
+    val clipboard = LocalClipboardManager.current
     val sheetState = rememberModalBottomSheetState(skipPartiallyExpanded = true)
     var selectedTab by remember { mutableIntStateOf(0) }
     var notes by remember(videoId) { mutableStateOf(VideoNotesStore.getNotes(context, videoId)) }
@@ -129,6 +142,11 @@ fun VideoPowerToolsSheet(
                     selected = selectedTab == 2,
                     onClick = { selectedTab = 2 },
                     text = { Text("Transkript") },
+                )
+                Tab(
+                    selected = selectedTab == 3,
+                    onClick = { selectedTab = 3 },
+                    text = { Text("Hız & Odak") },
                 )
             }
 
@@ -309,7 +327,7 @@ fun VideoPowerToolsSheet(
                     }
                 }
 
-                else -> {
+                2 -> {
                     OutlinedTextField(
                         value = transcriptQuery,
                         onValueChange = { transcriptQuery = it },
@@ -411,6 +429,81 @@ fun VideoPowerToolsSheet(
                                 color = MaterialTheme.colorScheme.onSurfaceVariant,
                             )
                         }
+                    }
+                }
+
+                else -> {
+                    Surface(
+                        shape = RoundedCornerShape(16.dp),
+                        color = MaterialTheme.colorScheme.surfaceContainerLow,
+                        modifier = Modifier.fillMaxWidth(),
+                    ) {
+                        Column(
+                            modifier = Modifier.padding(14.dp),
+                            verticalArrangement = Arrangement.spacedBy(10.dp),
+                        ) {
+                            Text(
+                                text = "Süper Hız (YouTube 2x sınırının ötesi)",
+                                style = MaterialTheme.typography.titleSmall,
+                                fontWeight = FontWeight.SemiBold,
+                            )
+                            FlowRow(
+                                horizontalArrangement = Arrangement.spacedBy(8.dp),
+                                verticalArrangement = Arrangement.spacedBy(4.dp),
+                            ) {
+                                listOf(0.75f, 1.0f, 1.25f, 1.5f, 1.75f, 2.0f, 2.5f, 3.0f).forEach { speed ->
+                                    val selected = kotlin.math.abs(playbackSpeed - speed) < 0.03f
+                                    FilterChip(
+                                        selected = selected,
+                                        onClick = { onSetPlaybackSpeed(speed) },
+                                        label = { Text("${speed}x") },
+                                    )
+                                }
+                            }
+                        }
+                    }
+
+                    Surface(
+                        shape = RoundedCornerShape(16.dp),
+                        color = MaterialTheme.colorScheme.surfaceContainerLow,
+                        modifier = Modifier.fillMaxWidth(),
+                    ) {
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(14.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                        ) {
+                            Column(modifier = Modifier.weight(1f)) {
+                                Text(
+                                    text = "Odak Modu (Önerilenleri Gizle)",
+                                    style = MaterialTheme.typography.titleSmall,
+                                    fontWeight = FontWeight.SemiBold,
+                                )
+                                Text(
+                                    text = "Video altındaki öneri karmaşasını gizler; ders/çalışma için ideal.",
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                )
+                            }
+                            Switch(
+                                checked = focusModeEnabled,
+                                onCheckedChange = onToggleFocusMode,
+                            )
+                        }
+                    }
+
+                    val shareUrl = VideoToolsEngine.buildShareTimestampUrl(videoId, currentPositionMs)
+                    Button(
+                        onClick = {
+                            clipboard.setText(AnnotatedString(shareUrl))
+                            Toast.makeText(context, "Zaman damgalı link kopyalandı: $shareUrl", Toast.LENGTH_SHORT).show()
+                        },
+                        modifier = Modifier.fillMaxWidth(),
+                    ) {
+                        Icon(Icons.Rounded.ContentCopy, contentDescription = null)
+                        Spacer(modifier = Modifier.padding(horizontal = 4.dp))
+                        Text("Şu Anki Saniyeden Kopyala (${VideoToolsEngine.formatTimestampMs(currentPositionMs)})")
                     }
                 }
             }

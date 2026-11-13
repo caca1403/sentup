@@ -37,4 +37,29 @@ class VideoToolsEngineTest {
         assertEquals(1, VideoToolsEngine.searchTranscriptCues(cues, "vpn").size)
         assertEquals(2, VideoToolsEngine.searchTranscriptCues(cues, "").size)
     }
+
+    @Test
+    fun `buildShareTimestampUrl appends ?t= seconds cleanly`() {
+        assertEquals("https://youtu.be/dQw4w9WgXcQ?t=75", VideoToolsEngine.buildShareTimestampUrl("dQw4w9WgXcQ", 75_400L))
+        assertEquals("https://youtu.be/dQw4w9WgXcQ", VideoToolsEngine.buildShareTimestampUrl("dQw4w9WgXcQ", 0L))
+    }
+
+    @Test
+    fun `summarizeVideo extracts ranked summary points from transcript`() {
+        val cues = (1..12).map { i ->
+            VttCue(
+                startMs = i * 5_000L,
+                endMs = i * 5_000L + 4_000L,
+                text = "Bölüm $i yapay sinir ağı ses analizi ve ritim tahmini hakkında önemli detaylar"
+            )
+        }
+        val summary = com.sentup.android.ml.VideoQaEngine.summarizeVideo(
+            title = "Yapay Sinir Ağı Ses Analizi",
+            description = null,
+            chapters = emptyList(),
+            cues = cues,
+            limit = 3
+        )
+        assertEquals(3, summary.size)
+    }
 }

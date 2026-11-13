@@ -55,6 +55,12 @@ object VideoToolsEngine {
         return cues.filter { it.text.lowercase().contains(q) }
     }
 
+    fun buildShareTimestampUrl(videoId: String, positionMs: Long): String {
+        val cleanId = videoId.trim()
+        val sec = (positionMs.coerceAtLeast(0L) / 1000L)
+        return if (sec > 0L) "https://youtu.be/$cleanId?t=$sec" else "https://youtu.be/$cleanId"
+    }
+
     fun formatTimestampMs(ms: Long): String {
         val totalSec = (ms.coerceAtLeast(0L) / 1000L)
         val hours = totalSec / 3600L

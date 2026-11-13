@@ -575,6 +575,7 @@ fun VideoPlayerContent(
     var showSleepTimerSheet by remember { mutableStateOf(false) }
     var showVideoQaSheet by remember { mutableStateOf(false) }
     var showPowerToolsSheet by remember { mutableStateOf(false) }
+    var focusModeEnabled by remember { mutableStateOf(false) }
     var abLoopStartMs by remember(currentVideo?.videoId) { mutableStateOf<Long?>(null) }
     var abLoopEndMs by remember(currentVideo?.videoId) { mutableStateOf<Long?>(null) }
 
@@ -1197,7 +1198,7 @@ fun VideoPlayerContent(
                         // already conditional on having something to show, so
                         // the switch reuses that path instead of adding a
                         // second way for it to be absent.
-                        relatedVideos = if (showRelatedVideos) relatedVideos else emptyList(),
+                        relatedVideos = if (showRelatedVideos && !focusModeEnabled) relatedVideos else emptyList(),
                         onVideoSelect = { viewModel.playVideo(it) },
                         modifier = Modifier
                             .fillMaxSize()
@@ -1464,12 +1465,16 @@ fun VideoPlayerContent(
             videoTitle = video?.title.orEmpty(),
             currentPositionMs = currentPosition,
             durationMs = duration,
+            playbackSpeed = playbackSpeed,
+            focusModeEnabled = focusModeEnabled,
             subtitles = captionCues,
             chapters = chapters,
             abLoopStartMs = abLoopStartMs,
             abLoopEndMs = abLoopEndMs,
             onSetAbLoopStart = { abLoopStartMs = it },
             onSetAbLoopEnd = { abLoopEndMs = it },
+            onSetPlaybackSpeed = { viewModel.setPlaybackSpeed(it) },
+            onToggleFocusMode = { focusModeEnabled = it },
             onSeekTo = { viewModel.seekTo(it) },
             onDismiss = { showPowerToolsSheet = false }
         )
