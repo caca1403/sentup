@@ -8,6 +8,15 @@ import androidx.compose.foundation.background
 import androidx.compose.foundation.border
 import androidx.compose.foundation.combinedClickable
 import androidx.compose.foundation.clickable
+import androidx.compose.foundation.layout.aspectRatio
+import androidx.compose.foundation.lazy.grid.GridCells
+import androidx.compose.foundation.lazy.grid.LazyVerticalGrid
+import androidx.compose.foundation.lazy.grid.items as gridItems
+import androidx.compose.foundation.lazy.grid.rememberLazyGridState
+import androidx.compose.material.icons.outlined.OndemandVideo
+import androidx.compose.material.icons.rounded.OndemandVideo
+import androidx.compose.ui.draw.clip
+import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.foundation.horizontalScroll
 import androidx.compose.foundation.rememberScrollState
 import androidx.compose.foundation.layout.Arrangement
@@ -268,6 +277,12 @@ fun HomeScreen(
     onPlayVideoQueue: ((com.sentup.android.data.VideoQueue) -> Unit)? = null,
     onOpenShorts: (List<com.sentup.android.data.ShortsItem>, Int) -> Unit = { _, _ -> },
     /**
+     * The Home Shorts shelf arrived. The host warms the first ladders from it so
+     * the swipe player starts on the tap rather than on a cold resolve; it does
+     * nothing when preloading is off or a rate-limit hold stands.
+     */
+    onShortsFeedLoaded: (List<com.sentup.android.data.ShortsItem>) -> Unit = {},
+    /**
      * Open a creator's channel page. Threaded down to every surface that shows
      * a channel name, so tapping one means the same thing everywhere.
      */
@@ -419,6 +434,16 @@ fun HomeScreen(
         }
     }
 
+    // The shelf is what the Shorts tab plays from, so the moment it exists the
+    // host warms its first ladders. Doing this here rather than on the tap is
+    // the whole point: resolution has to start while the user is still looking
+    // at the grid.
+    LaunchedEffect(videoMode, shortsEnabled, shortsFeed.size) {
+        if (videoMode && shortsEnabled && shortsFeed.isNotEmpty()) {
+            onShortsFeedLoaded(shortsFeed)
+        }
+    }
+
     // Saveable, not just remembered. Opening a channel page is a real
     // navigation, so this composable is disposed and restored on the way back,
     // and a plainly-remembered tab index would drop the user on Home every time
@@ -530,6 +555,7 @@ fun HomeScreen(
     // transition settles, so leaving Explore halfway down and coming back
     // would land at the top.
     val exploreScrollState = rememberLazyListState()
+    val shortsGridState = rememberLazyGridState()
 
     // Which of the above the visible tab is currently driving.
     val currentTabScrollState = when (selectedTab) {
@@ -574,6 +600,12 @@ fun HomeScreen(
     // number that names nothing.
     LaunchedEffect(videoMode) {
         if (!videoMode && selectedTab > VideoHomeDestination.SUBSCRIPTIONS.tabId) selectedTab = 0
+        // The Shorts tab leaves the bar with the swipe player switched off; if
+        // it was the remembered tab, fall back rather than sit on a bar with
+        // no matching entry.
+        if (videoMode && selectedTab == VideoHomeDestination.SHORTS.tabId && !shortsEnabled) {
+            selectedTab = videoRootTab
+        }
     }
 
     // Re-read the history when Home becomes the active tab. Playback writes an
@@ -1554,6 +1586,14 @@ fun HomeScreen(
                                     if (playNext) playerViewModel.playNext(song)
                                     else playerViewModel.addToQueue(song)
                                 },
+                                onSetPlaybackSpeed = { speed ->
+                                    playerViewModel.setPlaybackSpeed(speed, persist = false)
+                                },
+                                onSeekToTimestamp = { song, posMs ->
+                                    playerViewModel.playQueue(songs, song)
+                                    playerViewModel.seekTo(posMs)
+                                    showPlayerSheet = true
+                                },
                                 allSongsListState = musicLibraryScrollState
                             )
                         }
@@ -1695,6 +1735,61 @@ fun HomeScreen(
                             )
                         }
                     }
+                    5 -> if (videoMode) {
+                        // Shorts: choosing the tab opens the swipe feed itself,
+                        // the way tapping the Shorts button does elsewhere. When
+                        // the feed closes, its plain grid stays here - one card
+                        // per Short, tapping a card reopens the swipe feed at
+                        // that item.
+                        val isShortsTabLoading by viewModel.isShortsLoading.collectAsState()
+                        var shortsTabAutoOpened by remember { mutableStateOf(false) }
+                        LaunchedEffect(shortsFeed.size) {
+                            if (!shortsTabAutoOpened && shortsEnabled && shortsFeed.isNotEmpty()) {
+                                shortsTabAutoOpened = true
+                                onOpenShorts(shortsFeed, 0)
+                            }
+                        }
+                        if (shortsFeed.isEmpty() && isShortsTabLoading) {
+                            Box(
+                                modifier = Modifier.fillMaxSize(),
+                                contentAlignment = Alignment.Center
+                            ) {
+                                CircularProgressIndicator()
+                            }
+                        } else if (shortsFeed.isEmpty()) {
+                            Box(
+                                modifier = Modifier.fillMaxSize(),
+                                contentAlignment = Alignment.Center
+                            ) {
+                                Text(
+                                    text = stringResource(R.string.shorts_feed_empty),
+                                    style = MaterialTheme.typography.bodyMedium,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant
+                                )
+                            }
+                        } else {
+                            LazyVerticalGrid(
+                                columns = GridCells.Adaptive(minSize = 150.dp),
+                                state = shortsGridState,
+                                contentPadding = androidx.compose.foundation.layout.PaddingValues(
+                                    start = 12.dp,
+                                    end = 12.dp,
+                                    top = listContentPadding.calculateTopPadding() + 8.dp,
+                                    bottom = listContentPadding.calculateBottomPadding()
+                                ),
+                                horizontalArrangement = Arrangement.spacedBy(10.dp),
+                                verticalArrangement = Arrangement.spacedBy(14.dp)
+                            ) {
+                                gridItems(shortsFeed, key = { short -> short.videoId }) { short ->
+                                    val index = shortsFeed.indexOf(short)
+                                    ShortsTabCard(
+                                        short = short,
+                                        onClick = { onOpenShorts(shortsFeed, index.coerceAtLeast(0)) }
+                                    )
+                                }
+                            }
+                        }
+                    }
                 }
             }
         } else {
@@ -1774,7 +1869,13 @@ fun HomeScreen(
         // contract. Only their Material container and item presentation differ.
         val navBarHaptics = com.sentup.android.util.rememberSentupHaptics()
         val navTabs = if (videoMode) {
-            videoHomeConfiguration.orderedVisibleDestinations.map { destination ->
+            videoHomeConfiguration.orderedVisibleDestinations.mapNotNull { destination ->
+                // Shorts as a destination is the swipe player's door; with the
+                // player switched off a Short opens as an ordinary video, so
+                // the door would open on nothing and the tab stays out.
+                if (destination == VideoHomeDestination.SHORTS && !shortsEnabled) {
+                    return@mapNotNull null
+                }
                 when (destination) {
                     VideoHomeDestination.HOME -> Triple(
                         destination.tabId,
@@ -1801,6 +1902,11 @@ fun HomeScreen(
                         stringResource(R.string.tab_explore),
                         Pair(Icons.Rounded.AutoAwesome, Icons.Rounded.AutoAwesome)
                     )
+                    VideoHomeDestination.SHORTS -> Triple(
+                        destination.tabId,
+                        stringResource(R.string.tab_shorts),
+                        Pair(Icons.Rounded.OndemandVideo, Icons.Outlined.OndemandVideo)
+                    )
                 }
             }
         } else listOf(
@@ -1810,9 +1916,23 @@ fun HomeScreen(
         )
         val selectNavTab: (Int) -> Unit = { index ->
             if (selectedTab == index) {
-                if (currentTabScrollState.canScrollBackward) {
+                // Shorts rides a lazy grid rather than a lazy list, so it
+                // answers the re-tap through its own state; every other tab
+                // answers through the list the when above resolved.
+                val atTop = if (selectedTab == VideoHomeDestination.SHORTS.tabId) {
+                    !shortsGridState.canScrollBackward
+                } else {
+                    !currentTabScrollState.canScrollBackward
+                }
+                if (!atTop) {
                     navBarHaptics.performHapticFeedback(HapticFeedbackType.ContextClick)
-                    scope.launch { currentTabScrollState.scrollToTop() }
+                    scope.launch {
+                        if (selectedTab == VideoHomeDestination.SHORTS.tabId) {
+                            shortsGridState.scrollToTop()
+                        } else {
+                            currentTabScrollState.scrollToTop()
+                        }
+                    }
                 }
             } else {
                 navBarHaptics.performHapticFeedback(HapticFeedbackType.ContextClick)
@@ -2775,3 +2895,45 @@ fun SearchContent(
 
 /** How long an app left running goes before a return to it checks for an update again. */
 private const val UPDATE_RECHECK_MS = 6L * 60L * 60L * 1000L
+
+/**
+ * One Short on the Shorts tab's grid: a tall card with the picture filling it
+ * and the title under it. Tapping opens the swipe feed at this item, so the
+ * card is a door to the player rather than a player of its own.
+ */
+@Composable
+private fun ShortsTabCard(
+    short: com.sentup.android.data.ShortsItem,
+    onClick: () -> Unit
+) {
+    Column(
+        modifier = Modifier
+            .clip(RoundedCornerShape(18.dp))
+            .clickable(onClick = onClick)
+    ) {
+        Box(
+            modifier = Modifier
+                .fillMaxWidth()
+                .aspectRatio(9f / 16f)
+                .clip(RoundedCornerShape(18.dp))
+                .background(MaterialTheme.colorScheme.surfaceVariant),
+            contentAlignment = Alignment.Center
+        ) {
+            coil.compose.AsyncImage(
+                model = short.thumbnailUrl,
+                contentDescription = short.title,
+                contentScale = androidx.compose.ui.layout.ContentScale.Crop,
+                modifier = Modifier.fillMaxSize()
+            )
+        }
+        Spacer(Modifier.height(6.dp))
+        Text(
+            text = short.title,
+            maxLines = 2,
+            overflow = TextOverflow.Ellipsis,
+            style = MaterialTheme.typography.bodySmall,
+            color = MaterialTheme.colorScheme.onSurface,
+            modifier = Modifier.padding(horizontal = 2.dp)
+        )
+    }
+}

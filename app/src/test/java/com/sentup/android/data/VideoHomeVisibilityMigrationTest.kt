@@ -16,7 +16,7 @@ class VideoHomeVisibilityMigrationTest {
     /** Verbatim from the enum's companion. */
     private val defaults = VideoHomeDestination.entries.toList()
 
-    private val addedAfterKey = setOf(VideoHomeDestination.EXPLORE)
+    private val addedAfterKey = setOf(VideoHomeDestination.EXPLORE, VideoHomeDestination.SHORTS)
 
     private fun resolve(
         storedVisible: Set<String>?,
@@ -45,7 +45,7 @@ class VideoHomeVisibilityMigrationTest {
     fun `an existing install gains only the new tab`() {
         // Subscriptions hidden by the user before this build existed.
         val stored = setOf("home", "search", "library")
-        assertEquals(setOf("home", "search", "library", "explore"), ids(resolve(stored, null)))
+        assertEquals(setOf("home", "search", "library", "explore", "shorts"), ids(resolve(stored, null)))
     }
 
     @Test
@@ -73,7 +73,10 @@ class VideoHomeVisibilityMigrationTest {
         // The guard has to fire exactly once, on the run that fills the key in.
         val knownOnUpgrade = defaults.filterNot { it in addedAfterKey }.toSet()
         val arrivedOnUpgrade = defaults.filterNot { it in knownOnUpgrade }
-        assertEquals(setOf(VideoHomeDestination.EXPLORE), arrivedOnUpgrade.toSet())
+        assertEquals(
+            setOf(VideoHomeDestination.EXPLORE, VideoHomeDestination.SHORTS),
+            arrivedOnUpgrade.toSet()
+        )
         assertEquals(true, knownOnUpgrade.toSet() != defaults.toSet())
         // And not again once the key holds the full set.
         val knownAfter = defaults.toSet()
@@ -88,12 +91,13 @@ class VideoHomeVisibilityMigrationTest {
             .mapNotNull(VideoHomeDestination::fromStorageId)
         val order = storedOrder + defaults.filterNot { it in storedOrder }
         assertEquals(
-            listOf("home", "search", "subscriptions", "library", "explore"),
+            listOf("home", "search", "subscriptions", "library", "explore", "shorts"),
             order.map { it.storageId }
         )
         // The ids that were already stored still mean the same screen.
         assertEquals(0, VideoHomeDestination.fromStorageId("home")?.tabId)
         assertEquals(3, VideoHomeDestination.fromStorageId("library")?.tabId)
         assertEquals(4, VideoHomeDestination.fromStorageId("explore")?.tabId)
+        assertEquals(5, VideoHomeDestination.fromStorageId("shorts")?.tabId)
     }
 }

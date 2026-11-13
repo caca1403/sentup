@@ -117,9 +117,8 @@ private fun rememberMotionArtworkAllowed(wifiOnly: Boolean): Boolean {
         fun update() {
             if (disposed) return
             val capabilities = connectivity.getNetworkCapabilities(connectivity.activeNetwork)
-            val connected = capabilities?.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED) == true
-            val wifi = capabilities?.hasTransport(NetworkCapabilities.TRANSPORT_WIFI) == true &&
-                capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_NOT_METERED)
+            val connected = com.sentup.android.data.VpnResilientNetwork.isNetworkUsable(capabilities)
+            val wifi = com.sentup.android.data.VpnResilientNetwork.isUnmeteredOrWifiVpn(capabilities)
             val reducedMotion = Settings.Global.getFloat(context.contentResolver, Settings.Global.ANIMATOR_DURATION_SCALE, 1f) == 0f
             allowed = connected && (!wifiOnly || wifi) && !power.isPowerSaveMode && !reducedMotion &&
                 connectivity.restrictBackgroundStatus != ConnectivityManager.RESTRICT_BACKGROUND_STATUS_ENABLED &&

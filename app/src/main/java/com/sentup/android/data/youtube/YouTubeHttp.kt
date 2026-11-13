@@ -4,6 +4,7 @@ import android.content.Context
 import com.sentup.android.data.SessionManager
 import com.sentup.android.data.SessionRefreshInterceptor
 import com.sentup.android.data.ThemePreferences
+import com.sentup.android.data.VpnResilientNetwork
 import com.sentup.android.data.YouTubeAuthUtils
 import com.sentup.android.data.YouTubeRequestLedger
 import com.sentup.android.data.YouTubeSession
@@ -34,7 +35,7 @@ internal class YouTubeHttp(
     // Local-only kill-switch: checked per request so flipping the setting
     // needs no restart. newBuilder() copies interceptors, so this also guards
     // streamResolveClient and the NewPipe downloader (same client instance).
-    val okHttpClient = OkHttpClient.Builder()
+    val okHttpClient = VpnResilientNetwork.configureForVpn(OkHttpClient.Builder())
         .dispatcher(sharedHttpDispatcher)
         .connectionPool(sharedConnectionPool)
         .addInterceptor { chain ->

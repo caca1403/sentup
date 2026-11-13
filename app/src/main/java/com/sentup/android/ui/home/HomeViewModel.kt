@@ -725,10 +725,7 @@ class HomeViewModel(application: Application) : AndroidViewModel(application) {
                 network: android.net.Network,
                 caps: android.net.NetworkCapabilities,
             ) {
-                trySend(
-                    caps.hasCapability(android.net.NetworkCapabilities.NET_CAPABILITY_INTERNET) &&
-                        caps.hasCapability(android.net.NetworkCapabilities.NET_CAPABILITY_VALIDATED)
-                )
+                trySend(com.sentup.android.data.VpnResilientNetwork.isNetworkUsable(caps))
             }
 
             override fun onLost(network: android.net.Network) {
@@ -1574,8 +1571,7 @@ class HomeViewModel(application: Application) : AndroidViewModel(application) {
             .getSystemService(android.content.Context.CONNECTIVITY_SERVICE)
                 as android.net.ConnectivityManager
         val caps = cm.getNetworkCapabilities(cm.activeNetwork)
-        caps?.hasCapability(android.net.NetworkCapabilities.NET_CAPABILITY_INTERNET) == true &&
-            caps.hasCapability(android.net.NetworkCapabilities.NET_CAPABILITY_VALIDATED)
+        com.sentup.android.data.VpnResilientNetwork.isNetworkUsable(caps)
     } catch (e: Exception) {
         // Unknown is treated as connected, so a permissions or API oddity does
         // not turn every empty feed into a bogus "check your connection".

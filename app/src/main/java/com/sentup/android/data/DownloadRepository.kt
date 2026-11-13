@@ -247,7 +247,7 @@ class DownloadRepository private constructor(private val context: Context) {
             }
     }
 
-    private val client = OkHttpClient.Builder()
+    private val client = VpnResilientNetwork.configureForVpn(OkHttpClient.Builder())
         .addInterceptor { chain ->
             if (ThemePreferences.isLocalOnly(context)) {
                 throw java.io.IOException("Local only mode is on: network disabled")

@@ -48,6 +48,8 @@ import kotlinx.coroutines.Job
 @UnstableApi
 class PlayerViewModel(private val context: Context) : ViewModel() {
 
+    val trackCustomizationStore = com.sentup.android.data.TrackCustomizationStore(context)
+
     private var controllerFuture: ListenableFuture<MediaController>? = null
     private val controller: MediaController?
         get() = try {
@@ -823,6 +825,8 @@ class PlayerViewModel(private val context: Context) : ViewModel() {
     private fun startProgressUpdates() {
         viewModelScope.launch {
             var lastPosition = 0L
+            var lastTrimmedItemKey: String? = null
+            var lastOutroSkippedKey: String? = null
             while (isActive) {
                 controller?.let {
                     val currentPos = it.currentPosition
@@ -842,6 +846,25 @@ class PlayerViewModel(private val context: Context) : ViewModel() {
                     val item = it.currentMediaItem
                     val itemKey = item?.mediaMetadata?.extras?.getString(EXTRA_QUEUE_ITEM_ID)
                         ?: item?.mediaId
+                    val activeSongId = _currentSong.value?.id ?: item?.mediaId
+                    val trim = activeSongId?.let { id -> trackCustomizationStore.getTrim(id) }
+                    if (itemKey != null && itemKey != lastTrimmedItemKey && currentPos >= 0) {
+                        lastTrimmedItemKey = itemKey
+                        if (trim != null && trim.startMs > 500L && currentPos < trim.startMs - 500L) {
+                            it.seekTo(trim.startMs)
+                            _progress.value = trim.startMs
+                        }
+                    }
+                    if (
+                        it.isPlaying &&
+                        itemKey != null &&
+                        itemKey != lastOutroSkippedKey &&
+                        trim?.endMs != null &&
+                        currentPos >= trim.endMs
+                    ) {
+                        lastOutroSkippedKey = itemKey
+                        skipToNext()
+                    }
                     val metadataDuration = item?.mediaMetadata?.durationMs?.takeIf { d -> d > 0L }
                     if (itemKey != durationItemKey) {
                         durationItemKey = itemKey
@@ -1497,9 +1520,24 @@ class PlayerViewModel(private val context: Context) : ViewModel() {
     private val _sleepTimerEndOfTrack = MutableStateFlow(false)
     val sleepTimerEndOfTrack: StateFlow<Boolean> = _sleepTimerEndOfTrack.asStateFlow()
 
+    private val _sleepTimerTracksRemaining = MutableStateFlow(0)
+    val sleepTimerTracksRemaining: StateFlow<Int> = _sleepTimerTracksRemaining.asStateFlow()
+
     /** Stop playback after [minutes]; playback fades out rather than cutting. */
     fun startSleepTimer(minutes: Int) {
         sendSleepTimerCommand(MusicService.CMD_SLEEP_TIMER_SET, minutes)
+    }
+
+    /** Stop playback after [tracks] tracks finish. */
+    fun startSleepTimerTracks(tracks: Int) {
+        val ctrl = controller ?: return
+        val args = android.os.Bundle().apply {
+            putInt(MusicService.ARG_SLEEP_TIMER_TRACKS, tracks)
+        }
+        ctrl.sendCustomCommand(
+            androidx.media3.session.SessionCommand(MusicService.CMD_SLEEP_TIMER_SET, android.os.Bundle.EMPTY),
+            args
+        )
     }
 
     /** Stop playback when the track that is playing now finishes. */
@@ -1590,6 +1628,8 @@ class PlayerViewModel(private val context: Context) : ViewModel() {
         _sleepTimerEndsAt.value = endsAt.takeIf { it > 0L }
         _sleepTimerEndOfTrack.value =
             extras.getBoolean(MusicService.EXTRA_SLEEP_TIMER_END_OF_TRACK, false)
+        _sleepTimerTracksRemaining.value =
+            extras.getInt(MusicService.EXTRA_SLEEP_TIMER_TRACKS_REMAINING, 0)
     }
 
     fun skipToNext() {

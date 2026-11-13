@@ -403,6 +403,7 @@ class MusicService : MediaLibraryService() {
         const val CMD_SLEEP_TIMER_SET = "com.sentup.android.SLEEP_TIMER_SET"
         const val CMD_SLEEP_TIMER_CANCEL = "com.sentup.android.SLEEP_TIMER_CANCEL"
         const val ARG_SLEEP_TIMER_MINUTES = "sleep_timer_minutes"
+        const val ARG_SLEEP_TIMER_TRACKS = "sleep_timer_tracks"
 
         const val CMD_SKIP_NEXT = "com.sentup.android.SKIP_NEXT"
         const val CMD_SKIP_PREVIOUS = "com.sentup.android.SKIP_PREVIOUS"
@@ -459,6 +460,7 @@ class MusicService : MediaLibraryService() {
         /** Session-extras keys the timer state is published under. */
         const val EXTRA_SLEEP_TIMER_ENDS_AT = "sleep_timer_ends_at"
         const val EXTRA_SLEEP_TIMER_END_OF_TRACK = "sleep_timer_end_of_track"
+        const val EXTRA_SLEEP_TIMER_TRACKS_REMAINING = "sleep_timer_tracks_remaining"
 
         /** Session-extras key the current playback rate is published under. */
         const val EXTRA_PLAYBACK_SPEED = "playback_speed"
@@ -1159,6 +1161,15 @@ class MusicService : MediaLibraryService() {
 
         override fun onMediaItemTransition(mediaItem: MediaItem?, reason: Int) {
             super.onMediaItemTransition(mediaItem, reason)
+            if (reason == Player.MEDIA_ITEM_TRANSITION_REASON_AUTO && sleepTimerTracksRemaining > 0) {
+                sleepTimerTracksRemaining -= 1
+                if (sleepTimerTracksRemaining <= 1) {
+                    sleepTimerTracksRemaining = 0
+                    sleepTimerEndOfTrack = true
+                    engine.setPauseAtEndOfMediaItems(true)
+                }
+                publishSessionState()
+            }
             if (reason == Player.MEDIA_ITEM_TRANSITION_REASON_REPEAT) lastFmTracker?.reset()
             automaticTransitionAttempt = null
             refreshMediaButtons()
@@ -2111,7 +2122,12 @@ class MusicService : MediaLibraryService() {
             args: Bundle
         ): ListenableFuture<SessionResult> = when (customCommand.customAction) {
             CMD_SLEEP_TIMER_SET -> {
-                startSleepTimer(args.getInt(ARG_SLEEP_TIMER_MINUTES, 0))
+                val tracks = args.getInt(ARG_SLEEP_TIMER_TRACKS, 0)
+                if (tracks > 1) {
+                    startSleepTimerTracks(tracks)
+                } else {
+                    startSleepTimer(args.getInt(ARG_SLEEP_TIMER_MINUTES, 0))
+                }
                 Futures.immediateFuture(SessionResult(SessionResult.RESULT_SUCCESS))
             }
             CMD_SLEEP_TIMER_CANCEL -> {
@@ -2888,6 +2904,15 @@ class MusicService : MediaLibraryService() {
     /** True while the player is set to stop when the current track finishes. */
     private var sleepTimerEndOfTrack: Boolean = false
 
+    /** Number of tracks left to play before pausing (0 = disabled). */
+    private var sleepTimerTracksRemaining: Int = 0
+
+    private fun startSleepTimerTracks(tracks: Int) {
+        clearSleepTimer(publish = false)
+        sleepTimerTracksRemaining = tracks.coerceAtLeast(2)
+        publishSessionState()
+    }
+
     /**
      * The rate music plays at, 1f being the recorded speed. Held here rather
      * than read back off a player because the crossfade engine rewrites tempo
@@ -2985,6 +3010,7 @@ class MusicService : MediaLibraryService() {
         sleepFadeJob = null
         sleepTimerEndsAt = 0L
         sleepTimerEndOfTrack = false
+        sleepTimerTracksRemaining = 0
         // Both engines matter. The standby becomes audible at the next
         // crossfade and must not carry an old end-of-track instruction.
         engine.setPauseAtEndOfMediaItems(false)
@@ -3099,6 +3125,7 @@ class MusicService : MediaLibraryService() {
                 Bundle().apply {
                     putLong(EXTRA_SLEEP_TIMER_ENDS_AT, sleepTimerEndsAt)
                     putBoolean(EXTRA_SLEEP_TIMER_END_OF_TRACK, sleepTimerEndOfTrack)
+                    putInt(EXTRA_SLEEP_TIMER_TRACKS_REMAINING, sleepTimerTracksRemaining)
                     putFloat(EXTRA_PLAYBACK_SPEED, playbackSpeed)
                     putIntArray(EXTRA_PLAY_ORDER, currentPlayOrder())
                 }

@@ -289,6 +289,14 @@ class ShortsPlayerViewModel(application: android.app.Application) : AndroidViewM
         override fun removeEldestEntry(eldest: MutableMap.MutableEntry<String, com.sentup.android.data.WatchNextData>) =
             size > 20
     }
+    // One extraction per video, shared by whoever asks first. Without this the
+    // tapped Short and its own prefetch entry both resolved the same video at
+    // once: two full extractions racing each other, and the one feeding
+    // playback could arrive second. Sharing the work is what makes the first
+    // frame land at the speed of one resolve instead of two.
+    private val resolveFlight =
+        com.sentup.android.service.DeferredSingleFlight<String, List<VideoQuality>>(viewModelScope)
+
     // Main-thread owned. Obsolete requests must not sit ahead of the next swipe.
     private val prefetchJobs = mutableMapOf<String, Job>()
     private val prefetchSemaphore = kotlinx.coroutines.sync.Semaphore(1)
@@ -351,6 +359,25 @@ class ShortsPlayerViewModel(application: android.app.Application) : AndroidViewM
     private fun cachedQualities(videoId: String): List<VideoQuality>? =
         synchronized(qualitiesCache) { qualitiesCache[videoId] }
 
+    /**
+     * The ladder for [videoId], resolved once per video however many callers
+     * want it. A cache hit returns immediately; otherwise the in-flight job is
+     * joined rather than a second extraction started. Cancelling the caller
+     * (a swipe) does not cancel the shared work - a blocking NewPipe fetch
+     * cannot be stopped anyway - so the next surface to ask gets the answer.
+     */
+    private suspend fun sharedQualities(videoId: String): List<VideoQuality> {
+        cachedQualities(videoId)?.let { return it }
+        // Read the epoch before waiting: an invalidation that lands while this
+        // resolve is in flight must still drop the result it was given.
+        val epoch = qualitiesEpoch
+        val qualities = resolveFlight.getOrStart(videoId) {
+            resolvePlayableQualities(videoId)
+        }.await()
+        cacheQualities(videoId, qualities, epoch)
+        return qualities
+    }
+
     private fun cacheQualities(videoId: String, qualities: List<VideoQuality>, epoch: Int = qualitiesEpoch) {
         if (qualities.isEmpty()) return
         synchronized(qualitiesCache) {
@@ -368,10 +395,40 @@ class ShortsPlayerViewModel(application: android.app.Application) : AndroidViewM
 
     // A bot-check verdict stands prefetch down for the same reason a 429 does:
     // resolving Shorts nobody has swiped to yet would repeat a refusal.
-    private fun canPrefetch(): Boolean =
-        _isActive.value && ThemePreferences.isPlaybackPreloadEnabled(context) &&
+    private fun canPrefetch(requireActive: Boolean = true): Boolean =
+        (!requireActive || _isActive.value) &&
+            ThemePreferences.isPlaybackPreloadEnabled(context) &&
             !YouTubeRateLimit.isHeld() &&
             !com.sentup.android.data.YouTubeRepository.isBotCheckVerdictActive()
+
+    /**
+     * Warm the head of a Shorts list before the swipe player is open.
+     *
+     * The Shorts tab opens the full-screen feed by itself, so the first item is
+     * known to be about to play while the grid is still on screen. Resolving and
+     * warming it there is the difference between a Short that starts on the tap
+     * and one that shows its first frame seconds later; until this existed the
+     * only warm-up was for index + 1, so the item the user actually opened was
+     * always a cold resolve.
+     *
+     * Deliberately does not require the player to be active, and deliberately
+     * does not start a sequence: it touches the two ladder caches and stops.
+     * Gated exactly like every other speculative request (preload switch, rate
+     * limit hold, bot-check verdict) because these are still requests nobody
+     * asked for.
+     */
+    fun preloadFeed(items: List<ShortsItem>, count: Int = 2) {
+        if (items.isEmpty()) return
+        if (!canPrefetch(requireActive = false)) return
+        viewModelScope.launch {
+            for (item in items.take(count)) {
+                if (!canPrefetch(requireActive = false)) return@launch
+                val qualities = runCatching { sharedQualities(item.videoId) }.getOrNull()
+                    ?: continue
+                runCatching { warmPlayableHead(qualities, requireActive = false) }
+            }
+        }
+    }
 
     /** Resolve and warm only the next Short; cached ladders still need media bytes. */
     private fun prefetchAround(index: Int) {
@@ -394,10 +451,7 @@ class ShortsPlayerViewModel(application: android.app.Application) : AndroidViewM
             val id = item.videoId
             val epoch = qualitiesEpoch
             launchPrefetch("s:$id", prefetchSemaphore) {
-                val qualities = cachedQualities(id) ?: resolvePlayableQualities(id).also {
-                    ensureActive()
-                    cacheQualities(id, it, epoch)
-                }
+                val qualities = sharedQualities(id).also { ensureActive() }
                 // Re-evaluate after resolution: a farther item may have become
                 // the immediate next Short while its extraction was in flight.
                 if (epoch == qualitiesEpoch && shouldWarmShort(id)) {
@@ -425,8 +479,8 @@ class ShortsPlayerViewModel(application: android.app.Application) : AndroidViewM
     }
 
     /** Bounded audio/video heads only; live and adaptive manifests stay out of the cache. */
-    private suspend fun warmPlayableHead(qualities: List<VideoQuality>) {
-        if (!canPrefetch()) return
+    private suspend fun warmPlayableHead(qualities: List<VideoQuality>, requireActive: Boolean = true) {
+        if (!canPrefetch(requireActive)) return
         if (qualities.isEmpty()) return
         val quality = pickDefaultQuality(qualities)
         if (quality.isDASH || quality.isLive) return
@@ -853,6 +907,9 @@ class ShortsPlayerViewModel(application: android.app.Application) : AndroidViewM
                     synchronized(qualitiesCache) { qualitiesCache.remove(item.videoId) }
                 }
                 youtubeRepository.invalidateVideoStreamResult(item.videoId)
+                // A resolve still in flight was started under the dead token;
+                // recovery must not join it, so forget the key first.
+                resolveFlight.forget(item.videoId)?.cancel()
                 val qualities = kotlinx.coroutines.withTimeout(15_000L) {
                     resolvePlayableQualities(item.videoId)
                 }
@@ -959,9 +1016,7 @@ class ShortsPlayerViewModel(application: android.app.Application) : AndroidViewM
                     delay(COLD_RESOLVE_DWELL_MS)
                 }
                 kotlinx.coroutines.withTimeout(15_000L) {
-                    val qualities = cachedQualities(item.videoId)
-                        ?: resolvePlayableQualities(item.videoId)
-                            .also { cacheQualities(item.videoId, it) }
+                    val qualities = sharedQualities(item.videoId)
                     if (_currentIndex.value != index) return@withTimeout
                     // Live arrived in the reel feed: hand it to the video
                     // player, which has the vertical live layout and chat, and

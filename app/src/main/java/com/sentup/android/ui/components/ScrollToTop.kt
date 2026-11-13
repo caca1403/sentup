@@ -27,3 +27,16 @@ suspend fun LazyListState.scrollToTop() {
         animateScrollToItem(0)
     }
 }
+
+/**
+ * The grid twin of [scrollToTop]. A tab whose content is a lazy grid (Shorts)
+ * answers a re-tap with the same animate-then-jump decision as the lazy lists,
+ * so the bar behaves identically whichever container the page chose.
+ */
+suspend fun androidx.compose.foundation.lazy.grid.LazyGridState.scrollToTop() {
+    if (firstVisibleItemIndex > ANIMATED_SCROLL_TO_TOP_MAX_ITEMS) {
+        scrollToItem(0)
+    } else {
+        animateScrollToItem(0)
+    }
+}

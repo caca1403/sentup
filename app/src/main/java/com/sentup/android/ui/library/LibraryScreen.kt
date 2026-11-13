@@ -232,7 +232,9 @@ fun LibraryContent(
      * their own states, since each is a different list and sharing one would
      * restore another list's index.
      */
-    allSongsListState: LazyListState = rememberLazyListState()
+    allSongsListState: LazyListState = rememberLazyListState(),
+    onSetPlaybackSpeed: ((Float) -> Unit)? = null,
+    onSeekToTimestamp: ((Song, Long) -> Unit)? = null
 ) {
     // Navigation State
     var currentRoute by rememberSaveable { mutableStateOf(LibraryRoute.Main) }
@@ -388,6 +390,9 @@ fun LibraryContent(
                     currentRoute = LibraryRoute.CreatePlaylist
                 },
                 onSongLongPress = onSongLongPress,
+                onSetPlaybackSpeed = onSetPlaybackSpeed,
+                onSeekToTimestamp = onSeekToTimestamp,
+                onEnqueueSong = onEnqueueSong,
                 allSongsListState = allSongsListState
             )
     }
@@ -1043,8 +1048,96 @@ private fun LibrarySingleFlow(
     readyOfflineHistoryDisabled: Boolean,
     onReadyOfflineClick: () -> Unit,
     viewModel: HomeViewModel,
+    themePreferences: ThemePreferences,
+    onPlayQueue: (List<Song>, Song?) -> Unit,
+    onShuffleQueue: (List<Song>) -> Unit,
+    onEnqueueSong: ((Song, Boolean) -> Unit)?,
+    onSetPlaybackSpeed: ((Float) -> Unit)? = null,
+    onSeekToTimestamp: ((Song, Long) -> Unit)? = null,
     onShuffle: () -> Unit,
 ) {
+    var viewMode by rememberSaveable { mutableStateOf(LibraryViewMode.Mixes) }
+    var searchQuery by rememberSaveable { mutableStateOf("") }
+    var activeFilter by rememberSaveable { mutableStateOf(com.sentup.android.data.LibraryFilterChip.All) }
+    var folderSortOrder by rememberSaveable { mutableStateOf(com.sentup.android.data.FolderSortOrder.Name) }
+    var selectedFolderChannel by rememberSaveable { mutableStateOf<String?>(null) }
+    var selectedFolderAlbum by rememberSaveable { mutableStateOf<String?>(null) }
+    var selectionMode by rememberSaveable { mutableStateOf(false) }
+    var selectedSongIds by remember { mutableStateOf<Set<String>>(emptySet()) }
+
+    val folderContext = LocalContext.current
+    val customFolderStore = remember(folderContext) { com.sentup.android.data.CustomFolderStore(folderContext) }
+    val customFolders by customFolderStore.folders.collectAsState()
+    var folderSourceTab by rememberSaveable { mutableStateOf(FolderSourceTab.Custom) }
+    var currentCustomFolderId by rememberSaveable { mutableStateOf<String?>(null) }
+    var showCreateFolderParentId by remember { mutableStateOf<String?>(null) }
+    var isCreateFolderDialogOpen by remember { mutableStateOf(false) }
+    var renameTargetFolder by remember { mutableStateOf<com.sentup.android.data.MusicFolder?>(null) }
+    var moveTargetFolder by remember { mutableStateOf<com.sentup.android.data.MusicFolder?>(null) }
+    var addSongsTargetFolder by remember { mutableStateOf<com.sentup.android.data.MusicFolder?>(null) }
+    var audioProfileTargetFolder by remember { mutableStateOf<com.sentup.android.data.MusicFolder?>(null) }
+    var autoRuleTargetFolder by remember { mutableStateOf<com.sentup.android.data.MusicFolder?>(null) }
+    var trackToolsTargetSong by remember { mutableStateOf<Song?>(null) }
+    var showCleanerSheet by remember { mutableStateOf(false) }
+    var showNeuralLabSheet by remember { mutableStateOf(false) }
+    var showFolderExportImportDialog by remember { mutableStateOf(false) }
+    var showAddSelectedToFolderDialog by remember { mutableStateOf(false) }
+    val trackCustomizationStore = remember(folderContext) { com.sentup.android.data.TrackCustomizationStore(folderContext) }
+    val trackTrims by trackCustomizationStore.trims.collectAsState()
+    val songBookmarks by trackCustomizationStore.bookmarks.collectAsState()
+    val librarySongsById = remember(librarySongs) { librarySongs.associateBy { it.id } }
+
+    val pinnedChannels by themePreferences.pinnedMusicChannels.collectAsState()
+    val likedIds = remember(likedSongs) { likedSongs.mapTo(mutableSetOf()) { it.id } }
+    val downloadedIds = remember(downloadedSongs) { downloadedSongs.mapTo(mutableSetOf()) { it.id } }
+
+    val filteredSongs = remember(songs, searchQuery, activeFilter, downloadedIds, likedIds, playCounts) {
+        com.sentup.android.data.filterLibrarySongs(
+            songs = songs,
+            query = searchQuery,
+            filter = activeFilter,
+            downloadedIds = downloadedIds,
+            likedIds = likedIds,
+            playCounts = playCounts
+        )
+    }
+
+    val singlesLabel = stringResource(R.string.lib_folder_singles)
+    val unknownChannelLabel = stringResource(R.string.lib_folder_unknown_channel)
+    val channelFolders = remember(
+        filteredSongs,
+        playCounts,
+        folderSortOrder,
+        pinnedChannels,
+        singlesLabel,
+        unknownChannelLabel
+    ) {
+        com.sentup.android.data.buildChannelFolderHierarchy(
+            songs = filteredSongs,
+            playCounts = playCounts,
+            sortOrder = folderSortOrder,
+            pinnedChannels = pinnedChannels,
+            singlesLabel = singlesLabel,
+            unknownChannelLabel = unknownChannelLabel
+        )
+    }
+
+    val smartMixes = remember(filteredSongs, downloadedIds, playCounts) {
+        com.sentup.android.data.buildLibrarySmartMixes(
+            songs = filteredSongs,
+            downloadedIds = downloadedIds,
+            playCounts = playCounts
+        )
+    }
+
+    val libraryDna = remember(librarySongs, downloadedIds, playCounts) {
+        com.sentup.android.data.computeLibraryDna(
+            songs = librarySongs,
+            downloadedIds = downloadedIds,
+            playCounts = playCounts
+        )
+    }
+
     val artists = remember(librarySongs) {
         librarySongs.filterNot { isUnknownArtist(it.artist) }.groupSongsByArtist()
     }
@@ -1055,61 +1148,250 @@ private fun LibrarySingleFlow(
     val scope = rememberCoroutineScope()
 
     // Flat item order below, so a chip can scroll to a section header:
-    // 0 chips, 1 insights, 2 shortcuts, 3 playlist header, then its rows,
+    // 0 mode/search, 1 DNA, 2 chips, 3 insights, 4 shortcuts, 5 playlist header, then its rows,
     // then (optional) artist and album sections, then the song list.
     val playlistRows = if (playlists.isEmpty()) 1 else (playlists.size + 1) / 2
-    var idx = 4 + playlistRows
+    var idx = 6 + playlistRows
     val artistsHeaderIdx = if (artists.isNotEmpty()) idx else -1
     if (artists.isNotEmpty()) idx += 1 + (artists.size + 1) / 2
     val albumsHeaderIdx = if (albums.isNotEmpty()) idx else -1
     if (albums.isNotEmpty()) idx += 1 + (albums.size + 1) / 2
     val songsHeaderIdx = idx
     val anchors = buildList {
-        add("Analiz" to 1)
-        add("Listeler" to 3)
+        add("Analiz" to 3)
+        add("Listeler" to 5)
         if (artistsHeaderIdx >= 0) add("Sanatçılar" to artistsHeaderIdx)
         if (albumsHeaderIdx >= 0) add("Albümler" to albumsHeaderIdx)
         add("Şarkılar" to songsHeaderIdx)
     }
 
-    LazyColumn(
-        state = listState,
-        modifier = Modifier.fillMaxSize(),
-        contentPadding = PaddingValues(
-            top = 8.dp,
-            bottom = contentPadding.calculateBottomPadding() + 120.dp
-        )
-    ) {
-        // 0: quick jump. Pick what you want on top; the list scrolls to it.
-        item(key = "flow_chips") {
-            Row(
-                modifier = Modifier
-                    .fillMaxWidth()
-                    .horizontalScroll(rememberScrollState())
-                    .padding(horizontal = SentupGroup.inset, vertical = 4.dp),
-                horizontalArrangement = Arrangement.spacedBy(8.dp)
-            ) {
-                FilterChip(
-                    selected = false,
-                    onClick = onShuffle,
-                    leadingIcon = {
-                        Icon(
-                            Icons.Rounded.Shuffle,
-                            contentDescription = null,
-                            modifier = Modifier.size(16.dp)
-                        )
+    Box(modifier = Modifier.fillMaxSize()) {
+        LazyColumn(
+            state = listState,
+            modifier = Modifier.fillMaxSize(),
+            contentPadding = PaddingValues(
+                top = 8.dp,
+                bottom = contentPadding.calculateBottomPadding() + 120.dp
+            )
+        ) {
+            item(key = "library_mode_and_search") {
+                LibraryModeAndSearchHeader(
+                    viewMode = viewMode,
+                    onViewModeChange = { nextMode ->
+                        viewMode = nextMode
+                        if (nextMode != LibraryViewMode.Folders) {
+                            selectionMode = false
+                            selectedSongIds = emptySet()
+                        }
                     },
-                    label = { Text("Karıştır") }
+                    searchQuery = searchQuery,
+                    onSearchQueryChange = { searchQuery = it },
+                    activeFilter = activeFilter,
+                    onFilterChange = { activeFilter = it }
                 )
-                anchors.forEach { (label, target) ->
-                    FilterChip(
-                        selected = false,
-                        onClick = { scope.launch { listState.animateScrollToItem(target) } },
-                        label = { Text(label) }
+            }
+
+            item(key = "library_dna_card") {
+                LibraryDnaCard(
+                    dna = libraryDna,
+                    onSurpriseMe = {
+                        val unplayed = librarySongs.filter { (playCounts[it.id] ?: 0) == 0 }
+                        val pool = if (unplayed.isNotEmpty()) unplayed else librarySongs
+                        if (pool.isNotEmpty()) {
+                            onShuffleQueue(pool.shuffled())
+                        }
+                    },
+                    onOpenCleaner = { showCleanerSheet = true },
+                    onOpenNeuralLab = { showNeuralLabSheet = true },
+                    modifier = Modifier.padding(top = 6.dp, bottom = 6.dp)
+                )
+            }
+
+            if (viewMode == LibraryViewMode.Folders) {
+                item(key = "folder_source_tabs") {
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(horizontal = SentupGroup.inset, vertical = 2.dp),
+                        horizontalArrangement = Arrangement.spacedBy(8.dp)
+                    ) {
+                        FilterChip(
+                            selected = folderSourceTab == FolderSourceTab.Custom,
+                            onClick = { folderSourceTab = FolderSourceTab.Custom },
+                            label = { Text(stringResource(R.string.lib_folders_custom)) }
+                        )
+                        FilterChip(
+                            selected = folderSourceTab == FolderSourceTab.ChannelsAuto,
+                            onClick = { folderSourceTab = FolderSourceTab.ChannelsAuto },
+                            label = { Text(stringResource(R.string.lib_folders_auto)) }
+                        )
+                    }
+                }
+                if (folderSourceTab == FolderSourceTab.Custom) {
+                    customFolderBrowserItems(
+                        folders = customFolders,
+                        allSongs = librarySongs,
+                        songsById = librarySongsById,
+                        currentFolderId = currentCustomFolderId,
+                        searchQuery = searchQuery,
+                        likedIds = likedIds,
+                        downloadedIds = downloadedIds,
+                        playCounts = playCounts,
+                        onNavigateFolder = { currentCustomFolderId = it },
+                        onCreateFolderRequest = { parentId ->
+                            showCreateFolderParentId = parentId
+                            isCreateFolderDialogOpen = true
+                        },
+                        onRenameFolderRequest = { folder -> renameTargetFolder = folder },
+                        onMoveFolderRequest = { folder -> moveTargetFolder = folder },
+                        onDeleteFolder = { folder ->
+                            if (currentCustomFolderId == folder.id) {
+                                currentCustomFolderId = folder.parentId
+                            }
+                            customFolderStore.deleteFolder(folder.id)
+                        },
+                        onTogglePinFolder = { folder -> customFolderStore.togglePinFolder(folder.id) },
+                        onAddSongsRequest = { folder -> addSongsTargetFolder = folder },
+                        onFolderAudioProfileRequest = { folder -> audioProfileTargetFolder = folder },
+                        onFolderAutoRuleRequest = { folder -> autoRuleTargetFolder = folder },
+                        onPlayFolderWithProfile = { folder, queue, shuffle ->
+                            folder.playbackSpeed?.let { speed -> onSetPlaybackSpeed?.invoke(speed) }
+                            if (shuffle) {
+                                onShuffleQueue(queue)
+                            } else {
+                                onPlayQueue(queue, queue.firstOrNull())
+                            }
+                        },
+                        onOpenTrackTools = { song -> trackToolsTargetSong = song },
+                        onExportImportFoldersRequest = { showFolderExportImportDialog = true },
+                        onRemoveArtistFromFolder = { folderId, artistName ->
+                            customFolderStore.removeArtistFromFolder(folderId, artistName)
+                        },
+                        onRemoveAlbumFromFolder = { folderId, albumName ->
+                            customFolderStore.removeAlbumFromFolder(folderId, albumName)
+                        },
+                        onRemoveSongFromFolder = { folderId, songId ->
+                            customFolderStore.removeSongFromFolder(folderId, songId)
+                        },
+                        onOpenArtist = onArtistClick,
+                        onOpenAlbum = onAlbumClick,
+                        onPlayQueue = onPlayQueue,
+                        onShuffleQueue = onShuffleQueue,
+                        onSongLongPress = onSongLongPress
+                    )
+                } else {
+                    channelFolderBrowserItems(
+                        channels = channelFolders,
+                        selectedChannelName = selectedFolderChannel,
+                        selectedAlbumName = selectedFolderAlbum,
+                        sortOrder = folderSortOrder,
+                        selectionMode = selectionMode,
+                        selectedSongIds = selectedSongIds,
+                        likedIds = likedIds,
+                        downloadedIds = downloadedIds,
+                        onSelectChannel = { selectedFolderChannel = it },
+                        onSelectAlbum = { selectedFolderAlbum = it },
+                        onSortOrderChange = { folderSortOrder = it },
+                        onTogglePinChannel = { themePreferences.togglePinnedMusicChannel(it) },
+                        onPlayQueue = onPlayQueue,
+                        onShuffleQueue = onShuffleQueue,
+                        onToggleSelectionMode = {
+                            selectionMode = !selectionMode
+                            if (!selectionMode) selectedSongIds = emptySet()
+                        },
+                        onToggleSongSelected = { songId ->
+                            selectedSongIds = if (songId in selectedSongIds) {
+                                selectedSongIds - songId
+                            } else {
+                                selectedSongIds + songId
+                            }
+                        },
+                        onSongLongPress = onSongLongPress,
+                        onSaveChannelAsFolder = { channel ->
+                            val created = customFolderStore.importChannelAsFolder(channel)
+                            currentCustomFolderId = created.id
+                            folderSourceTab = FolderSourceTab.Custom
+                        }
                     )
                 }
+                return@LazyColumn
             }
-        }
+
+            if (viewMode == LibraryViewMode.Mixes) {
+                smartMixesItems(
+                    mixes = smartMixes,
+                    onPlayMix = { mix -> onPlayQueue(mix.songs, mix.songs.firstOrNull()) },
+                    onShuffleMix = { mix -> onShuffleQueue(mix.songs) }
+                )
+                return@LazyColumn
+            }
+
+            if (searchQuery.isNotBlank() || activeFilter != com.sentup.android.data.LibraryFilterChip.All) {
+                item(key = "flow_filtered_header") {
+                    SentupGroupHeader(
+                        text = pluralStringResource(R.plurals.n_songs, filteredSongs.size, filteredSongs.size),
+                        modifier = Modifier.padding(top = SentupGroup.gap)
+                    )
+                }
+                if (filteredSongs.isEmpty()) {
+                    item(key = "flow_filtered_empty") {
+                        Box(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(vertical = 48.dp, horizontal = SentupGroup.inset),
+                            contentAlignment = Alignment.Center
+                        ) {
+                            Text(
+                                text = stringResource(R.string.lib_folder_empty),
+                                style = MaterialTheme.typography.bodyMedium,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                        }
+                    }
+                } else {
+                    items(filteredSongs, key = { "filtered_song_" + it.id }) { song ->
+                        SongListItem(
+                            song = song,
+                            isLiked = song.id in likedIds,
+                            isDownloaded = song.id in downloadedIds,
+                            onLongClick = onSongLongPress?.let { press -> { press(song) } },
+                            onClick = { onPlayQueue(filteredSongs, song) }
+                        )
+                    }
+                }
+                return@LazyColumn
+            }
+
+            // 2: quick jump. Pick what you want on top; the list scrolls to it.
+            item(key = "flow_chips") {
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .horizontalScroll(rememberScrollState())
+                        .padding(horizontal = SentupGroup.inset, vertical = 4.dp),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    FilterChip(
+                        selected = false,
+                        onClick = onShuffle,
+                        leadingIcon = {
+                            Icon(
+                                Icons.Rounded.Shuffle,
+                                contentDescription = null,
+                                modifier = Modifier.size(16.dp)
+                            )
+                        },
+                        label = { Text("Karıştır") }
+                    )
+                    anchors.forEach { (label, target) ->
+                        FilterChip(
+                            selected = false,
+                            onClick = { scope.launch { listState.animateScrollToItem(target) } },
+                            label = { Text(label) }
+                        )
+                    }
+                }
+            }
 
         // 1: the analytics block, the first thing you scroll past into data.
         item(key = "flow_insights") {
@@ -1340,6 +1622,39 @@ private fun LibrarySingleFlow(
                 onClick = { onSongClick(song) }
             )
         }
+        }
+
+        val selectedSongs = remember(selectedSongIds, librarySongs) {
+            librarySongs.filter { it.id in selectedSongIds }
+        }
+        MultiSelectActionBar(
+            selectedCount = selectedSongs.size,
+            onPlayNext = {
+                selectedSongs.asReversed().forEach { song -> onEnqueueSong?.invoke(song, true) }
+                selectionMode = false
+                selectedSongIds = emptySet()
+            },
+            onAddToQueue = {
+                selectedSongs.forEach { song -> onEnqueueSong?.invoke(song, false) }
+                selectionMode = false
+                selectedSongIds = emptySet()
+            },
+            onShuffleSelected = {
+                if (selectedSongs.isNotEmpty()) {
+                    onShuffleQueue(selectedSongs)
+                }
+                selectionMode = false
+                selectedSongIds = emptySet()
+            },
+            onAddToFolder = { showAddSelectedToFolderDialog = true },
+            onClear = {
+                selectionMode = false
+                selectedSongIds = emptySet()
+            },
+            modifier = Modifier
+                .align(Alignment.BottomCenter)
+                .padding(bottom = contentPadding.calculateBottomPadding() + 8.dp)
+        )
     }
 
     if (showHiddenSheet) {
@@ -1347,6 +1662,172 @@ private fun LibrarySingleFlow(
             hidden = hiddenPlaylists,
             onUnhide = onUnhidePlaylist,
             onDismiss = { showHiddenSheet = false }
+        )
+    }
+
+    if (isCreateFolderDialogOpen) {
+        CreateOrRenameFolderDialog(
+            isRename = false,
+            onDismiss = { isCreateFolderDialogOpen = false },
+            onConfirm = { name, colorHex ->
+                customFolderStore.createFolder(name, parentId = showCreateFolderParentId, colorHex = colorHex)
+                isCreateFolderDialogOpen = false
+            }
+        )
+    }
+
+    renameTargetFolder?.let { target ->
+        CreateOrRenameFolderDialog(
+            initialName = target.name,
+            initialColorHex = target.colorHex,
+            isRename = true,
+            onDismiss = { renameTargetFolder = null },
+            onConfirm = { name, colorHex ->
+                customFolderStore.renameFolder(target.id, name, colorHex)
+                renameTargetFolder = null
+            }
+        )
+    }
+
+    moveTargetFolder?.let { target ->
+        val excluded = remember(customFolders, target.id) {
+            com.sentup.android.data.CustomFolderTree.subtreeIds(customFolders, target.id)
+        }
+        PickTargetFolderDialog(
+            title = stringResource(R.string.lib_custom_folder_move),
+            folders = customFolders,
+            includeRoot = true,
+            excludedFolderIds = excluded,
+            onSelectFolder = { newParentId ->
+                customFolderStore.moveFolder(target.id, newParentId)
+                moveTargetFolder = null
+            },
+            onDismiss = { moveTargetFolder = null }
+        )
+    }
+
+    addSongsTargetFolder?.let { target ->
+        PickContentForFolderSheet(
+            targetFolder = target,
+            allSongs = librarySongs,
+            onConfirm = { chosenArtists, chosenAlbums, chosenSongIds ->
+                customFolderStore.setFolderContent(
+                    folderId = target.id,
+                    artistNames = chosenArtists,
+                    albumNames = chosenAlbums,
+                    songIds = chosenSongIds
+                )
+                addSongsTargetFolder = null
+            },
+            onDismiss = { addSongsTargetFolder = null }
+        )
+    }
+
+    audioProfileTargetFolder?.let { target ->
+        FolderAudioProfileDialog(
+            folder = target,
+            onDismiss = { audioProfileTargetFolder = null },
+            onConfirm = { speed, eqPreset ->
+                customFolderStore.setFolderAudioProfile(target.id, speed, eqPreset)
+                audioProfileTargetFolder = null
+            }
+        )
+    }
+
+    autoRuleTargetFolder?.let { target ->
+        FolderAutoRuleDialog(
+            folder = target,
+            onDismiss = { autoRuleTargetFolder = null },
+            onConfirm = { rule ->
+                customFolderStore.setFolderAutoRule(target.id, rule)
+                autoRuleTargetFolder = null
+            }
+        )
+    }
+
+    trackToolsTargetSong?.let { targetSong ->
+        TrackTrimAndBookmarksSheet(
+            song = targetSong,
+            currentTrim = trackTrims[targetSong.id],
+            bookmarks = songBookmarks[targetSong.id].orEmpty(),
+            onSaveTrim = { startMs, endMs ->
+                trackCustomizationStore.setTrim(targetSong.id, startMs, endMs)
+            },
+            onClearTrim = {
+                trackCustomizationStore.clearTrim(targetSong.id)
+            },
+            onAddBookmark = { posMs, note ->
+                trackCustomizationStore.addBookmark(targetSong.id, posMs, note)
+            },
+            onDeleteBookmark = { bmId ->
+                trackCustomizationStore.deleteBookmark(targetSong.id, bmId)
+            },
+            onJumpToTimestamp = { posMs ->
+                onSeekToTimestamp?.invoke(targetSong, posMs)
+                trackToolsTargetSong = null
+            },
+            allSongs = librarySongs,
+            onPlaySimilar = { queue ->
+                trackToolsTargetSong = null
+                onPlayQueue(queue, queue.firstOrNull())
+            },
+            onDismiss = { trackToolsTargetSong = null }
+        )
+    }
+
+    if (showCleanerSheet) {
+        val healthReport = remember(librarySongs) {
+            com.sentup.android.data.analyzeLibraryHealth(librarySongs)
+        }
+        LibraryCleanerSheet(
+            report = healthReport,
+            onPlaySong = { song ->
+                showCleanerSheet = false
+                onPlayQueue(librarySongs, song)
+            },
+            onDismiss = { showCleanerSheet = false }
+        )
+    }
+
+    if (showFolderExportImportDialog) {
+        FolderExportImportDialog(
+            exportedJson = customFolderStore.exportFoldersJson(),
+            onImportJson = { raw -> customFolderStore.importFoldersJson(raw) },
+            onDismiss = { showFolderExportImportDialog = false }
+        )
+    }
+
+    if (showNeuralLabSheet) {
+        val recentSongs by viewModel.recentlyPlayed.collectAsState()
+        NeuralLabSheet(
+            songs = librarySongs,
+            customFolders = customFolders,
+            playCounts = playCounts,
+            recentlyPlayed = recentSongs,
+            onPlayQueue = onPlayQueue,
+            onDismiss = { showNeuralLabSheet = false }
+        )
+    }
+
+    if (showAddSelectedToFolderDialog) {
+        PickTargetFolderDialog(
+            title = stringResource(R.string.lib_custom_folder_add_to),
+            folders = customFolders,
+            includeRoot = false,
+            onCreateNewFolder = {
+                showAddSelectedToFolderDialog = false
+                showCreateFolderParentId = null
+                isCreateFolderDialogOpen = true
+            },
+            onSelectFolder = { targetId ->
+                if (targetId != null) {
+                    customFolderStore.addSongsToFolder(targetId, selectedSongIds)
+                }
+                showAddSelectedToFolderDialog = false
+                selectionMode = false
+                selectedSongIds = emptySet()
+            },
+            onDismiss = { showAddSelectedToFolderDialog = false }
         )
     }
 }
@@ -1379,6 +1860,9 @@ fun LibraryMainScreen(
      * a New playlist button that does nothing. */
     onCreatePlaylist: () -> Unit,
     onSongLongPress: ((Song) -> Unit)? = null,
+    onEnqueueSong: ((Song, Boolean) -> Unit)? = null,
+    onSetPlaybackSpeed: ((Float) -> Unit)? = null,
+    onSeekToTimestamp: ((Song, Long) -> Unit)? = null,
     allSongsListState: LazyListState = rememberLazyListState()
 ) {
     val userPlaylists by viewModel.userPlaylists.collectAsState()
@@ -1571,6 +2055,12 @@ fun LibraryMainScreen(
                             readyOfflineHistoryDisabled = readyOfflineHistoryDisabled,
                             onReadyOfflineClick = onReadyOfflineClick,
                             viewModel = viewModel,
+                            themePreferences = themePreferences,
+                            onPlayQueue = onPlayQueue,
+                            onShuffleQueue = onShuffleQueue,
+                            onEnqueueSong = onEnqueueSong,
+                            onSetPlaybackSpeed = onSetPlaybackSpeed,
+                            onSeekToTimestamp = onSeekToTimestamp,
                             onShuffle = { onShuffleQueue(sortedSongs) }
                         )
                         LibraryTab.Playlists -> {

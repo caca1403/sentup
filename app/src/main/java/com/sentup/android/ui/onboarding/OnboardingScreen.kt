@@ -226,16 +226,30 @@ fun OnboardingScreen(
                     Box(
                         modifier = Modifier
                             .size(34.dp)
-                            .clip(PolygonShape(MaterialShapes.Cookie9Sided))
+                            .clip(RoundedCornerShape(10.dp))
                             .background(MaterialTheme.colorScheme.primary),
                         contentAlignment = Alignment.Center
                     ) {
-                        Icon(
-                            imageVector = Icons.Rounded.MusicNote,
-                            contentDescription = null,
-                            tint = MaterialTheme.colorScheme.onPrimary,
-                            modifier = Modifier.size(18.dp)
-                        )
+                        val onPrimaryColor = MaterialTheme.colorScheme.onPrimary
+                        Canvas(modifier = Modifier.size(20.dp)) {
+                            val barCount = 5
+                            val barW = size.width * 0.11f
+                            val gap = size.width * 0.08f
+                            val totalW = barCount * barW + (barCount - 1) * gap
+                            val startX = (size.width - totalW) / 2f
+                            val heights = listOf(0.42f, 0.68f, 0.92f, 0.68f, 0.42f)
+                            heights.forEachIndexed { idx, frac ->
+                                val h = size.height * frac
+                                val x = startX + idx * (barW + gap)
+                                val topY = (size.height - h) / 2f
+                                drawRoundRect(
+                                    color = onPrimaryColor,
+                                    topLeft = Offset(x, topY),
+                                    size = Size(barW, h),
+                                    cornerRadius = CornerRadius(barW / 2f)
+                                )
+                            }
+                        }
                     }
                     Text(
                         text = "Sentüp",
@@ -521,18 +535,11 @@ private fun SentupTubeMark(modifier: Modifier = Modifier) {
         val height = size.height
         val center = Offset(width / 2f, height / 2f)
 
-        val tubeWidth = width * 0.46f
-        val tubeHeight = height * 0.64f
-        val left = (width - tubeWidth) / 2f
-        val top = center.y - tubeHeight / 2f + height * 0.04f
-        val radius = tubeWidth / 2f
-
-        // The glow sits behind the glass rather than around the icon, so the
-        // mark reads as lit from inside instead of ringed by a halo.
-        val glowRadius = width * 0.60f
+        // Subtle inner glow behind Sentüp's active 5-bar equalizer logo.
+        val glowRadius = width * 0.56f
         drawCircle(
             brush = Brush.radialGradient(
-                colors = listOf(primary.copy(alpha = 0.34f * glow.value), Color.Transparent),
+                colors = listOf(primary.copy(alpha = 0.30f * glow.value), Color.Transparent),
                 center = center,
                 radius = glowRadius
             ),
@@ -540,67 +547,35 @@ private fun SentupTubeMark(modifier: Modifier = Modifier) {
             center = center
         )
 
-        // Lid, sitting proud of the tube the way the launcher mark draws it.
-        val lidWidth = tubeWidth * 0.82f
-        val lidHeight = height * 0.075f
-        drawRoundRect(
-            color = primary.copy(alpha = 0.95f),
-            topLeft = Offset(center.x - lidWidth / 2f, top - lidHeight * 1.5f),
-            size = Size(lidWidth, lidHeight),
-            cornerRadius = CornerRadius(lidHeight / 2f)
-        )
-        // A lighter cap on the lid: the one edge that catches the light.
-        drawRoundRect(
-            color = onPrimary.copy(alpha = 0.35f),
-            topLeft = Offset(center.x - lidWidth / 2f, top - lidHeight * 1.5f),
-            size = Size(lidWidth, lidHeight * 0.34f),
-            cornerRadius = CornerRadius(lidHeight / 2f)
-        )
-
-        // Glass: a wash that is brighter at the top, so the surface has a light
-        // source and the outline is not the only thing describing it.
+        // Active Sentüp squircle badge matching the launcher mark.
+        val badgeSize = width * 0.64f
+        val badgeLeft = (width - badgeSize) / 2f
+        val badgeTop = (height - badgeSize) / 2f
+        val badgeCorner = badgeSize * 0.28f
         drawRoundRect(
             brush = Brush.verticalGradient(
-                colors = listOf(primary.copy(alpha = 0.30f), primary.copy(alpha = 0.10f)),
-                startY = top,
-                endY = top + tubeHeight
+                colors = listOf(primary, primary.copy(alpha = 0.86f)),
+                startY = badgeTop,
+                endY = badgeTop + badgeSize
             ),
-            topLeft = Offset(left, top),
-            size = Size(tubeWidth, tubeHeight),
-            cornerRadius = CornerRadius(radius)
+            topLeft = Offset(badgeLeft, badgeTop),
+            size = Size(badgeSize, badgeSize),
+            cornerRadius = CornerRadius(badgeCorner)
         )
-        drawRoundRect(
-            color = primary.copy(alpha = 0.55f),
-            topLeft = Offset(left, top),
-            size = Size(tubeWidth, tubeHeight),
-            cornerRadius = CornerRadius(radius),
-            style = Stroke(width = 2.dp.toPx())
-        )
-        // Specular edge: a short bright run along the upper-left of the glass,
-        // clipped to the tube so it can never draw outside the silhouette.
-        clipRect(left, top, left + tubeWidth, top + tubeHeight) {
-            drawArc(
-                color = onPrimary.copy(alpha = 0.38f),
-                startAngle = 190f,
-                sweepAngle = 120f,
-                useCenter = false,
-                topLeft = Offset(left, top),
-                size = Size(tubeWidth, tubeHeight),
-                style = Stroke(width = 2.dp.toPx(), cap = StrokeCap.Round)
-            )
-        }
 
-        // The sound itself, inside the glass.
-        val barWidth = tubeWidth * 0.115f
-        val gap = tubeWidth * 0.06f
+        // Sentüp active mark: 5 centered rounded equalizer bars with gentle breathing.
+        val barWidth = badgeSize * 0.088f
+        val gap = badgeSize * 0.068f
         val totalWidth = bars.size * barWidth + (bars.size - 1) * gap
-        val baseline = top + tubeHeight - tubeHeight * 0.18f
-        var x = left + (tubeWidth - totalWidth) / 2f
-        bars.forEachIndexed { index, fraction ->
-            val barHeight = tubeHeight * 0.48f * fraction.value
+        var x = badgeLeft + (badgeSize - totalWidth) / 2f
+        val baseFractions = listOf(0.32f, 0.52f, 0.72f, 0.52f, 0.32f)
+        bars.forEachIndexed { index, anim ->
+            val animatedFrac = (baseFractions[index] * (0.78f + 0.28f * anim.value)).coerceIn(0.22f, 0.78f)
+            val barHeight = badgeSize * animatedFrac
+            val barTop = center.y - barHeight / 2f
             drawRoundRect(
-                color = if (index % 2 == 0) onPrimary else onPrimary.copy(alpha = 0.68f),
-                topLeft = Offset(x, baseline - barHeight),
+                color = onPrimary,
+                topLeft = Offset(x, barTop),
                 size = Size(barWidth, barHeight),
                 cornerRadius = CornerRadius(barWidth / 2f)
             )

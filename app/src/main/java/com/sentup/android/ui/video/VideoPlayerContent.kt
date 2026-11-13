@@ -38,11 +38,13 @@ import androidx.compose.material.icons.rounded.Animation
 import androidx.compose.material.icons.rounded.Audiotrack
 import com.sentup.android.service.FrameInterpolationStatus
 import androidx.compose.material.icons.rounded.Bedtime
+import androidx.compose.material.icons.rounded.Bookmarks
 import androidx.compose.material.icons.rounded.MusicNote
 import androidx.compose.material.icons.rounded.Check
 import androidx.compose.material.icons.rounded.Close
 import androidx.compose.material.icons.rounded.PictureInPictureAlt
 import androidx.compose.material.icons.rounded.PlayArrow
+import androidx.compose.material.icons.rounded.QuestionAnswer
 import androidx.compose.material.icons.rounded.Refresh
 import androidx.compose.material.icons.rounded.RepeatOne
 import androidx.compose.material.icons.rounded.StayCurrentPortrait
@@ -571,6 +573,16 @@ fun VideoPlayerContent(
     // a picker sheet stacked over the settings sheet is the nesting the
     // comments and queue sheets already avoid by the same hand-off.
     var showSleepTimerSheet by remember { mutableStateOf(false) }
+    var showVideoQaSheet by remember { mutableStateOf(false) }
+    var showPowerToolsSheet by remember { mutableStateOf(false) }
+    var abLoopStartMs by remember(currentVideo?.videoId) { mutableStateOf<Long?>(null) }
+    var abLoopEndMs by remember(currentVideo?.videoId) { mutableStateOf<Long?>(null) }
+
+    LaunchedEffect(currentPosition, abLoopStartMs, abLoopEndMs) {
+        VideoToolsEngine.abLoopNextSeekMs(currentPosition, abLoopStartMs, abLoopEndMs)?.let { start ->
+            viewModel.seekTo(start)
+        }
+    }
 
     // Comments Sheet + Sign-in Dialog State
     var showCommentsSheet by remember { mutableStateOf(false) }
@@ -854,6 +866,7 @@ fun VideoPlayerContent(
                         },
                         onDeleteComment = { comment -> viewModel.deleteComment(comment) },
                         onDismiss = { showCommentsSheet = false },
+                        immersive = true,
                         onSeekTo = { seconds -> viewModel.seekTo(seconds * 1000L, precise = true) },
                         modifier = Modifier
                             .fillMaxHeight()
@@ -1264,6 +1277,7 @@ fun VideoPlayerContent(
                             onDeleteComment = { comment -> viewModel.deleteComment(comment) },
                             onDismiss = { showCommentsSheet = false },
                             modifier = Modifier.fillMaxSize(),
+                            immersive = true,
                             onSeekTo = { seconds ->
                                 viewModel.seekTo(seconds * 1000L, precise = true)
                                 // Jumping to the moment a comment is about is
@@ -1433,6 +1447,34 @@ fun VideoPlayerContent(
         )
     }
 
+    if (showVideoQaSheet) {
+        VideoQaSheet(
+            title = video?.title.orEmpty(),
+            description = video?.description,
+            chapters = chapters,
+            cues = captionCues,
+            onSeekToMs = { viewModel.seekTo(it) },
+            onDismiss = { showVideoQaSheet = false }
+        )
+    }
+
+    if (showPowerToolsSheet) {
+        VideoPowerToolsSheet(
+            videoId = currentVideo?.videoId.orEmpty(),
+            videoTitle = video?.title.orEmpty(),
+            currentPositionMs = currentPosition,
+            durationMs = duration,
+            subtitles = captionCues,
+            chapters = chapters,
+            abLoopStartMs = abLoopStartMs,
+            abLoopEndMs = abLoopEndMs,
+            onSetAbLoopStart = { abLoopStartMs = it },
+            onSetAbLoopEnd = { abLoopEndMs = it },
+            onSeekTo = { viewModel.seekTo(it) },
+            onDismiss = { showPowerToolsSheet = false }
+        )
+    }
+
     // Captions / subtitles sheet
     if (showCaptionsSheet) {
         CaptionsSheet(
@@ -1506,6 +1548,15 @@ fun VideoPlayerContent(
             onSleepTimerClick = {
                 showPlaybackSettings = false
                 showSleepTimerSheet = true
+            },
+            onAskVideoClick = {
+                showPlaybackSettings = false
+                showVideoQaSheet = true
+            },
+            abLoopActive = abLoopStartMs != null && abLoopEndMs != null,
+            onPowerToolsClick = {
+                showPlaybackSettings = false
+                showPowerToolsSheet = true
             },
             showPip = pipSupported,
             onPipClick = {
@@ -1706,6 +1757,9 @@ private fun PlayerSettingsSections(
     sleepTimerEndsAt: Long?,
     sleepTimerEndOfVideo: Boolean,
     onSleepTimerClick: () -> Unit,
+    onAskVideoClick: (() -> Unit)? = null,
+    abLoopActive: Boolean = false,
+    onPowerToolsClick: (() -> Unit)? = null,
     showPip: Boolean,
     onPipClick: () -> Unit,
     showComments: Boolean,
@@ -2050,6 +2104,24 @@ private fun PlayerSettingsSections(
                     selected = sleepTimerActive,
                     modifier = modifier,
                     onClick = onSleepTimerClick
+                )
+            }
+            if (onAskVideoClick != null) add { modifier ->
+                com.sentup.android.ui.player.OptionTile(
+                    icon = Icons.Rounded.QuestionAnswer,
+                    label = stringResource(R.string.vp_ask_video),
+                    selected = false,
+                    modifier = modifier,
+                    onClick = onAskVideoClick
+                )
+            }
+            if (onPowerToolsClick != null) add { modifier ->
+                com.sentup.android.ui.player.OptionTile(
+                    icon = Icons.Rounded.Bookmarks,
+                    label = "A-B / Notlar",
+                    selected = abLoopActive,
+                    modifier = modifier,
+                    onClick = onPowerToolsClick
                 )
             }
             if (showZoomToFill) add { modifier ->

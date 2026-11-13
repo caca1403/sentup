@@ -1,5 +1,7 @@
 package com.sentup.android.ui.settings
 import androidx.compose.ui.res.stringResource
+import androidx.compose.runtime.rememberCoroutineScope
+import kotlinx.coroutines.launch
 import com.sentup.android.R
 import kotlin.math.roundToInt
 
@@ -49,6 +51,7 @@ import androidx.compose.material.icons.rounded.CheckCircle
 import androidx.compose.material.icons.rounded.CloudOff
 import androidx.compose.material.icons.rounded.Contrast
 import androidx.compose.material.icons.rounded.Dashboard
+import androidx.compose.material.icons.rounded.DeleteOutline
 import androidx.compose.material.icons.rounded.DirectionsCar
 import androidx.compose.material.icons.rounded.FilterList
 import androidx.compose.material.icons.rounded.Bedtime
@@ -72,7 +75,9 @@ import androidx.compose.material.icons.rounded.Favorite
 import androidx.compose.material.icons.rounded.NotInterested
 import androidx.compose.material.icons.rounded.NotificationsActive
 import androidx.compose.material.icons.rounded.Palette
+import androidx.compose.material.icons.rounded.RadioButtonUnchecked
 import androidx.compose.material.icons.rounded.AutoAwesome
+import androidx.compose.material.icons.rounded.OndemandVideo
 import androidx.compose.material.icons.rounded.GridView
 import androidx.compose.material.icons.rounded.Insights
 import androidx.compose.material.icons.rounded.Person
@@ -81,6 +86,7 @@ import androidx.compose.material.icons.rounded.Save
 import androidx.compose.material.icons.rounded.Security
 import androidx.compose.material.icons.rounded.Subscriptions
 import androidx.compose.material.icons.rounded.ToggleOn
+import androidx.compose.material.icons.rounded.Tune
 import androidx.compose.material.icons.rounded.VideoLibrary
 import androidx.compose.material.icons.rounded.Visibility
 import androidx.compose.material.icons.rounded.ArrowDownward
@@ -1734,7 +1740,100 @@ internal fun VideoHomeSettingsPage(
     onMoveDestination: (VideoHomeDestination, Int) -> Unit,
     onBack: () -> Unit,
 ) {
+    val context = androidx.compose.ui.platform.LocalContext.current
+    val scope = rememberCoroutineScope()
+    val exploreRepo = remember(context) { com.sentup.android.data.ExploreListsRepository(context) }
+    val exploreLists by exploreRepo.lists.collectAsState()
+    val selectedExploreId by exploreRepo.selectedListId.collectAsState()
+    val localSubsRepo = remember(context) { com.sentup.android.data.LocalSubscriptionsRepository(context) }
+    val localSubs by localSubsRepo.subscriptions.collectAsState()
+    val availableChannels = remember(localSubs) {
+        val fromSubs = localSubs.map { ExploreChannelOption(it.channelId, it.name) }
+        val fromHistory = com.sentup.android.data.VideoHistoryRepository(context)
+            .getHistory()
+            .mapNotNull { item ->
+                val name = item.channelName.trim()
+                if (name.isEmpty()) null
+                else ExploreChannelOption(item.channelId?.takeIf { it.isNotBlank() } ?: name, name)
+            }
+        (fromSubs + fromHistory).distinctBy { it.idOrName }
+    }
+    var showExploreBuilder by remember { mutableStateOf(false) }
+    var editingExploreList by remember { mutableStateOf<com.sentup.android.data.ExploreList?>(null) }
+    var showUnifiedBackupDialog by remember { mutableStateOf(false) }
+
     SettingsDetailScaffold(title = stringResource(R.string.vhc_title), onBack = onBack) {
+        item {
+            val activeOrdered = configuration.destinationOrder.filter { it in configuration.visibleDestinations }
+            SettingsSection(title = stringResource(R.string.vhc_nav_preview_title)) {
+                SettingsCard {
+                    Column(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(14.dp),
+                        verticalArrangement = Arrangement.spacedBy(10.dp),
+                    ) {
+                        Text(
+                            text = stringResource(R.string.vhc_nav_preview_sub),
+                            style = MaterialTheme.typography.bodySmall,
+                            color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        )
+                        Surface(
+                            shape = RoundedCornerShape(22.dp),
+                            color = MaterialTheme.colorScheme.surfaceContainerHigh,
+                            modifier = Modifier.fillMaxWidth(),
+                        ) {
+                            Row(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .padding(horizontal = 8.dp, vertical = 10.dp),
+                                horizontalArrangement = Arrangement.SpaceEvenly,
+                                verticalAlignment = Alignment.CenterVertically,
+                            ) {
+                                activeOrdered.forEachIndexed { idx, dest ->
+                                    val label = when (dest) {
+                                        VideoHomeDestination.HOME -> stringResource(R.string.tab_home)
+                                        VideoHomeDestination.SEARCH -> stringResource(R.string.tab_search)
+                                        VideoHomeDestination.SUBSCRIPTIONS -> stringResource(R.string.tab_subs)
+                                        VideoHomeDestination.LIBRARY -> stringResource(R.string.tab_library)
+                                        VideoHomeDestination.EXPLORE -> stringResource(R.string.tab_explore)
+                                        VideoHomeDestination.SHORTS -> stringResource(R.string.tab_shorts)
+                                    }
+                                    val icon = when (dest) {
+                                        VideoHomeDestination.HOME -> Icons.Rounded.Home
+                                        VideoHomeDestination.SEARCH -> Icons.Rounded.Search
+                                        VideoHomeDestination.SUBSCRIPTIONS -> Icons.Rounded.Subscriptions
+                                        VideoHomeDestination.LIBRARY -> Icons.Rounded.VideoLibrary
+                                        VideoHomeDestination.EXPLORE -> Icons.Rounded.AutoAwesome
+                                        VideoHomeDestination.SHORTS -> Icons.Rounded.OndemandVideo
+                                    }
+                                    Column(
+                                        horizontalAlignment = Alignment.CenterHorizontally,
+                                        verticalArrangement = Arrangement.spacedBy(2.dp),
+                                        modifier = Modifier.weight(1f),
+                                    ) {
+                                        Icon(
+                                            imageVector = icon,
+                                            contentDescription = null,
+                                            tint = if (idx == 0) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant,
+                                            modifier = Modifier.size(20.dp),
+                                        )
+                                        Text(
+                                            text = "${idx + 1}. $label",
+                                            style = MaterialTheme.typography.labelSmall,
+                                            color = if (idx == 0) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant,
+                                            maxLines = 1,
+                                            overflow = TextOverflow.Ellipsis,
+                                        )
+                                    }
+                                }
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
         item {
             SettingsSection(title = stringResource(R.string.vhc_feed_section)) {
                 SettingsCard {
@@ -1765,8 +1864,123 @@ internal fun VideoHomeSettingsPage(
                             },
                             onMoveUp = { onMoveDestination(destination, -1) },
                             onMoveDown = { onMoveDestination(destination, 1) },
+                            onConfigure = if (destination == VideoHomeDestination.EXPLORE) {
+                                {
+                                    editingExploreList = exploreRepo.find(selectedExploreId)
+                                    showExploreBuilder = true
+                                }
+                            } else null,
                         )
                     }
+                }
+            }
+        }
+
+        item {
+            SettingsSection(title = stringResource(R.string.vhc_custom_explore_section)) {
+                SettingsCard {
+                    SettingsRow(
+                        icon = Icons.Rounded.AutoAwesome,
+                        title = stringResource(R.string.vhc_custom_explore_create),
+                        subtitle = stringResource(R.string.vhc_custom_explore_create_sub),
+                        onClick = {
+                            editingExploreList = null
+                            showExploreBuilder = true
+                        },
+                    )
+                    SettingsDivider()
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clickable { exploreRepo.select(null) }
+                            .padding(horizontal = 16.dp, vertical = 12.dp),
+                        verticalAlignment = Alignment.CenterVertically,
+                    ) {
+                        Icon(
+                            imageVector = if (selectedExploreId == null) Icons.Rounded.CheckCircle else Icons.Rounded.RadioButtonUnchecked,
+                            contentDescription = null,
+                            tint = if (selectedExploreId == null) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant,
+                            modifier = Modifier.size(20.dp),
+                        )
+                        Spacer(Modifier.width(12.dp))
+                        Text(
+                            text = stringResource(R.string.vhc_custom_explore_builtin),
+                            style = MaterialTheme.typography.bodyMedium,
+                            fontWeight = if (selectedExploreId == null) FontWeight.SemiBold else FontWeight.Normal,
+                            modifier = Modifier.weight(1f),
+                        )
+                    }
+                    exploreLists.forEach { list ->
+                        SettingsDivider()
+                        val isActive = list.id == selectedExploreId
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .clickable { exploreRepo.select(list.id) }
+                                .padding(start = 16.dp, end = 8.dp, top = 8.dp, bottom = 8.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                        ) {
+                            Icon(
+                                imageVector = if (isActive) Icons.Rounded.CheckCircle else Icons.Rounded.RadioButtonUnchecked,
+                                contentDescription = null,
+                                tint = if (isActive) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant,
+                                modifier = Modifier.size(20.dp),
+                            )
+                            Spacer(Modifier.width(12.dp))
+                            Column(modifier = Modifier.weight(1f)) {
+                                Text(
+                                    text = list.name,
+                                    style = MaterialTheme.typography.bodyLarge,
+                                    fontWeight = FontWeight.SemiBold,
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis,
+                                )
+                                val detailParts = buildList {
+                                    if (list.rules.channelIds.isNotEmpty()) add("${list.rules.channelIds.size} ch")
+                                    if (list.rules.includeWords.isNotEmpty()) add(list.rules.includeWords.joinToString(", "))
+                                    if (list.rules.length != com.sentup.android.data.ExploreLength.ANY) add(list.rules.length.id)
+                                    if (list.rules.freshness != com.sentup.android.data.ExploreFreshness.ANY) add(list.rules.freshness.id)
+                                }
+                                if (detailParts.isNotEmpty()) {
+                                    Text(
+                                        text = detailParts.joinToString(" · "),
+                                        style = MaterialTheme.typography.bodySmall,
+                                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                        maxLines = 1,
+                                        overflow = TextOverflow.Ellipsis,
+                                    )
+                                }
+                            }
+                            IconButton(
+                                onClick = {
+                                    editingExploreList = list
+                                    showExploreBuilder = true
+                                }
+                            ) {
+                                Icon(Icons.Rounded.Tune, contentDescription = null)
+                            }
+                            IconButton(
+                                onClick = {
+                                    scope.launch { exploreRepo.delete(list.id) }
+                                }
+                            ) {
+                                Icon(Icons.Rounded.DeleteOutline, contentDescription = null)
+                            }
+                        }
+                    }
+                }
+            }
+        }
+
+        item {
+            SettingsSection(title = stringResource(R.string.vhc_unified_backup_title)) {
+                SettingsCard {
+                    SettingsRow(
+                        icon = Icons.Rounded.Save,
+                        title = stringResource(R.string.vhc_unified_backup_title),
+                        subtitle = stringResource(R.string.vhc_unified_backup_sub),
+                        onClick = { showUnifiedBackupDialog = true },
+                    )
                 }
             }
         }
@@ -1780,6 +1994,116 @@ internal fun VideoHomeSettingsPage(
             )
         }
     }
+
+    if (showExploreBuilder) {
+        CustomExploreBuilderSheet(
+            editingList = editingExploreList,
+            availableChannels = availableChannels,
+            onSave = { name, rules ->
+                val target = editingExploreList
+                scope.launch {
+                    if (target == null) {
+                        exploreRepo.saveAsList(name, rules)
+                    } else {
+                        exploreRepo.rename(target.id, name)
+                        exploreRepo.updateRules(target.id, rules)
+                        exploreRepo.select(target.id)
+                    }
+                    showExploreBuilder = false
+                    editingExploreList = null
+                }
+            },
+            onDismiss = {
+                showExploreBuilder = false
+                editingExploreList = null
+            }
+        )
+    }
+
+    if (showUnifiedBackupDialog) {
+        UnifiedJsonBackupDialog(
+            context = context,
+            onDismiss = { showUnifiedBackupDialog = false }
+        )
+    }
+}
+
+@Composable
+private fun UnifiedJsonBackupDialog(
+    context: android.content.Context,
+    onDismiss: () -> Unit,
+) {
+    val scope = rememberCoroutineScope()
+    val clipboard = androidx.compose.ui.platform.LocalClipboardManager.current
+    var importText by remember { mutableStateOf("") }
+    var statusMessage by remember { mutableStateOf<String?>(null) }
+    val copiedMsg = stringResource(R.string.vhc_unified_copied)
+    val invalidMsg = stringResource(R.string.vhc_unified_invalid)
+    val importedTemplate = stringResource(R.string.vhc_unified_imported, 111, 222, 333)
+
+    androidx.compose.material3.AlertDialog(
+        onDismissRequest = onDismiss,
+        title = { Text(stringResource(R.string.vhc_unified_backup_title)) },
+        text = {
+            Column(verticalArrangement = Arrangement.spacedBy(10.dp)) {
+                Text(
+                    text = stringResource(R.string.vhc_unified_backup_sub),
+                    style = MaterialTheme.typography.bodySmall,
+                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                )
+                androidx.compose.material3.OutlinedButton(
+                    onClick = {
+                        val exported = com.sentup.android.data.UnifiedBackupJson.exportAll(context)
+                        clipboard.setText(androidx.compose.ui.text.AnnotatedString(exported))
+                        statusMessage = copiedMsg
+                    },
+                    modifier = Modifier.fillMaxWidth(),
+                ) {
+                    Text(stringResource(R.string.vhc_unified_copy))
+                }
+                androidx.compose.material3.OutlinedTextField(
+                    value = importText,
+                    onValueChange = { importText = it },
+                    label = { Text(stringResource(R.string.vhc_unified_import_hint)) },
+                    maxLines = 4,
+                    modifier = Modifier.fillMaxWidth(),
+                )
+                statusMessage?.let { msg ->
+                    Text(
+                        text = msg,
+                        style = MaterialTheme.typography.labelMedium,
+                        color = MaterialTheme.colorScheme.primary,
+                    )
+                }
+            }
+        },
+        confirmButton = {
+            androidx.compose.material3.Button(
+                onClick = {
+                    scope.launch {
+                        val res = com.sentup.android.data.UnifiedBackupJson.importAll(context, importText)
+                        if (res == null) {
+                            statusMessage = invalidMsg
+                        } else {
+                            statusMessage = importedTemplate
+                                .replace("111", res.importedSubscriptions.toString())
+                                .replace("222", res.importedFolders.toString())
+                                .replace("333", res.importedExploreLists.toString())
+                            importText = ""
+                        }
+                    }
+                },
+                enabled = importText.isNotBlank(),
+            ) {
+                Text(stringResource(R.string.vhc_unified_import_btn))
+            }
+        },
+        dismissButton = {
+            androidx.compose.material3.TextButton(onClick = onDismiss) {
+                Text(stringResource(android.R.string.cancel))
+            }
+        },
+    )
 }
 
 /**
@@ -1805,6 +2129,7 @@ private fun VideoHomeDestinationRow(
     onVisibleChange: (Boolean) -> Unit,
     onMoveUp: () -> Unit,
     onMoveDown: () -> Unit,
+    onConfigure: (() -> Unit)? = null,
 ) {
     val title = when (destination) {
         VideoHomeDestination.HOME -> stringResource(R.string.tab_home)
@@ -1812,6 +2137,7 @@ private fun VideoHomeDestinationRow(
         VideoHomeDestination.SUBSCRIPTIONS -> stringResource(R.string.tab_subs)
         VideoHomeDestination.LIBRARY -> stringResource(R.string.tab_library)
         VideoHomeDestination.EXPLORE -> stringResource(R.string.tab_explore)
+        VideoHomeDestination.SHORTS -> stringResource(R.string.tab_shorts)
     }
     val icon = when (destination) {
         VideoHomeDestination.HOME -> Icons.Rounded.Home
@@ -1819,6 +2145,7 @@ private fun VideoHomeDestinationRow(
         VideoHomeDestination.SUBSCRIPTIONS -> Icons.Rounded.Subscriptions
         VideoHomeDestination.LIBRARY -> Icons.Rounded.VideoLibrary
         VideoHomeDestination.EXPLORE -> Icons.Rounded.AutoAwesome
+        VideoHomeDestination.SHORTS -> Icons.Rounded.OndemandVideo
     }
     // The last visible destination cannot be hidden, so its row is not a toggle
     // either - a row that animates a press and then does nothing reads as a bug.
@@ -1857,6 +2184,15 @@ private fun VideoHomeDestinationRow(
             overflow = TextOverflow.Ellipsis,
             modifier = Modifier.weight(1f),
         )
+        if (onConfigure != null) {
+            IconButton(onClick = onConfigure) {
+                Icon(
+                    imageVector = Icons.Rounded.Tune,
+                    contentDescription = stringResource(R.string.vhc_custom_explore_create),
+                    tint = MaterialTheme.colorScheme.primary,
+                )
+            }
+        }
         DestinationStepper(
             icon = Icons.Rounded.ArrowUpward,
             contentDescription = stringResource(R.string.vhc_move_up, title),

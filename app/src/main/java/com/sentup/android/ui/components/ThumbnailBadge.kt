@@ -60,6 +60,15 @@ fun ThumbnailBadge(
 }
 
 /**
+ * The label color for content sitting on a `scrim`-tinted surface over video
+ * (the Shorts overlay's frosted chips). Same documented exception as
+ * [ThumbnailBadge]: M3 publishes no `onScrim`, so the white paired with the
+ * scrim's black is written once here for every surface that needs it.
+ */
+@Composable
+fun onScrimLabelColor(): Color = Color.White
+
+/**
  * The badge for a [VideoItem], drawing nothing when there is nothing honest to
  * say - an unknown duration on a VOD is blank rather than "0:00".
  */

@@ -1,5 +1,6 @@
 package com.sentup.android.ui.ai
 
+import androidx.activity.compose.BackHandler
 import androidx.compose.foundation.background
 import androidx.compose.foundation.clickable
 import androidx.compose.foundation.layout.Arrangement
@@ -21,11 +22,13 @@ import androidx.compose.foundation.lazy.grid.items
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
+import androidx.compose.material.icons.automirrored.rounded.ArrowBack
 import androidx.compose.material.icons.rounded.AutoAwesome
 import androidx.compose.material.icons.rounded.Close
 import androidx.compose.material.icons.rounded.PlayArrow
 import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.Icon
+import androidx.compose.material3.IconButton
 import androidx.compose.material3.MaterialTheme
 import androidx.compose.material3.Text
 import androidx.compose.runtime.Composable
@@ -106,14 +109,22 @@ fun InsightsScreen(
     // memory, so current() costs nothing.
     val excluded = taste.excludedArtists
 
+    BackHandler(onBack = onBack)
+
     Column(modifier = modifier.fillMaxSize().sentupPage()) {
         // Header
         Row(
             modifier = Modifier
                 .fillMaxWidth()
-                .padding(start = SentupGroup.inset, end = SentupGroup.inset, top = 20.dp, bottom = 8.dp),
+                .padding(start = 6.dp, end = SentupGroup.inset, top = 16.dp, bottom = 8.dp),
             verticalAlignment = Alignment.CenterVertically
         ) {
+            IconButton(onClick = onBack) {
+                Icon(
+                    imageVector = Icons.AutoMirrored.Rounded.ArrowBack,
+                    contentDescription = "Back"
+                )
+            }
             Icon(
                 imageVector = Icons.Rounded.AutoAwesome,
                 contentDescription = null,

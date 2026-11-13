@@ -41,6 +41,7 @@ import androidx.compose.foundation.layout.windowInsetsPadding
 import androidx.compose.foundation.pager.VerticalPager
 import androidx.compose.foundation.pager.rememberPagerState
 import androidx.compose.foundation.shape.CircleShape
+import com.sentup.android.ui.components.onScrimLabelColor
 import com.sentup.android.ui.theme.SentupDivider
 import com.sentup.android.ui.theme.SentupGroup
 import com.sentup.android.ui.theme.SentupGroupCard
@@ -539,10 +540,9 @@ fun ShortsPlayerOverlay(
                     val capsule = playerPillShape()
                     Row(
                         modifier = Modifier
-                            .sentupCard(shape = capsule, elevation = 2)
-                            .sentupSpecularEdge(capsule)
                             .sentupPressScale(channelPress)
                             .clip(capsule)
+                            .background(MaterialTheme.colorScheme.scrim.copy(alpha = 0.42f))
                             .then(
                                 if (channelId != null) {
                                     Modifier.clickable(
@@ -584,7 +584,7 @@ fun ShortsPlayerOverlay(
                             text = video.channelName,
                             style = MaterialTheme.typography.titleSmall,
                             fontWeight = FontWeight.SemiBold,
-                            color = MaterialTheme.colorScheme.onSurface,
+                            color = onScrimLabelColor(),
                             maxLines = 1,
                             overflow = TextOverflow.Ellipsis,
                             modifier = Modifier.weight(1f, fill = false)
@@ -611,13 +611,12 @@ fun ShortsPlayerOverlay(
                     val titleShape = RoundedCornerShape(SentupRadii.card)
                     Column(
                         modifier = Modifier
-                            .sentupCard(shape = titleShape, elevation = 2)
-                            .sentupSpecularEdge(titleShape)
+                            .clip(titleShape)
+                            .background(MaterialTheme.colorScheme.scrim.copy(alpha = 0.42f))
                             .then(
                                 if (hasMore) {
                                     Modifier
                                         .sentupPressScale(titlePress)
-                                        .clip(titleShape)
                                         .clickable(
                                             interactionSource = titlePress,
                                             indication = null
@@ -631,7 +630,7 @@ fun ShortsPlayerOverlay(
                         Text(
                             text = video.title,
                             style = MaterialTheme.typography.bodyMedium,
-                            color = MaterialTheme.colorScheme.onSurface,
+                            color = onScrimLabelColor(),
                             maxLines = 2,
                             overflow = TextOverflow.Ellipsis
                         )
@@ -641,7 +640,7 @@ fun ShortsPlayerOverlay(
                                 Text(
                                     text = stats,
                                     style = MaterialTheme.typography.labelMedium,
-                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    color = onScrimLabelColor().copy(alpha = 0.72f),
                                     maxLines = 1,
                                     overflow = TextOverflow.Ellipsis,
                                     modifier = Modifier.weight(1f, fill = false)
@@ -650,7 +649,7 @@ fun ShortsPlayerOverlay(
                                 Icon(
                                     imageVector = Icons.Rounded.ExpandMore,
                                     contentDescription = null,
-                                    tint = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    tint = onScrimLabelColor().copy(alpha = 0.72f),
                                     modifier = Modifier.size(16.dp)
                                 )
                             }
@@ -671,7 +670,7 @@ fun ShortsPlayerOverlay(
                     ShortsAction(
                         icon = if (likeStatus == LikeStatus.LIKE) Icons.Rounded.ThumbUp
                             else Icons.Outlined.ThumbUp,
-                        label = engagement?.likeCount ?: stringResource(R.string.like),
+                        count = engagement?.likeCount,
                         active = likeStatus == LikeStatus.LIKE,
                         contentDescription = stringResource(R.string.like),
                         onClick = { requireLogin { viewModel.toggleLike() } }
@@ -681,7 +680,6 @@ fun ShortsPlayerOverlay(
                     ShortsAction(
                         icon = if (likeStatus == LikeStatus.DISLIKE) Icons.Rounded.ThumbDown
                             else Icons.Outlined.ThumbDown,
-                        label = stringResource(R.string.sp_action_dislike),
                         active = likeStatus == LikeStatus.DISLIKE,
                         contentDescription = stringResource(R.string.cd_dislike),
                         onClick = { requireLogin { viewModel.toggleDislike() } }
@@ -690,7 +688,6 @@ fun ShortsPlayerOverlay(
                 if (ThemePreferences.SHORTS_ACTION_COMMENTS !in hiddenActions) {
                     ShortsAction(
                         icon = Icons.Rounded.ChatBubble,
-                        label = stringResource(R.string.cd_comments),
                         contentDescription = stringResource(R.string.cd_comments),
                         onClick = {
                             viewModel.ensureCommentsLoaded()
@@ -701,7 +698,6 @@ fun ShortsPlayerOverlay(
                 if (ThemePreferences.SHORTS_ACTION_SHARE !in hiddenActions) {
                     ShortsAction(
                         icon = Icons.Rounded.Share,
-                        label = stringResource(R.string.video_options_share),
                         contentDescription = stringResource(R.string.video_options_share),
                         onClick = {
                             val videoId = currentVideo?.videoId ?: return@ShortsAction
@@ -729,7 +725,6 @@ fun ShortsPlayerOverlay(
                 if (ThemePreferences.SHORTS_ACTION_NOT_INTERESTED !in hiddenActions) {
                     ShortsAction(
                         icon = Icons.Rounded.NotInterested,
-                        label = stringResource(R.string.video_options_not_interested),
                         contentDescription = stringResource(R.string.video_options_not_interested),
                         // Opens a chooser rather than acting straight away: this
                         // button sits in a rail the thumb rests on while
@@ -793,7 +788,10 @@ fun ShortsPlayerOverlay(
             onOpenAuthor = { channelId ->
                 showCommentsSheet = false
                 onOpenChannel(channelId)
-            }
+            },
+            // Opened over the Short on screen: one flat surface, no page tone
+            // and no card inside a card.
+            immersive = true
         )
     }
 
@@ -879,49 +877,55 @@ fun ShortsPlayerOverlay(
 @Composable
 private fun ShortsAction(
     icon: ImageVector,
-    label: String,
     contentDescription: String,
     active: Boolean = false,
+    count: String? = null,
     onClick: () -> Unit,
     onLongClick: (() -> Unit)? = null
 ) {
     val interactionSource = remember { MutableInteractionSource() }
-    val shape = playerPillShape()
 
-    Column(
-        horizontalAlignment = Alignment.CenterHorizontally,
-        modifier = Modifier
-            .sentupPressScale(interactionSource)
-            .sentupCard(shape = shape, elevation = 2)
-            .sentupSpecularEdge(shape)
-            .clip(shape)
-            .combinedClickable(
-                interactionSource = interactionSource,
-                indication = null,
-                onClick = onClick,
-                onLongClick = onLongClick
+    // Frosted-glass rail: a translucent scrim circle per action, the same
+    // idiom the queue-artwork overlay and thumbnails use over video. The
+    // opaque cards these replaced floated as grey tiles on top of the frame
+    // and read as a settings list; a scrim chip belongs to the picture.
+    // Icon-only - the one text kept is a number, which is data, not a name.
+    Column(horizontalAlignment = Alignment.CenterHorizontally) {
+        Box(
+            contentAlignment = Alignment.Center,
+            modifier = Modifier
+                .size(44.dp)
+                .sentupPressScale(interactionSource)
+                .clip(CircleShape)
+                .background(MaterialTheme.colorScheme.scrim.copy(alpha = 0.36f))
+                .combinedClickable(
+                    interactionSource = interactionSource,
+                    indication = null,
+                    onClick = onClick,
+                    onLongClick = onLongClick
+                )
+        ) {
+            Icon(
+                imageVector = icon,
+                contentDescription = contentDescription,
+                tint = if (active) MaterialTheme.colorScheme.primary
+                    else onScrimLabelColor(),
+                modifier = Modifier.size(23.dp)
             )
-            .padding(horizontal = 11.dp, vertical = 9.dp)
-    ) {
-        Icon(
-            imageVector = icon,
-            contentDescription = contentDescription,
-            tint = if (active) MaterialTheme.colorScheme.primary
-                else MaterialTheme.colorScheme.onSurface,
-            modifier = Modifier.size(22.dp)
-        )
-        Spacer(modifier = Modifier.height(3.dp))
-        Text(
-            text = label,
-            style = MaterialTheme.typography.labelSmall,
-            fontWeight = FontWeight.Medium,
-            color = if (active) MaterialTheme.colorScheme.primary
-                else MaterialTheme.colorScheme.onSurfaceVariant,
-            maxLines = 1,
-            overflow = TextOverflow.Ellipsis,
-            textAlign = TextAlign.Center,
-            modifier = Modifier.widthIn(max = 68.dp)
-        )
+        }
+        if (count != null) {
+            Spacer(modifier = Modifier.height(4.dp))
+            Text(
+                text = count,
+                style = MaterialTheme.typography.labelSmall,
+                fontWeight = FontWeight.SemiBold,
+                color = onScrimLabelColor().copy(alpha = 0.92f),
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis,
+                textAlign = TextAlign.Center,
+                modifier = Modifier.widthIn(max = 52.dp)
+            )
+        }
     }
 }
 

@@ -1937,9 +1937,7 @@ class VideoPlayerViewModel(application: android.app.Application) : AndroidViewMo
         val connectivity = context.getSystemService(Context.CONNECTIVITY_SERVICE)
             as? android.net.ConnectivityManager ?: return false
         val capabilities = connectivity.getNetworkCapabilities(connectivity.activeNetwork)
-            ?: return false
-        return capabilities.hasCapability(android.net.NetworkCapabilities.NET_CAPABILITY_INTERNET) &&
-            capabilities.hasCapability(android.net.NetworkCapabilities.NET_CAPABILITY_VALIDATED)
+        return com.sentup.android.data.VpnResilientNetwork.isNetworkUsable(capabilities)
     }
 
     /** HTTP status behind a source error, or null when it was not an HTTP failure. */

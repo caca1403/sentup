@@ -21,6 +21,8 @@ import androidx.compose.foundation.layout.padding
 import androidx.compose.foundation.layout.size
 import androidx.compose.foundation.layout.width
 import androidx.compose.foundation.lazy.LazyColumn
+import androidx.compose.foundation.lazy.LazyRow
+import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
@@ -31,6 +33,7 @@ import androidx.compose.material.icons.rounded.DeleteOutline
 import androidx.compose.material.icons.rounded.Favorite
 import androidx.compose.material.icons.rounded.ModeComment
 import androidx.compose.material.icons.rounded.PushPin
+import androidx.compose.material.icons.rounded.Search
 import androidx.compose.material.icons.rounded.ThumbUp
 import androidx.compose.material.icons.rounded.Verified
 import androidx.compose.material3.AlertDialog
@@ -119,6 +122,12 @@ fun CommentsPanel(
     onDismiss: () -> Unit,
     modifier: Modifier = Modifier,
     /**
+     * Flat treatment for sheets opened over the players (Shorts, watch page):
+     * no page-tone fill, no inner card - one flat surface instead of a box
+     * inside a box, which is what read as cluttered above the video.
+     */
+    immersive: Boolean = false,
+    /**
      * Seek the player, in seconds, when a comment's timestamp is tapped.
      * Null (the Shorts sheet) renders timestamps as ordinary text.
      */
@@ -160,6 +169,8 @@ fun CommentsPanel(
     // The order the thread is shown in. Saved, so a rotation does not silently
     // put back the one the user just rearranged.
     var order by rememberSaveable { mutableStateOf(CommentOrder.TOP) }
+    var searchQuery by rememberSaveable { mutableStateOf("") }
+    var filterMode by rememberSaveable { mutableStateOf(CommentFilterMode.ALL) }
 
     // Reorders what has already loaded; the pinned ones stay at the top under
     // either choice, because a pin is the creator speaking, not a ranking.
@@ -172,6 +183,9 @@ fun CommentsPanel(
             )
         }
     }
+    val filteredComments = remember(ordered, searchQuery, filterMode) {
+        VideoToolsEngine.filterComments(ordered, searchQuery, filterMode)
+    }
 
     Surface(
         shape = RoundedCornerShape(topStart = SentupRadii.panel, topEnd = SentupRadii.panel),
@@ -183,7 +197,7 @@ fun CommentsPanel(
         Column(
             modifier = Modifier
                 .fillMaxSize()
-                .sentupPage()
+                .then(if (immersive) Modifier else Modifier.sentupPage())
                 .imePadding()
         ) {
             VideoSheetTitleBar(
@@ -215,7 +229,7 @@ fun CommentsPanel(
                     modifier = Modifier
                         .fillMaxWidth()
                         .padding(horizontal = SentupGroup.inset)
-                        .padding(bottom = 12.dp),
+                        .padding(bottom = 8.dp),
                     horizontalArrangement = Arrangement.spacedBy(8.dp)
                 ) {
                     VideoSegmentPill(
@@ -229,6 +243,50 @@ fun CommentsPanel(
                         onClick = { order = CommentOrder.NEW }
                     )
                 }
+
+                OutlinedTextField(
+                    value = searchQuery,
+                    onValueChange = { searchQuery = it },
+                    singleLine = true,
+                    placeholder = { Text("Yorumlarda ara…") },
+                    leadingIcon = {
+                        Icon(Icons.Rounded.Search, contentDescription = null)
+                    },
+                    trailingIcon = {
+                        if (searchQuery.isNotEmpty()) {
+                            androidx.compose.material3.IconButton(onClick = { searchQuery = "" }) {
+                                Icon(Icons.Rounded.Close, contentDescription = null)
+                            }
+                        }
+                    },
+                    shape = RoundedCornerShape(14.dp),
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = SentupGroup.inset)
+                        .padding(bottom = 8.dp)
+                )
+
+                LazyRow(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .padding(horizontal = SentupGroup.inset)
+                        .padding(bottom = 10.dp),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    val modes = listOf(
+                        CommentFilterMode.ALL to "Tümü",
+                        CommentFilterMode.TIMESTAMPS to "Zaman Damgalı",
+                        CommentFilterMode.QUESTIONS to "Sorular",
+                        CommentFilterMode.PINNED_OR_HEARTED to "Sabitli / Kalpli",
+                    )
+                    items(modes) { (mode, label) ->
+                        VideoSegmentPill(
+                            label = label,
+                            selected = filterMode == mode,
+                            onClick = { filterMode = mode }
+                        )
+                    }
+                }
             }
 
             Box(
@@ -236,10 +294,16 @@ fun CommentsPanel(
                     .weight(1f)
                     .fillMaxWidth()
                     .padding(horizontal = SentupGroup.inset)
-                    .sentupCard(
-                        shape = RoundedCornerShape(SentupRadii.card),
-                        elevation = 0,
-                        tinted = false
+                    .then(
+                        if (immersive) {
+                            Modifier
+                        } else {
+                            Modifier.sentupCard(
+                                shape = RoundedCornerShape(SentupRadii.card),
+                                elevation = 0,
+                                tinted = false
+                            )
+                        }
                     )
             ) {
                 when {
@@ -278,8 +342,8 @@ fun CommentsPanel(
                                 vertical = 6.dp
                             )
                         ) {
-                            items(ordered.size, key = { ordered[it].commentId }) { index ->
-                                val comment = ordered[index]
+                            items(filteredComments.size, key = { filteredComments[it].commentId }) { index ->
+                                val comment = filteredComments[index]
                                 Column {
                                     CommentRow(
                                         comment = comment,
@@ -492,6 +556,8 @@ fun CommentsSheet(
     onOpenAuthor: ((channelId: String) -> Unit)? = null,
     heightFraction: Float = 0.65f,
     header: (@Composable () -> Unit)? = null,
+    /** Flat, single-surface treatment for sheets opened over the players. */
+    immersive: Boolean = false,
     unavailableMessage: String = "Comments are unavailable for this video"
 ) {
     ModalBottomSheet(
@@ -520,6 +586,7 @@ fun CommentsSheet(
             onDismiss = onDismiss,
             onOpenAuthor = onOpenAuthor,
             header = header,
+            immersive = immersive,
             unavailableMessage = unavailableMessage,
             modifier = Modifier
                 .fillMaxHeight(heightFraction)

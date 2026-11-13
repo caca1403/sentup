@@ -1317,6 +1317,7 @@ fun MusicApp(
                     }
                 }
                 HomeScreen(
+                    onShortsFeedLoaded = { items -> shortsPlayerViewModel.preloadFeed(items) },
                     compactVideoHome = compactVideoHome,
                     inlinePreviews = inlinePreviews,
                     onWatchAsVideo = moveMusicToVideo,

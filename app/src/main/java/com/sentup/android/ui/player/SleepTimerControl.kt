@@ -46,14 +46,17 @@ internal fun rememberSleepTimerControl(
 ): SleepTimerControl {
     val endsAt by viewModel.sleepTimerEndsAt.collectAsState()
     val endOfTrack by viewModel.sleepTimerEndOfTrack.collectAsState()
+    val tracksRemaining by viewModel.sleepTimerTracksRemaining.collectAsState()
     var showSheet by remember { mutableStateOf(false) }
 
     if (showSheet) {
         SleepTimerSheet(
             endsAt = endsAt,
             endOfTrack = endOfTrack,
+            tracksRemaining = tracksRemaining,
             onStartMinutes = { viewModel.startSleepTimer(it) },
             onStartEndOfTrack = { viewModel.startSleepTimerEndOfTrack() },
+            onStartTracks = { viewModel.startSleepTimerTracks(it) },
             onCancel = { viewModel.cancelSleepTimer() },
             onDismiss = { showSheet = false },
             accent = accent,
@@ -64,7 +67,7 @@ internal fun rememberSleepTimerControl(
     }
 
     return SleepTimerControl(
-        active = endsAt != null || endOfTrack,
+        active = endsAt != null || endOfTrack || tracksRemaining > 0,
         open = { showSheet = true }
     )
 }

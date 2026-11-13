@@ -24,7 +24,17 @@ enum class VideoHomeDestination(val tabId: Int, val storageId: String) {
      * would silently become a different screen for everyone who had already
      * chosen where it goes.
      */
-    EXPLORE(4, "explore");
+    EXPLORE(4, "explore"),
+
+    /**
+     * The Shorts swipe player as its own destination. Tapping it opens the
+     * full-screen swipe feed directly; when the feed closes, the tab keeps a
+     * plain grid of the same items.
+     *
+     * Id 5 for the same reason EXPLORE took 4: stored ids are frozen, so a new
+     * destination appends and never shifts.
+     */
+    SHORTS(5, "shorts");
 
     companion object {
         val defaultOrder: List<VideoHomeDestination> = entries.toList()
@@ -356,6 +366,9 @@ class ThemePreferences(context: Context) {
     private val _libraryAlbumSort = MutableStateFlow(prefs.getString(KEY_LIBRARY_ALBUM_SORT, null))
     val libraryAlbumSort: StateFlow<String?> = _libraryAlbumSort.asStateFlow()
 
+    private val _pinnedMusicChannels = MutableStateFlow(getPinnedMusicChannelsPreference())
+    val pinnedMusicChannels: StateFlow<Set<String>> = _pinnedMusicChannels.asStateFlow()
+
     // The Subscriptions feed's own controls. Persisted for the reason the
     // Library sort is: they were held in composition state, and the tab lives
     // inside Home's AnimatedContent, so leaving the tab disposed the state and
@@ -535,6 +548,7 @@ class ThemePreferences(context: Context) {
             KEY_LIBRARY_TAB -> _libraryTab.value = getLibraryTabPreference()
             KEY_LIBRARY_ARTIST_SORT -> _libraryArtistSort.value = prefs.getString(KEY_LIBRARY_ARTIST_SORT, null)
             KEY_LIBRARY_ALBUM_SORT -> _libraryAlbumSort.value = prefs.getString(KEY_LIBRARY_ALBUM_SORT, null)
+            KEY_PINNED_MUSIC_CHANNELS -> _pinnedMusicChannels.value = getPinnedMusicChannelsPreference()
             KEY_SUBSCRIPTION_FEED_PERIOD ->
                 _subscriptionFeedPeriod.value = getSubscriptionFeedPeriodPreference()
             KEY_SUBSCRIPTION_FEED_ORDER ->
@@ -609,7 +623,7 @@ class ThemePreferences(context: Context) {
          * the mark, the notification and the app read as one thing; the
          * wallpaper option is still under Settings for whoever wants it.
          */
-        const val DEFAULT_COLOR_PALETTE = "emerald"
+        const val DEFAULT_COLOR_PALETTE = "dynamic"
         private const val KEY_LOAD_LOCAL_SONGS = "load_local_songs"
         /** One-shot marker for [migrateLoadLocalSongsDefault]. */
         private const val KEY_LOAD_LOCAL_SONGS_DEFAULT_MIGRATED =
@@ -699,7 +713,7 @@ class ThemePreferences(context: Context) {
          * stored set is the authority again.
          */
         private val DESTINATIONS_ADDED_AFTER_KNOWN_KEY =
-            setOf(VideoHomeDestination.EXPLORE)
+            setOf(VideoHomeDestination.EXPLORE, VideoHomeDestination.SHORTS)
         private const val KEY_PLAYER_STYLE = "player_style"
         private const val KEY_SAVE_VIDEO_HISTORY = "save_video_history"
         private const val KEY_SAVE_MUSIC_HISTORY = "save_music_history"
@@ -1139,6 +1153,7 @@ class ThemePreferences(context: Context) {
         private const val KEY_LIBRARY_TAB = "library_tab"
         private const val KEY_LIBRARY_ARTIST_SORT = "library_artist_sort"
         private const val KEY_LIBRARY_ALBUM_SORT = "library_album_sort"
+        private const val KEY_PINNED_MUSIC_CHANNELS = "pinned_music_channels"
         private const val KEY_SUBSCRIPTION_FEED_PERIOD = "subscription_feed_period"
         private const val KEY_SUBSCRIPTION_FEED_ORDER = "subscription_feed_order"
         private const val KEY_HIDE_WATCHED_IN_FEED = "hide_watched_in_feed"
@@ -2829,6 +2844,21 @@ class ThemePreferences(context: Context) {
     fun setLibraryAlbumSort(sortName: String) {
         prefs.edit().putString(KEY_LIBRARY_ALBUM_SORT, sortName).apply()
         _libraryAlbumSort.value = sortName
+    }
+
+    private fun getPinnedMusicChannelsPreference(): Set<String> =
+        prefs.getStringSet(KEY_PINNED_MUSIC_CHANNELS, emptySet())?.toSet() ?: emptySet()
+
+    /** Pins or unpins a channel folder in the Music Library's Channel -> Album -> Song browser. */
+    fun togglePinnedMusicChannel(channelName: String) {
+        val normalized = channelName.trim()
+        if (normalized.isEmpty()) return
+        val updated = _pinnedMusicChannels.value.toMutableSet()
+        if (!updated.add(normalized)) {
+            updated.remove(normalized)
+        }
+        prefs.edit().putStringSet(KEY_PINNED_MUSIC_CHANNELS, updated).apply()
+        _pinnedMusicChannels.value = updated
     }
 
     private fun getSubscriptionFeedPeriodPreference(): String =

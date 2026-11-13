@@ -7,180 +7,112 @@
             android:viewportWidth="108"
             android:viewportHeight="108">
 
-            <!-- The whole mark, for the closing pulse. Pivot is the icon centre. -->
+            <!-- Active Sentüp mark: squircle tile + 5 rounded equalizer bars. -->
             <group
                 android:name="pulse_group"
                 android:pivotX="54"
                 android:pivotY="54"
-                android:scaleX="1"
-                android:scaleY="1">
+                android:scaleX="0.85"
+                android:scaleY="0.85">
 
-                <!-- ============ TUBE BODY ============ -->
-                <!-- Drops in with a half-turn of rotation. -->
+                <path
+                    android:fillColor="#051A08"
+                    android:pathData="M34,20 H74 A14,14 0 0 1 88,34 V74 A14,14 0 0 1 74,88 H34 A14,14 0 0 1 20,74 V34 A14,14 0 0 1 34,20 Z" />
+
                 <group
-                    android:name="body_group"
-                    android:pivotX="56"
-                    android:pivotY="58"
-                    android:scaleX="0"
-                    android:scaleY="0"
-                    android:rotation="-30">
-
+                    android:name="bars_outer"
+                    android:pivotX="54"
+                    android:pivotY="54"
+                    android:scaleY="0.4">
                     <path
-                        android:fillColor="#DAD8CD"
-                        android:pathData="M56,30A12,12 0 0 1 68,42V74A12,12 0 0 1 56,86A12,12 0 0 1 44,74V42A12,12 0 0 1 56,30Z" />
+                        android:fillColor="#00000000"
+                        android:strokeColor="#E8F5E9"
+                        android:strokeWidth="6"
+                        android:strokeLineCap="round"
+                        android:pathData="M30,45 V63 M78,45 V63" />
                 </group>
 
-                <!-- ============ LID ============ -->
-                <!-- Screws down onto the tube from above. -->
                 <group
-                    android:name="cap_group"
-                    android:pivotX="56"
-                    android:pivotY="29"
-                    android:scaleX="0"
-                    android:scaleY="0"
-                    android:translateY="-60">
-
+                    android:name="bars_mid"
+                    android:pivotX="54"
+                    android:pivotY="54"
+                    android:scaleY="0.4">
                     <path
-                        android:fillColor="#DAD8CC"
-                        android:pathData="M45,24H67A5,5 0 0 1 72,29A5,5 0 0 1 67,34H45A5,5 0 0 1 40,29A5,5 0 0 1 45,24Z" />
+                        android:fillColor="#00000000"
+                        android:strokeColor="#E8F5E9"
+                        android:strokeWidth="6"
+                        android:strokeLineCap="round"
+                        android:pathData="M42,39 V69 M66,39 V69" />
                 </group>
 
-                <!-- ============ PLAY TRIANGLE ============ -->
-                <!-- Swings into place from the left. -->
                 <group
-                    android:name="play_group"
-                    android:pivotX="49"
-                    android:pivotY="58"
-                    android:scaleX="0"
-                    android:scaleY="0"
-                    android:rotation="-90">
-
+                    android:name="bar_center"
+                    android:pivotX="54"
+                    android:pivotY="54"
+                    android:scaleY="0.4">
                     <path
-                        android:fillColor="#372DA9"
-                        android:pathData="M49,48L49,68L63,58Z" />
+                        android:fillColor="#00000000"
+                        android:strokeColor="#E8F5E9"
+                        android:strokeWidth="6"
+                        android:strokeLineCap="round"
+                        android:pathData="M54,33 V75" />
                 </group>
-
             </group>
         </vector>
     </aapt:attr>
 
-    <!-- ========== TUBE BODY: scale in with overshoot (0-300ms) ========== -->
-    <target android:name="body_group">
-        <aapt:attr name="android:animation">
-            <set>
-                <objectAnimator
-                    android:propertyName="scaleX"
-                    android:valueFrom="0"
-                    android:valueTo="1"
-                    android:duration="300"
-                    android:interpolator="@android:interpolator/overshoot" />
-                <objectAnimator
-                    android:propertyName="scaleY"
-                    android:valueFrom="0"
-                    android:valueTo="1"
-                    android:duration="300"
-                    android:interpolator="@android:interpolator/overshoot" />
-                <objectAnimator
-                    android:propertyName="rotation"
-                    android:valueFrom="-30"
-                    android:valueTo="0"
-                    android:duration="300"
-                    android:interpolator="@android:interpolator/overshoot" />
-            </set>
-        </aapt:attr>
-    </target>
-
-    <!-- ========== LID: screws down from above (100-400ms) ========== -->
-    <target android:name="cap_group">
-        <aapt:attr name="android:animation">
-            <set>
-                <objectAnimator
-                    android:propertyName="scaleX"
-                    android:valueFrom="0"
-                    android:valueTo="1"
-                    android:startOffset="100"
-                    android:duration="300"
-                    android:interpolator="@android:interpolator/overshoot" />
-                <objectAnimator
-                    android:propertyName="scaleY"
-                    android:valueFrom="0"
-                    android:valueTo="1"
-                    android:startOffset="100"
-                    android:duration="300"
-                    android:interpolator="@android:interpolator/overshoot" />
-                <objectAnimator
-                    android:propertyName="translateY"
-                    android:valueFrom="-60"
-                    android:valueTo="0"
-                    android:startOffset="100"
-                    android:duration="300"
-                    android:interpolator="@android:interpolator/overshoot" />
-            </set>
-        </aapt:attr>
-    </target>
-
-    <!-- ========== PLAY TRIANGLE: swings in from -90 deg (200-500ms) ========== -->
-    <target android:name="play_group">
-        <aapt:attr name="android:animation">
-            <set>
-                <objectAnimator
-                    android:propertyName="scaleX"
-                    android:valueFrom="0"
-                    android:valueTo="1"
-                    android:startOffset="200"
-                    android:duration="300"
-                    android:interpolator="@android:interpolator/overshoot" />
-                <objectAnimator
-                    android:propertyName="scaleY"
-                    android:valueFrom="0"
-                    android:valueTo="1"
-                    android:startOffset="200"
-                    android:duration="300"
-                    android:interpolator="@android:interpolator/overshoot" />
-                <objectAnimator
-                    android:propertyName="rotation"
-                    android:valueFrom="-90"
-                    android:valueTo="0"
-                    android:startOffset="200"
-                    android:duration="300"
-                    android:interpolator="@android:interpolator/overshoot" />
-            </set>
-        </aapt:attr>
-    </target>
-
-    <!-- ========== FINAL PULSE: the whole mark breathes (500-760ms) ========== -->
     <target android:name="pulse_group">
         <aapt:attr name="android:animation">
             <set>
                 <objectAnimator
                     android:propertyName="scaleX"
-                    android:valueFrom="1"
-                    android:valueTo="1.08"
-                    android:startOffset="500"
-                    android:duration="120"
-                    android:interpolator="@android:interpolator/accelerate_decelerate" />
+                    android:valueFrom="0.85"
+                    android:valueTo="1"
+                    android:duration="380"
+                    android:interpolator="@android:interpolator/overshoot" />
                 <objectAnimator
                     android:propertyName="scaleY"
-                    android:valueFrom="1"
-                    android:valueTo="1.08"
-                    android:startOffset="500"
-                    android:duration="120"
-                    android:interpolator="@android:interpolator/accelerate_decelerate" />
-                <objectAnimator
-                    android:propertyName="scaleX"
-                    android:valueFrom="1.08"
+                    android:valueFrom="0.85"
                     android:valueTo="1"
-                    android:startOffset="620"
-                    android:duration="140"
-                    android:interpolator="@android:interpolator/decelerate_cubic" />
-                <objectAnimator
-                    android:propertyName="scaleY"
-                    android:valueFrom="1.08"
-                    android:valueTo="1"
-                    android:startOffset="620"
-                    android:duration="140"
-                    android:interpolator="@android:interpolator/decelerate_cubic" />
+                    android:duration="380"
+                    android:interpolator="@android:interpolator/overshoot" />
             </set>
+        </aapt:attr>
+    </target>
+
+    <target android:name="bars_outer">
+        <aapt:attr name="android:animation">
+            <objectAnimator
+                android:propertyName="scaleY"
+                android:valueFrom="0.4"
+                android:valueTo="1"
+                android:startOffset="100"
+                android:duration="350"
+                android:interpolator="@android:interpolator/overshoot" />
+        </aapt:attr>
+    </target>
+
+    <target android:name="bars_mid">
+        <aapt:attr name="android:animation">
+            <objectAnimator
+                android:propertyName="scaleY"
+                android:valueFrom="0.4"
+                android:valueTo="1"
+                android:startOffset="160"
+                android:duration="350"
+                android:interpolator="@android:interpolator/overshoot" />
+        </aapt:attr>
+    </target>
+
+    <target android:name="bar_center">
+        <aapt:attr name="android:animation">
+            <objectAnimator
+                android:propertyName="scaleY"
+                android:valueFrom="0.4"
+                android:valueTo="1"
+                android:startOffset="220"
+                android:duration="350"
+                android:interpolator="@android:interpolator/overshoot" />
         </aapt:attr>
     </target>
 </animated-vector>

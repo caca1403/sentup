@@ -252,29 +252,49 @@ fun ExploreContent(
                 )
             }
 
-            // Live YouTube first: the page opens on what is actually
-            // happening, not on an empty filter of things you own.
-            discover.forEach { shelf ->
-                item(key = "disc_" + shelf.id + "_header") {
-                    ExploreShelfHeader(
-                        title = stringResource(R.string.explore_discover_trending),
-                        shelf = shelf,
-                        onOpenChannel = onOpenChannel,
-                        onPlayAll = onPlayShelf
-                    )
-                }
-                videoListItems(
-                    videos = shelf.videos,
-                    layout = listLayout,
-                    keyPrefix = "disc_" + shelf.id + "_"
-                ) { video, cell ->
-                    ExploreVideoCard(
-                        video = video,
-                        modifier = cell,
-                        onVideoClick = onVideoClick,
-                        onLongPress = onEnqueueVideo,
-                        onOpenChannel = onOpenChannel
-                    )
+            // Empty-by-default & tutorial when no custom Explore list exists yet.
+            if (lists.isEmpty() && selectedListId == null) {
+                item(key = "explore_tutorial_card") {
+                    Surface(
+                        shape = RoundedCornerShape(24.dp),
+                        color = MaterialTheme.colorScheme.surfaceContainerHigh,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(horizontal = 16.dp, vertical = 8.dp)
+                    ) {
+                        Column(
+                            modifier = Modifier.padding(20.dp),
+                            verticalArrangement = Arrangement.spacedBy(10.dp)
+                        ) {
+                            Icon(
+                                imageVector = Icons.Rounded.AutoAwesome,
+                                contentDescription = null,
+                                tint = MaterialTheme.colorScheme.primary,
+                                modifier = Modifier.size(32.dp)
+                            )
+                            Text(
+                                text = stringResource(R.string.explore_tutorial_title),
+                                style = MaterialTheme.typography.titleLarge,
+                                fontWeight = FontWeight.Bold
+                            )
+                            Text(
+                                text = stringResource(R.string.explore_tutorial_sub),
+                                style = MaterialTheme.typography.bodyMedium,
+                                color = MaterialTheme.colorScheme.onSurfaceVariant
+                            )
+                            Text(stringResource(R.string.explore_tutorial_step1), style = MaterialTheme.typography.bodySmall)
+                            Text(stringResource(R.string.explore_tutorial_step2), style = MaterialTheme.typography.bodySmall)
+                            Text(stringResource(R.string.explore_tutorial_step3), style = MaterialTheme.typography.bodySmall)
+                            Spacer(Modifier.height(4.dp))
+                            Button(
+                                onClick = { showFilters = true },
+                                shape = RoundedCornerShape(999.dp),
+                                modifier = Modifier.fillMaxWidth()
+                            ) {
+                                Text(stringResource(R.string.explore_tutorial_cta))
+                            }
+                        }
+                    }
                 }
             }
 

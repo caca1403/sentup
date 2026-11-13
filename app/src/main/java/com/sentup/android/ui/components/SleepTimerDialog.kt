@@ -72,6 +72,8 @@ fun SleepTimerSheet(
     onStartEndOfTrack: () -> Unit,
     onCancel: () -> Unit,
     onDismiss: () -> Unit,
+    tracksRemaining: Int = 0,
+    onStartTracks: ((Int) -> Unit)? = null,
     accent: Color = MaterialTheme.colorScheme.primary,
     onAccent: Color = MaterialTheme.colorScheme.onPrimary,
     container: Color = MaterialTheme.colorScheme.surfaceContainerHigh,
@@ -126,7 +128,16 @@ fun SleepTimerSheet(
 
             Spacer(modifier = Modifier.height(20.dp))
 
-            if (endOfTrack) {
+            if (tracksRemaining > 0) {
+                SleepTimerStatus(
+                    headline = stringResource(R.string.sleep_timer_status_tracks, tracksRemaining),
+                    detail = stringResource(R.string.sleep_timer_detail_tracks),
+                    accent = accent,
+                    onContainer = onContainer
+                )
+                Spacer(modifier = Modifier.height(20.dp))
+                TurnOffButton(onCancel, accent, onAccent)
+            } else if (endOfTrack) {
                 SleepTimerStatus(
                     headline = statusMediaHeadline ?: stringResource(R.string.sleep_timer_status_track),
                     detail = endOfMediaDetail ?: stringResource(R.string.sleep_timer_detail_track),
@@ -208,6 +219,32 @@ fun SleepTimerSheet(
                                 style = MaterialTheme.typography.titleSmall,
                                 fontWeight = FontWeight.SemiBold
                             )
+                        }
+                    }
+
+                    if (onStartTracks != null) {
+                        Text(
+                            text = stringResource(R.string.sleep_timer_after_tracks),
+                            style = MaterialTheme.typography.labelMedium,
+                            color = onContainer.copy(alpha = 0.72f),
+                            modifier = Modifier.padding(top = 4.dp)
+                        )
+                        Row(
+                            modifier = Modifier.fillMaxWidth(),
+                            horizontalArrangement = Arrangement.spacedBy(10.dp)
+                        ) {
+                            listOf(2, 3, 5).forEach { count ->
+                                FilledTonalButton(
+                                    onClick = { onStartTracks(count) },
+                                    modifier = Modifier.weight(1f),
+                                    colors = ButtonDefaults.filledTonalButtonColors(
+                                        containerColor = accent.copy(alpha = 0.16f),
+                                        contentColor = onContainer
+                                    )
+                                ) {
+                                    Text(stringResource(R.string.sleep_timer_tracks_chip, count))
+                                }
+                            }
                         }
                     }
                 }
