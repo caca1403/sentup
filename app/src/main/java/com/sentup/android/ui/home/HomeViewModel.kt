@@ -1606,9 +1606,11 @@ class HomeViewModel(application: Application) : AndroidViewModel(application) {
             return
         }
         if (subscriptionFeedAttempted && !force) return
-        // An explicit refresh during a hold must not spend the requests either:
-        // say so instead, and leave whatever is already on screen alone.
-        if (com.sentup.android.data.YouTubeRateLimit.isHeld()) {
+        // An explicit user refresh (e.g. after toggling VPN) clears any local
+        // hold so the user can always retry against YouTube directly.
+        if (force) {
+            com.sentup.android.data.YouTubeRateLimit.clear()
+        } else if (com.sentup.android.data.YouTubeRateLimit.isHeld()) {
             _subscriptionFeedError.value = rateLimitMessage()
             return
         }

@@ -125,7 +125,11 @@ internal class YouTubeHttp(
         sessionManager.noteSessionExpired(session, !loggedIn)
     }
 
-    private companion object {
+    internal companion object {
+        fun evictConnections() {
+            sharedConnectionPool.evictAll()
+        }
+
         // A backstop on one NewPipe request, and generous on purpose: this
         // downloader serves search, playlists and channel pages, whose
         // responses are far larger than a /player call and which had no

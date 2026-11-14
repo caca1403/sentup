@@ -79,6 +79,9 @@ object YouTubeRequestLedger : Interceptor {
         // A response served entirely from OkHttp's disk cache never reached
         // YouTube, so it is not traffic YouTube can hold against us.
         if (response.networkResponse == null) return response
+        if (response.isSuccessful && YouTubeRateLimit.isHeld()) {
+            YouTubeRateLimit.clear()
+        }
         record(key, failure = response.code.takeIf { it !in 200..399 }?.toString())
         return response
     }

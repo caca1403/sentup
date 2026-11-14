@@ -113,15 +113,23 @@ class NetworkChangeWatcher(context: Context, private val onChanged: () -> Unit) 
     @Volatile
     private var current: Network? = null
 
+    @Volatile
+    private var currentIsVpn: Boolean = false
+
     fun start() {
         if (callback != null || manager == null) return
-        current = manager.activeNetwork
+        val active = manager.activeNetwork
+        current = active
+        currentIsVpn = active
+            ?.let { manager.getNetworkCapabilities(it) }
+            ?.hasTransport(NetworkCapabilities.TRANSPORT_VPN) == true
         val watch = object : ConnectivityManager.NetworkCallback() {
             override fun onCapabilitiesChanged(network: Network, capabilities: NetworkCapabilities) {
-                if (network == current ||
-                    !capabilities.hasCapability(NetworkCapabilities.NET_CAPABILITY_VALIDATED)
-                ) return
+                if (!VpnResilientNetwork.isNetworkUsable(capabilities)) return
+                val isVpn = capabilities.hasTransport(NetworkCapabilities.TRANSPORT_VPN)
+                if (network == current && isVpn == currentIsVpn) return
                 current = network
+                currentIsVpn = isVpn
                 onChanged()
             }
         }

@@ -6,8 +6,12 @@ import coil.ImageLoaderFactory
 import com.sentup.android.data.CrashReporter
 import com.sentup.android.data.LocalVideoThumbnail
 import com.sentup.android.data.LocalVideoThumbnailFetcher
+import com.sentup.android.data.NetworkChangeWatcher
+import com.sentup.android.data.YouTubeRepository
 
 class SentupApplication : Application(), ImageLoaderFactory {
+
+    private var networkChangeWatcher: NetworkChangeWatcher? = null
 
     override fun onCreate() {
         super.onCreate()
@@ -15,6 +19,11 @@ class SentupApplication : Application(), ImageLoaderFactory {
         // file to offer on the next launch. It wraps - never replaces - the
         // platform handler.
         CrashReporter.install(this)
+        // Clear rate-limit / bot-check holds and stale sockets whenever the
+        // device switches networks or toggles a VPN, even when no player is open.
+        networkChangeWatcher = NetworkChangeWatcher(this) {
+            YouTubeRepository.forgetConnectionVerdicts()
+        }.also { it.start() }
         // Reconcile the persisted periodic job with the user's current opt-in.
         // The setting handler does the same immediately when the value changes.
         com.sentup.android.work.UploadCheckWorker.sync(this)

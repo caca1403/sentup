@@ -158,6 +158,7 @@ class YouTubeRepository(private val context: Context) {
             BotCheckVerdict.reset()
             YouTubeRateLimit.clear()
             VideoStreamResolutionCache.clear()
+            YouTubeHttp.evictConnections()
         }
 
         /**
