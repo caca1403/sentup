@@ -4,6 +4,11 @@ All notable changes to **Sentüp** are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [Semantic Versioning](https://semver.org/).
 
+## [13.0]
+
+### Fixed
+- **Kitaplık DNA'sı Kart Düzeni (`LibraryDnaCard`)** — Dar ekranlarda istatistik metinlerinin (`%0 çevrimdışı`, `çalınmamış`) butonlarla sıkışıp dikey kırılmasını önlemek için kart iki satırlı düzene alındı (üstte istatistikler, altta eylem butonları).
+
 ## [12.0]
 
 ### Added
