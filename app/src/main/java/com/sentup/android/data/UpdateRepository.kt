@@ -67,7 +67,7 @@ class UpdateRepository {
             val request = Request.Builder()
                 .url(url)
                 .header("Accept", "application/vnd.github.v3+json")
-                .header("User-Agent", "Sentüp-Android")
+                .header("User-Agent", "Sentup-Android")
                 .build()
 
             return client.newCall(request).execute().use { response ->

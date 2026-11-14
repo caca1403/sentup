@@ -31,8 +31,8 @@ android {
         // platform did not gain until API 33.
         minSdk = 30
         targetSdk = 36
-        versionCode = 43
-        versionName = "13.0"
+        versionCode = 44
+        versionName = "13.1"
         manifestPlaceholders["appLabel"] = "@string/app_name"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
