@@ -4,6 +4,16 @@ All notable changes to **Sentüp** are documented here. The format follows
 [Keep a Changelog](https://keepachangelog.com/en/1.1.0/) and the project uses
 [Semantic Versioning](https://semver.org/).
 
+## [12.0]
+
+### Added
+- **Neural Audio Lab** — DSP / audio feature analysis, mood & discovery, sensor/environment awareness, and sequence/bandit recommendation engines (`NeuralLabSheet`, `AudioFeatureAndDspEngine`, `MoodAndDiscoveryEngine`, `SensorAndEnvironmentEngine`, `SequenceAndBanditEngine`).
+- **Custom Explore & Library Folder Hierarchy** — user-defined Explore builder (`CustomExploreBuilderSheet`), hierarchical library folders (`CustomFolderStore`, `CustomFolderBrowser`, `LibraryFolderHierarchy`, `LibraryFoldersAndMixes`), and track customization/cleaner tools (`TrackCustomizationStore`, `TrackToolsAndCleanerSheets`).
+- **Unified Backup (`UnifiedBackupJson`)** — unified JSON backup/restore support covering library/custom folder data and customizations.
+- **VPN-Resilient Networking (`VpnResilientNetwork`)** — network resilience improvements for YouTube/HTTP requests behind VPNs.
+- **YouTube / Video Power Tools & Q&A** — 3x super speed, focus mode, timestamp sharing, extractive summary, and video Q&A (`VideoPowerToolsSheet`, `VideoQaSheet`, `VideoQaEngine`, `VideoToolsEngine`).
+- **Automated Signed Release Workflow** — `.github/workflows/build.yml` workflow for building and publishing signed APKs on `v*` tags.
+
 ## [5.2]
 
 ### Added
