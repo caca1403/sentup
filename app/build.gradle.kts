@@ -31,8 +31,8 @@ android {
         // platform did not gain until API 33.
         minSdk = 30
         targetSdk = 36
-        versionCode = 45
-        versionName = "13.2"
+        versionCode = 46
+        versionName = "13.3"
         manifestPlaceholders["appLabel"] = "@string/app_name"
 
         testInstrumentationRunner = "androidx.test.runner.AndroidJUnitRunner"
@@ -96,9 +96,9 @@ android {
             // widgets, media session and sign-in state during testing.
             applicationIdSuffix = ".debug"
             versionNameSuffix = "-debug"
-            // The launcher label stays "Sentüp" (the localized app_name); the
-            // debug marker lives only in the suffixes above, not in the name.
-            manifestPlaceholders["appLabel"] = "@string/app_name"
+            // Debug gets its own launcher label so a sideloaded test build is
+            // tellable apart from the installed release it sits beside.
+            manifestPlaceholders["appLabel"] = "debugsentüp"
         }
         release {
             signingConfig = signingConfigs.getByName("release")

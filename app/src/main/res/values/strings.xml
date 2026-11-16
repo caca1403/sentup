@@ -961,7 +961,7 @@
     <string name="explore_empty_title">Nothing matches these rules</string>
     <string name="explore_empty_sub">Loosen a filter, or start one of the lists below.</string>
     <string name="explore_nothing_title">Nothing to explore yet</string>
-    <string name="explore_nothing_sub">Subscribe to a channel or watch something, and this fills up on its own.</string>
+    <string name="explore_nothing_sub">Create a list from one of the starting points below.</string>
     <string name="explore_failed_title">Couldn\'t load your videos</string>
     <string name="explore_failed_sub">Pull down to try again.</string>
     <string name="explore_shelf_default">For you</string>
@@ -2822,6 +2822,7 @@
     <string name="lib_picker_tab_artists">Artists</string>
     <string name="lib_picker_tab_albums">Albums</string>
     <string name="lib_picker_tab_songs">Songs</string>
+    <string name="lib_picker_yt_preview">YouTube Music preview</string>
     <string name="lib_mix_artist_spotlight">%1$s Mix</string>
     <string name="lib_mix_artist_spotlight_sub">Your top artist\'s best tracks</string>
     <string name="lib_mix_forgotten">Forgotten Favorites</string>

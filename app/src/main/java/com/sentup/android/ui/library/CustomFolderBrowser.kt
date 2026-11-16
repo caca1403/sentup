@@ -48,6 +48,7 @@ import androidx.compose.material.icons.rounded.Shuffle
 import androidx.compose.material.icons.rounded.Tune
 import androidx.compose.material3.AlertDialog
 import androidx.compose.material3.Button
+import androidx.compose.material3.CircularProgressIndicator
 import androidx.compose.material3.DropdownMenu
 import androidx.compose.material3.DropdownMenuItem
 import androidx.compose.material3.ExperimentalMaterial3Api
@@ -67,6 +68,7 @@ import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.LaunchedEffect
 import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
@@ -75,21 +77,28 @@ import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
 import androidx.compose.ui.graphics.Color
+import androidx.compose.ui.layout.ContentScale
 import androidx.compose.ui.res.pluralStringResource
 import androidx.compose.ui.res.stringResource
 import androidx.compose.ui.text.font.FontWeight
 import androidx.compose.ui.text.style.TextOverflow
 import androidx.compose.ui.unit.dp
+import coil.compose.AsyncImage
 import com.sentup.android.R
+import com.sentup.android.data.ArtistItem
 import com.sentup.android.data.CustomFolderTree
 import com.sentup.android.data.MusicFolder
+import com.sentup.android.data.PlaylistDisplayItem
 import com.sentup.android.data.Song
+import com.sentup.android.data.googleImageAtSize
 import com.sentup.android.data.isUnknownAlbum
 import com.sentup.android.data.isUnknownArtist
 import com.sentup.android.data.sortedInAlbumOrder
+import com.sentup.android.ui.home.HomeViewModel
 import com.sentup.android.ui.theme.SentupGroup
 import com.sentup.android.ui.theme.SentupRadii
 import java.util.Locale
+import kotlinx.coroutines.delay
 
 enum class FolderSourceTab {
     Custom,
@@ -876,6 +885,8 @@ private enum class FolderContentPickerTab { Artists, Albums, Songs }
 fun PickContentForFolderSheet(
     targetFolder: MusicFolder,
     allSongs: List<Song>,
+    /** Runs the same live YouTube Music search the main search screen runs. */
+    viewModel: HomeViewModel,
     onConfirm: (artists: List<String>, albums: List<String>, songIds: List<String>) -> Unit,
     onDismiss: () -> Unit
 ) {
@@ -930,6 +941,55 @@ fun PickContentForFolderSheet(
                 it.album.lowercase(Locale.ROOT).contains(q)
         }
     }
+
+    // Live YouTube Music preview - the same search the main music search
+    // runs, scoped to the active tab (Artists / Albums / Songs). Typing past
+    // two characters pulls YouTube results in after the same 500 ms debounce,
+    // so a folder can be filled from things that are not on the device yet.
+    // The preview is best-effort: offline or refused, the local filter above
+    // stays the only list and nothing here crashes the sheet.
+    var ytPreviewLoading by remember { mutableStateOf(false) }
+    var ytArtists by remember { mutableStateOf<List<ArtistItem>>(emptyList()) }
+    var ytAlbums by remember { mutableStateOf<List<PlaylistDisplayItem>>(emptyList()) }
+    var ytSongs by remember { mutableStateOf<List<Song>>(emptyList()) }
+
+    LaunchedEffect(query, activeTab) {
+        val onlineQuery = query.trim()
+        if (onlineQuery.length < 2) {
+            ytArtists = emptyList()
+            ytAlbums = emptyList()
+            ytSongs = emptyList()
+            ytPreviewLoading = false
+            return@LaunchedEffect
+        }
+        // Only the active tab's list is allowed to linger; the other two
+        // would otherwise resurface whenever the user flips back mid-word.
+        when (activeTab) {
+            FolderContentPickerTab.Artists -> {
+                ytAlbums = emptyList(); ytSongs = emptyList()
+            }
+            FolderContentPickerTab.Albums -> {
+                ytArtists = emptyList(); ytSongs = emptyList()
+            }
+            FolderContentPickerTab.Songs -> {
+                ytArtists = emptyList(); ytAlbums = emptyList()
+            }
+        }
+        ytPreviewLoading = true
+        delay(500) // Same debounce as the main search.
+        try {
+            when (activeTab) {
+                FolderContentPickerTab.Artists -> ytArtists = viewModel.searchArtists(onlineQuery)
+                FolderContentPickerTab.Albums -> ytAlbums = viewModel.searchAlbums(onlineQuery)
+                FolderContentPickerTab.Songs -> ytSongs = viewModel.searchYouTube(onlineQuery)
+            }
+        } catch (_: Exception) {
+            // Network refused or offline: keep whatever is local.
+        }
+        ytPreviewLoading = false
+    }
+
+    val ytPreviewVisible = query.trim().length >= 2
 
     ModalBottomSheet(onDismissRequest = onDismiss) {
         Column(
@@ -1071,12 +1131,47 @@ fun PickContentForFolderSheet(
             LazyColumn(modifier = Modifier.heightIn(max = 360.dp)) {
                 when (activeTab) {
                     FolderContentPickerTab.Artists -> {
+                        if (ytPreviewVisible) {
+                            item(key = "yt_head_ar") {
+                                FolderPickerSectionHeader(
+                                    title = stringResource(R.string.lib_picker_yt_preview),
+                                    isLoading = ytPreviewLoading
+                                )
+                            }
+                            items(ytArtists, key = { "yt_ar_${it.id}" }) { artist ->
+                                val artistName = artist.name.trim()
+                                val checked = selectedArtists.any { it.equals(artistName, ignoreCase = true) }
+                                PickerCheckRow(
+                                    title = artistName,
+                                    subtitle = artist.subscriberCount ?: "",
+                                    checked = checked,
+                                    thumbnailUrl = artist.thumbnailUrl,
+                                    roundArt = true,
+                                    onToggle = {
+                                        selectedArtists = if (checked) {
+                                            selectedArtists.filterNot { it.equals(artistName, ignoreCase = true) }.toSet()
+                                        } else {
+                                            selectedArtists + artistName
+                                        }
+                                    }
+                                )
+                            }
+                            if (artistEntries.isNotEmpty()) {
+                                item(key = "local_head_ar") {
+                                    FolderPickerSectionHeader(
+                                        title = stringResource(R.string.source_local_library),
+                                        isLoading = false
+                                    )
+                                }
+                            }
+                        }
                         items(artistEntries, key = { "pick_ar_${it.key}" }) { (artistName, songs) ->
                             val checked = artistName in selectedArtists
                             PickerCheckRow(
                                 title = artistName,
                                 subtitle = pluralStringResource(R.plurals.n_songs, songs.size, songs.size),
                                 checked = checked,
+                                roundArt = true,
                                 onToggle = {
                                     selectedArtists = if (checked) selectedArtists - artistName else selectedArtists + artistName
                                 }
@@ -1084,6 +1179,39 @@ fun PickContentForFolderSheet(
                         }
                     }
                     FolderContentPickerTab.Albums -> {
+                        if (ytPreviewVisible) {
+                            item(key = "yt_head_al") {
+                                FolderPickerSectionHeader(
+                                    title = stringResource(R.string.lib_picker_yt_preview),
+                                    isLoading = ytPreviewLoading
+                                )
+                            }
+                            items(ytAlbums, key = { "yt_al_${it.id}" }) { album ->
+                                val albumName = album.name.trim()
+                                val checked = selectedAlbums.any { it.equals(albumName, ignoreCase = true) }
+                                PickerCheckRow(
+                                    title = albumName,
+                                    subtitle = album.uploaderName,
+                                    checked = checked,
+                                    thumbnailUrl = album.thumbnailUrl,
+                                    onToggle = {
+                                        selectedAlbums = if (checked) {
+                                            selectedAlbums.filterNot { it.equals(albumName, ignoreCase = true) }.toSet()
+                                        } else {
+                                            selectedAlbums + albumName
+                                        }
+                                    }
+                                )
+                            }
+                            if (albumEntries.isNotEmpty()) {
+                                item(key = "local_head_al") {
+                                    FolderPickerSectionHeader(
+                                        title = stringResource(R.string.source_local_library),
+                                        isLoading = false
+                                    )
+                                }
+                            }
+                        }
                         items(albumEntries, key = { "pick_al_${it.key}" }) { (albumName, songs) ->
                             val checked = albumName in selectedAlbums
                             val artistLabel = songs.firstOrNull()?.artist.orEmpty()
@@ -1091,6 +1219,7 @@ fun PickContentForFolderSheet(
                                 title = albumName,
                                 subtitle = "$artistLabel · " + pluralStringResource(R.plurals.n_songs, songs.size, songs.size),
                                 checked = checked,
+                                thumbnailUrl = songs.firstOrNull()?.let { it.thumbnailUrl ?: it.albumArtUri?.toString() },
                                 onToggle = {
                                     selectedAlbums = if (checked) selectedAlbums - albumName else selectedAlbums + albumName
                                 }
@@ -1098,12 +1227,41 @@ fun PickContentForFolderSheet(
                         }
                     }
                     FolderContentPickerTab.Songs -> {
+                        if (ytPreviewVisible) {
+                            item(key = "yt_head_so") {
+                                FolderPickerSectionHeader(
+                                    title = stringResource(R.string.lib_picker_yt_preview),
+                                    isLoading = ytPreviewLoading
+                                )
+                            }
+                            items(ytSongs, key = { "yt_song_${it.id}" }) { song ->
+                                val checked = song.id in selectedSongIds
+                                PickerCheckRow(
+                                    title = song.title,
+                                    subtitle = song.artist,
+                                    checked = checked,
+                                    thumbnailUrl = song.thumbnailUrl,
+                                    onToggle = {
+                                        selectedSongIds = if (checked) selectedSongIds - song.id else selectedSongIds + song.id
+                                    }
+                                )
+                            }
+                            if (filteredSongs.isNotEmpty()) {
+                                item(key = "local_head_so") {
+                                    FolderPickerSectionHeader(
+                                        title = stringResource(R.string.source_local_library),
+                                        isLoading = false
+                                    )
+                                }
+                            }
+                        }
                         items(filteredSongs, key = { "pick_song_${it.id}" }) { song ->
                             val checked = song.id in selectedSongIds
                             PickerCheckRow(
                                 title = song.title,
                                 subtitle = "${song.artist} · ${song.album}",
                                 checked = checked,
+                                thumbnailUrl = song.thumbnailUrl ?: song.albumArtUri?.toString(),
                                 onToggle = {
                                     selectedSongIds = if (checked) selectedSongIds - song.id else selectedSongIds + song.id
                                 }
@@ -1117,12 +1275,43 @@ fun PickContentForFolderSheet(
     }
 }
 
+/**
+ * The small section label inside the folder content picker: the live
+ * "YouTube Music preview" header and, below it, the "From your library"
+ * divider. The spinner rides on the preview header only.
+ */
+@Composable
+private fun FolderPickerSectionHeader(title: String, isLoading: Boolean) {
+    Row(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(top = 8.dp, bottom = 2.dp),
+        verticalAlignment = Alignment.CenterVertically
+    ) {
+        Text(
+            text = title,
+            style = MaterialTheme.typography.labelMedium,
+            fontWeight = FontWeight.SemiBold,
+            color = MaterialTheme.colorScheme.primary,
+            modifier = Modifier.weight(1f)
+        )
+        if (isLoading) {
+            CircularProgressIndicator(
+                modifier = Modifier.size(14.dp),
+                strokeWidth = 2.dp
+            )
+        }
+    }
+}
+
 @Composable
 private fun PickerCheckRow(
     title: String,
     subtitle: String,
     checked: Boolean,
-    onToggle: () -> Unit
+    onToggle: () -> Unit,
+    thumbnailUrl: String? = null,
+    roundArt: Boolean = false,
 ) {
     Row(
         modifier = Modifier
@@ -1138,6 +1327,7 @@ private fun PickerCheckRow(
             contentDescription = null,
             tint = if (checked) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant
         )
+        PickerRowArtwork(url = thumbnailUrl, round = roundArt)
         Column(modifier = Modifier.weight(1f)) {
             Text(title, maxLines = 1, overflow = TextOverflow.Ellipsis, fontWeight = FontWeight.Medium)
             Text(
@@ -1150,3 +1340,39 @@ private fun PickerCheckRow(
         }
     }
 }
+
+/**
+ * The artwork slot of a picker row. Every row carries one: a device entry with
+ * no cover still reserves the space, so YouTube and local rows line up in the
+ * same column. Google images are asked for at the size they are drawn, and an
+ * artist wears a circle while a release wears a rounded square.
+ */
+@Composable
+private fun PickerRowArtwork(url: String?, round: Boolean) {
+    Box(
+        modifier = Modifier
+            .size(40.dp)
+            .clip(if (round) CircleShape else RoundedCornerShape(8.dp))
+            .background(MaterialTheme.colorScheme.surfaceContainerHighest),
+        contentAlignment = Alignment.Center
+    ) {
+        if (url.isNullOrBlank()) {
+            Icon(
+                imageVector = if (round) Icons.Rounded.Person else Icons.Rounded.MusicNote,
+                contentDescription = null,
+                modifier = Modifier.size(18.dp),
+                tint = MaterialTheme.colorScheme.onSurfaceVariant
+            )
+        } else {
+            AsyncImage(
+                model = googleImageAtSize(url, PICKER_ART_PX),
+                contentDescription = null,
+                modifier = Modifier.matchParentSize(),
+                contentScale = ContentScale.Crop
+            )
+        }
+    }
+}
+
+/** A 40dp slot on the densest supported screen. */
+private const val PICKER_ART_PX = 132

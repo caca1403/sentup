@@ -562,15 +562,9 @@ private fun ExploreListRow(
         horizontalArrangement = Arrangement.spacedBy(10.dp),
         modifier = Modifier.fillMaxWidth()
     ) {
-        item(key = "explore_default_card") {
-            ExploreListCard(
-                name = stringResource(R.string.explore_default_list),
-                summary = stringResource(R.string.explore_default_list_sub),
-                selected = selectedListId == null,
-                onClick = { onSelect(null) },
-                modifier = Modifier.width(176.dp)
-            )
-        }
+        // No built-in card: every list here is one the user created. An empty
+        // store shows only the add tile, and the empty state below the
+        // list row carries the presets.
         items(lists, key = { it.id }) { list ->
             var menuOpen by remember { mutableStateOf(false) }
             ExploreListCard(

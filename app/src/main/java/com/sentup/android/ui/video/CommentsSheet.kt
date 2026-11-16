@@ -189,8 +189,14 @@ fun CommentsPanel(
 
     Surface(
         shape = RoundedCornerShape(topStart = SentupRadii.panel, topEnd = SentupRadii.panel),
-        // The page tone paints itself below; a fill here would cover it.
-        color = androidx.compose.ui.graphics.Color.Transparent,
+        // The page tone paints itself below; a fill here would cover it. Over
+        // a player (immersive) nothing paints below the sheet - it would sit
+        // fully transparent on top of the video - so the sheet fills itself.
+        color = if (immersive) {
+            MaterialTheme.colorScheme.surface
+        } else {
+            androidx.compose.ui.graphics.Color.Transparent
+        },
         contentColor = MaterialTheme.colorScheme.onSurface,
         modifier = modifier
     ) {

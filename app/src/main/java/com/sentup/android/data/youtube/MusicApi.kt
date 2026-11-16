@@ -54,13 +54,33 @@ internal class MusicApi(
 
     /** Read a page. Null when the request could not be made or came back empty. */
     fun postMusicMetadata(endpoint: String, payload: JSONObject): JSONObject? {
-        val body = call(
+        val session = sessionManager.captureSession()
+        var body = call(
             endpoint = endpoint,
             body = payload,
-            session = sessionManager.captureSession(),
+            session = session,
             retryTransient = true,
-        ) ?: return null
-        return runCatching { JSONObject(body) }.getOrNull()?.takeUnless { it.has("error") }
+        )
+        // One anonymous retry, and only when a session was rejected. Reads
+        // need no account at all, so a session Google refused - rotated
+        // cookies, a hash the origin no longer accepts, a 200 that answers
+        // with an `error` body - must not become an empty search page: a
+        // poisoned login would hide every album and song result while the
+        // signed-out request next to it answers 200 with the shelf. One
+        // warning line keeps that session visible in a bug report.
+        fun rejected(text: String?): Boolean =
+            text == null || runCatching { JSONObject(text).has("error") }.getOrDefault(false)
+        if (session != null && rejected(body)) {
+            KLog.w(YOUTUBE_TAG, "Music $endpoint rejected the session; retrying anonymously")
+            val anonymous = call(
+                endpoint = endpoint,
+                body = payload,
+                session = null,
+                retryTransient = true,
+            )
+            if (!rejected(anonymous)) body = anonymous
+        }
+        return body?.let { runCatching { JSONObject(it) }.getOrNull() }?.takeUnless { it.has("error") }
     }
 
     /**

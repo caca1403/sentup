@@ -1710,6 +1710,7 @@ private fun LibrarySingleFlow(
         PickContentForFolderSheet(
             targetFolder = target,
             allSongs = librarySongs,
+            viewModel = viewModel,
             onConfirm = { chosenArtists, chosenAlbums, chosenSongIds ->
                 customFolderStore.setFolderContent(
                     folderId = target.id,

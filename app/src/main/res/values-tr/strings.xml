@@ -984,7 +984,7 @@
     <string name="explore_empty_title">Bu kurallara uyan bir şey yok</string>
     <string name="explore_empty_sub">Bir filtreyi gevşet ya da aşağıdaki listelerden birine başla.</string>
     <string name="explore_nothing_title">Henüz keşfedilecek bir şey yok</string>
-    <string name="explore_nothing_sub">Bir kanala abone ol ya da bir şeyler izle, kendiliğinden dolar.</string>
+    <string name="explore_nothing_sub">Aşağıdaki hazır şablonlardan biriyle liste oluşturarak başla.</string>
     <string name="explore_failed_title">Videoların yüklenemedi</string>
     <string name="explore_failed_sub">Aşağı çekip tekrar dene.</string>
     <string name="explore_shelf_default">Senin için</string>
@@ -2671,6 +2671,7 @@
     <string name="lib_picker_tab_artists">Sanatçılar</string>
     <string name="lib_picker_tab_albums">Albümler</string>
     <string name="lib_picker_tab_songs">Şarkılar</string>
+    <string name="lib_picker_yt_preview">YouTube Music önizlemesi</string>
     <string name="lib_mix_artist_spotlight">%1$s Miksi</string>
     <string name="lib_mix_artist_spotlight_sub">En çok dinlediğin sanatçıdan seçkiler</string>
     <string name="lib_mix_forgotten">Unutulan Favoriler</string>

@@ -230,6 +230,16 @@ class ExploreViewModel(application: Application) : AndroidViewModel(application)
      */
     fun load(force: Boolean = false) {
         if (loadJob?.isActive == true) return
+        // No list is open: the tab is user-created only. The built-in default
+        // rules no longer answer shelves on their own - the screen holds the
+        // tutorial card and the presets instead, and creating or opening a
+        // list is what turns content on.
+        if (listsRepository.selectedListId.value == null) {
+            _shelves.value = emptyList()
+            _hasLoaded.value = true
+            _isLoading.value = false
+            return
+        }
         val active = _rules.value
         publishChannels()
         val missing = active.sources.filterNot { it in gathered }.toSet()
@@ -274,11 +284,12 @@ class ExploreViewModel(application: Application) : AndroidViewModel(application)
     }
 
     /**
-     * Open [listId], or the built-in rules when it is null.
+     * Open [listId], or clear the screen when it is null.
      *
      * The selection is written to the store rather than kept here, so returning
      * to the tab lands on the list that was open - the same "coming back is not
-     * a reset" rule the Home feed follows.
+     * a reset" rule the Home feed follows. Null shows nothing: the tab is
+     * user-created only, and there is no built-in list to fall back to.
      */
     fun selectList(listId: String?) {
         listsRepository.select(listId)
@@ -313,7 +324,13 @@ class ExploreViewModel(application: Application) : AndroidViewModel(application)
 
     fun saveAsList(name: String) {
         val rules = _rules.value
-        viewModelScope.launch { listsRepository.saveAsList(name, rules) }
+        viewModelScope.launch {
+            listsRepository.saveAsList(name, rules)
+            // Saving selects the new list, and only a load turns it into
+            // shelves: with the default view gone, this is the moment the
+            // screen fills for a list built from an empty tab.
+            load()
+        }
     }
 
     /**
@@ -333,7 +350,16 @@ class ExploreViewModel(application: Application) : AndroidViewModel(application)
     }
 
     fun createFromPreset(preset: ExplorePreset, name: String) {
-        viewModelScope.launch { listsRepository.createFromPreset(preset, name) }
+        viewModelScope.launch {
+            val id = listsRepository.createFromPreset(preset, name)
+            // The opened list's rules are the preset's, not whatever the editor
+            // happened to be holding: the chips and isDirty read them from
+            // here, so a fresh list must not arrive already marked as edited.
+            id?.let { listId ->
+                listsRepository.find(listId)?.rules?.let { _rules.value = it }
+            }
+            load()
+        }
     }
 
     /** Write the on-screen rules back into the open list. */
@@ -484,6 +510,13 @@ class ExploreViewModel(application: Application) : AndroidViewModel(application)
      * *recording*, and an Explore list reads history rather than writing to it.
      */
     private fun rebuild() {
+        // The same empty guard [load] keeps, here too: resetRules and an edited
+        // rule set can both answer shelves with no list open, and the default
+        // "Quick picks" view is the one thing this tab must not show by itself.
+        if (listsRepository.selectedListId.value == null) {
+            _shelves.value = emptyList()
+            return
+        }
         val visible = notInterested.filter(
             // Only the sources the rules name, so turning one off takes its
             // videos away rather than filtering them out of a merged list.
@@ -504,8 +537,10 @@ class ExploreViewModel(application: Application) : AndroidViewModel(application)
         const val LIKED_PLAYLIST_ID = "LL"
 
         /**
-         * What the tab shows before any list is chosen: everything the followed
-         * channels published, one shelf per creator.
+         * The rules a brand-new list starts from. Nothing answers them on
+         * screen any more - with no list open the tab is empty by design - so
+         * this is the editor's starting point, not a view the tab falls back
+         * to.
          */
         val DEFAULT_RULES = ExploreRules(
             sources = setOf(ExploreSource.SUBSCRIPTIONS),
