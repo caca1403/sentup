@@ -89,9 +89,11 @@ internal class PlayerApi(
     ): PlayerAnswer = withContext(Dispatchers.IO) {
         try {
             val request = buildRequest(videoId, client, visitorData)
-            val (code, body) = http.newCall(request).execute().use { response ->
-                response.code to response.body?.string().orEmpty()
-            }
+            val (code, body) = com.sentup.android.data.VpnResilientNetwork
+                .executeResilient(http, request)
+                .use { response ->
+                    response.code to response.body?.string().orEmpty()
+                }
             readPlayerAnswer(code, body).also { log(it, videoId, client) }
         } catch (e: CancellationException) {
             // Swallowing this would report a cancelled call as a client with

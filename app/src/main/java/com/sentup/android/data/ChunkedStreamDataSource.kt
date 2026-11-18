@@ -1,39 +1,253 @@
 package com.sentup.android.data
 
+import android.net.Uri
 import androidx.media3.common.C
 import androidx.media3.common.util.UnstableApi
+import androidx.media3.datasource.BaseDataSource
 import androidx.media3.datasource.DataSource
 import androidx.media3.datasource.DataSpec
-import androidx.media3.datasource.DefaultHttpDataSource
 import androidx.media3.datasource.HttpDataSource
 import androidx.media3.datasource.TransferListener
+import java.io.EOFException
+import java.io.IOException
+import java.io.InputStream
+import java.util.concurrent.TimeUnit
+import okhttp3.Call
+import okhttp3.MediaType.Companion.toMediaTypeOrNull
+import okhttp3.OkHttpClient
+import okhttp3.Request
+import okhttp3.RequestBody.Companion.toRequestBody
+import okhttp3.Response
 
 /**
- * HTTP data source for googlevideo media that downloads in bounded chunks.
+ * VPN-resilient OkHttp-backed [HttpDataSource] replacing Media3's [androidx.media3.datasource.DefaultHttpDataSource]
+ * (`java.net.HttpURLConnection`).
+ *
+ * Ensures audio, video, DASH, HLS, and offline cache streams use [VpnResilientNetwork]:
+ * IPv4-first DNS + DoH fallback, proxy safety, NAT keep-alive pings, and instant socket eviction
+ * whenever a VPN connects, switches server, or disconnects.
+ */
+@UnstableApi
+private class VpnOkHttpDataSource(
+    private val callFactory: Call.Factory,
+) : BaseDataSource(/* isNetwork = */ true), HttpDataSource {
+
+    private val requestProperties = HashMap<String, String>()
+    private var currentDataSpec: DataSpec? = null
+    private var response: Response? = null
+    private var responseStream: InputStream? = null
+    private var opened = false
+    private var bytesToRead = 0L
+    private var bytesRead = 0L
+    private var lastResponseCode = -1
+    private var lastResponseHeaders: Map<String, List<String>> = emptyMap()
+
+    override fun setRequestProperty(name: String, value: String) {
+        synchronized(requestProperties) {
+            requestProperties[name] = value
+        }
+    }
+
+    override fun clearRequestProperty(name: String) {
+        synchronized(requestProperties) {
+            requestProperties.remove(name)
+        }
+    }
+
+    override fun clearAllRequestProperties() {
+        synchronized(requestProperties) {
+            requestProperties.clear()
+        }
+    }
+
+    override fun getResponseCode(): Int = if (opened) lastResponseCode else -1
+
+    override fun getResponseHeaders(): Map<String, List<String>> = lastResponseHeaders
+
+    override fun getUri(): Uri? =
+        response?.request?.url?.toString()?.let(Uri::parse) ?: currentDataSpec?.uri
+
+    override fun open(dataSpec: DataSpec): Long {
+        currentDataSpec = dataSpec
+        bytesRead = 0L
+        bytesToRead = 0L
+        transferInitializing(dataSpec)
+
+        val request = buildRequest(dataSpec)
+        val executed: Response = try {
+            (callFactory as? OkHttpClient)?.let { client ->
+                VpnResilientNetwork.executeResilient(client, request)
+            } ?: callFactory.newCall(request).execute()
+        } catch (e: IOException) {
+            throw HttpDataSource.HttpDataSourceException.createForIOException(
+                e,
+                dataSpec,
+                HttpDataSource.HttpDataSourceException.TYPE_OPEN,
+            )
+        }
+
+        response = executed
+        lastResponseCode = executed.code
+        lastResponseHeaders = executed.headers.toMultimap()
+
+        val body = executed.body
+        responseStream = body?.byteStream()
+
+        if (!executed.isSuccessful) {
+            val errorBytes = runCatching { responseStream?.readBytes() ?: ByteArray(0) }
+                .getOrDefault(ByteArray(0))
+            closeQuietly()
+            throw HttpDataSource.InvalidResponseCodeException(
+                lastResponseCode,
+                executed.message,
+                null,
+                lastResponseHeaders,
+                dataSpec,
+                errorBytes,
+            )
+        }
+
+        // If server replied 200 instead of 206 despite Range header, skip to requested position.
+        val bytesToSkip = if (lastResponseCode == 200 && dataSpec.position != 0L) dataSpec.position else 0L
+        val bodyLength = body?.contentLength()?.takeIf { it >= 0L } ?: C.LENGTH_UNSET.toLong()
+        bytesToRead = when {
+            dataSpec.length != C.LENGTH_UNSET.toLong() -> dataSpec.length
+            bodyLength != C.LENGTH_UNSET.toLong() -> (bodyLength - bytesToSkip).coerceAtLeast(0L)
+            else -> C.LENGTH_UNSET.toLong()
+        }
+
+        opened = true
+        transferStarted(dataSpec)
+
+        if (bytesToSkip > 0L) {
+            try {
+                skipInternal(bytesToSkip, dataSpec)
+            } catch (e: IOException) {
+                close()
+                throw if (e is HttpDataSource.HttpDataSourceException) {
+                    e
+                } else {
+                    HttpDataSource.HttpDataSourceException(
+                        e,
+                        dataSpec,
+                        androidx.media3.common.PlaybackException.ERROR_CODE_IO_UNSPECIFIED,
+                        HttpDataSource.HttpDataSourceException.TYPE_OPEN,
+                    )
+                }
+            }
+        }
+
+        return bytesToRead
+    }
+
+    override fun read(buffer: ByteArray, offset: Int, length: Int): Int {
+        if (length == 0) return 0
+        val stream = responseStream ?: return C.RESULT_END_OF_INPUT
+        val readLen = if (bytesToRead != C.LENGTH_UNSET.toLong()) {
+            val remaining = bytesToRead - bytesRead
+            if (remaining <= 0L) return C.RESULT_END_OF_INPUT
+            minOf(length.toLong(), remaining).toInt()
+        } else {
+            length
+        }
+
+        val count = try {
+            stream.read(buffer, offset, readLen)
+        } catch (e: IOException) {
+            throw HttpDataSource.HttpDataSourceException.createForIOException(
+                e,
+                checkNotNull(currentDataSpec),
+                HttpDataSource.HttpDataSourceException.TYPE_READ,
+            )
+        }
+        if (count == -1) return C.RESULT_END_OF_INPUT
+        bytesRead += count
+        bytesTransferred(count)
+        return count
+    }
+
+    override fun close() {
+        currentDataSpec = null
+        closeQuietly()
+        if (opened) {
+            opened = false
+            transferEnded()
+        }
+    }
+
+    private fun buildRequest(dataSpec: DataSpec): Request {
+        val builder = Request.Builder().url(dataSpec.uri.toString())
+        val headersSnapshot = synchronized(requestProperties) { HashMap(requestProperties) }
+        headersSnapshot.forEach { (k, v) -> builder.header(k, v) }
+        dataSpec.httpRequestHeaders.forEach { (k, v) -> builder.header(k, v) }
+
+        val hasRangeHeader = headersSnapshot.keys.any { it.equals("Range", ignoreCase = true) } ||
+            dataSpec.httpRequestHeaders.keys.any { it.equals("Range", ignoreCase = true) }
+        if (!hasRangeHeader && (dataSpec.position != 0L || dataSpec.length != C.LENGTH_UNSET.toLong())) {
+            val rangeValue = if (dataSpec.length == C.LENGTH_UNSET.toLong()) {
+                "bytes=${dataSpec.position}-"
+            } else {
+                "bytes=${dataSpec.position}-${dataSpec.position + dataSpec.length - 1}"
+            }
+            builder.header("Range", rangeValue)
+        }
+
+        if (!dataSpec.isFlagSet(DataSpec.FLAG_ALLOW_GZIP)) {
+            builder.header("Accept-Encoding", "identity")
+        }
+
+        val method = dataSpec.httpMethodString
+        val bodyBytes = dataSpec.httpBody
+        val requestBody = when {
+            dataSpec.httpMethod == DataSpec.HTTP_METHOD_GET || dataSpec.httpMethod == DataSpec.HTTP_METHOD_HEAD -> null
+            bodyBytes != null -> bodyBytes.toRequestBody(null)
+            dataSpec.httpMethod == DataSpec.HTTP_METHOD_POST -> ByteArray(0).toRequestBody("application/octet-stream".toMediaTypeOrNull())
+            else -> null
+        }
+        builder.method(method, requestBody)
+        return builder.build()
+    }
+
+    private fun skipInternal(bytesToSkip: Long, dataSpec: DataSpec) {
+        if (bytesToSkip <= 0L) return
+        val stream = responseStream ?: throw EOFException()
+        val scratch = ByteArray(4096)
+        var skipped = 0L
+        while (skipped < bytesToSkip) {
+            if (Thread.currentThread().isInterrupted) {
+                throw HttpDataSource.HttpDataSourceException(
+                    dataSpec,
+                    androidx.media3.common.PlaybackException.ERROR_CODE_IO_UNSPECIFIED,
+                    HttpDataSource.HttpDataSourceException.TYPE_OPEN,
+                )
+            }
+            val toRead = minOf(scratch.size.toLong(), bytesToSkip - skipped).toInt()
+            val read = stream.read(scratch, 0, toRead)
+            if (read == -1) throw EOFException()
+            skipped += read
+            bytesTransferred(read)
+        }
+    }
+
+    private fun closeQuietly() {
+        runCatching { responseStream?.close() }
+        runCatching { response?.close() }
+        responseStream = null
+        response = null
+    }
+}
+
+/**
+ * HTTP data source for googlevideo media that downloads in bounded chunks over [VpnResilientNetwork].
  *
  * googlevideo paces open-ended requests (no Range end bound) to roughly the
- * media bitrate: measured 32 KB/s on an audio stream whose URL served bounded
- * ranges at 5-22 MB/s over the same connection (verified July 2026).
- * ExoPlayer's progressive pipeline issues exactly those open-ended requests,
- * so every stream trickled in at playback speed - slow starts, stalling
- * seeks, and a read-ahead buffer that never actually filled. This source
- * splits the logical stream into [CHUNK_SIZE_BYTES] ranged requests,
- * invisibly to ExoPlayer: [open] reports the full remaining resource length
- * and [read] rolls over to the next ranged request when the current one is
- * exhausted. The served extent and total size come from the response's
- * Content-Range header, so a chunk that overshoots the end of the file is
- * handled by the server's clamping rather than by guessing.
- *
- * Also picks the per-request User-Agent via [YouTubeRepository.uaForPlaybackUri]:
- * googlevideo URLs are bound to their issuing InnerTube client through the
- * `?c=` query param and answer 403 when the playback UA does not match.
- *
- * URIs that are not chunkable progressive googlevideo streams - see
- * [shouldChunk] - pass straight through to the delegate unchunked.
+ * media bitrate. Splitting progressive googlevideo URLs into [CHUNK_SIZE_BYTES] ranged requests
+ * prevents throttling while keeping adaptive DASH/HLS manifests and segments unchunked.
+ * Also sets the per-request User-Agent via [YouTubeRepository.uaForPlaybackUri].
  */
 @UnstableApi
 class ChunkedStreamDataSource private constructor(
-    private val delegate: DefaultHttpDataSource,
+    private val delegate: HttpDataSource,
     private val allowNetwork: () -> Boolean,
 ) : DataSource {
 
@@ -41,50 +255,21 @@ class ChunkedStreamDataSource private constructor(
         private val allowNetwork: () -> Boolean = { true },
     ) : DataSource.Factory {
         override fun createDataSource(): DataSource = ChunkedStreamDataSource(
-            // No factory-level setUserAgent: DefaultHttpDataSource applies the
-            // userAgent field last and would overwrite the per-request
-            // User-Agent set in open().
-            DefaultHttpDataSource.Factory()
-                .setConnectTimeoutMs(CONNECT_TIMEOUT_MS)
-                .setReadTimeoutMs(READ_TIMEOUT_MS)
-                .setAllowCrossProtocolRedirects(true)
-                .createDataSource(),
+            delegate = VpnOkHttpDataSource(streamingClient),
             allowNetwork = allowNetwork,
         )
     }
 
     companion object {
-        /**
-         * 10 MB per ranged request: one request covers a whole typical song,
-         * and for video it balances request-count overhead against how much
-         * data is thrown away when the user seeks or switches quality.
-         */
         private const val CHUNK_SIZE_BYTES = 10L * 1024 * 1024
-        private const val CONNECT_TIMEOUT_MS = 15_000
-        private const val READ_TIMEOUT_MS = 15_000
         private const val UNSET = C.LENGTH_UNSET.toLong()
-
         private val CONTENT_RANGE_REGEX = Regex("""bytes (\d+)-(\d+)/(\d+|\*)""")
 
-        /**
-         * Whether chunking applies to [uri].
-         *
-         * Only progressive googlevideo URLs benefit, and those are exactly the
-         * ones carrying a query string (`?expire=...&itag=...`). The live
-         * pipeline's URLs are all path-style with no query at all - the HLS
-         * variant and media playlists on manifest.googlevideo.com, and the
-         * segment URLs they point at - and chunking actively hurts there: a
-         * segment answers 200 with neither Content-Length nor Content-Range
-         * even when a Range is sent, so [openChunk] assumes a full 10 MB
-         * chunk, hits EOF at ~300 KB, reopens at the new position, and the
-         * server re-serves the whole segment from the start. It terminates,
-         * but every segment gets downloaded twice. Verified August 2026.
-         *
-         * "Adaptive, so not a whole file" is the same judgement the playback
-         * cache has to make, so both read it from [isUncacheablePlaybackUrl]
-         * rather than keeping two copies of the URL shape to drift apart.
-         */
-        private fun shouldChunk(uri: android.net.Uri): Boolean {
+        private val streamingClient: OkHttpClient by lazy {
+            VpnResilientNetwork.sharedStreamingClient
+        }
+
+        private fun shouldChunk(uri: Uri): Boolean {
             if (uri.host?.endsWith(".googlevideo.com") != true) return false
             return !isUncacheablePlaybackUrl(uri.toString())
         }
@@ -92,20 +277,10 @@ class ChunkedStreamDataSource private constructor(
 
     private var currentSpec: DataSpec? = null
     private var chunked = false
-
-    /** Absolute read position within the resource. */
     private var position = 0L
-
-    /** Absolute exclusive end of the caller's requested window, or [UNSET]. */
     private var requestedEnd = UNSET
-
-    /** Total resource length learned from Content-Range, or [UNSET]. */
     private var totalLength = UNSET
-
-    /** Bytes the server actually promised for the currently open chunk. */
     private var chunkRemaining = 0L
-
-    /** Guards against reopen loops when the server serves an empty chunk. */
     private var chunkProgressed = false
 
     override fun addTransferListener(transferListener: TransferListener) {
@@ -114,7 +289,7 @@ class ChunkedStreamDataSource private constructor(
 
     override fun open(dataSpec: DataSpec): Long {
         if (!allowNetwork()) {
-            throw java.io.IOException("Local only mode is on: network disabled")
+            throw IOException("Local only mode is on: network disabled")
         }
         delegate.setRequestProperty(
             "User-Agent",
@@ -159,10 +334,6 @@ class ChunkedStreamDataSource private constructor(
         val toRead = minOf(length.toLong(), chunkRemaining).toInt()
         val read = delegate.read(buffer, offset, toRead)
         if (read == C.RESULT_END_OF_INPUT) {
-            // The server delivered less than Content-Range promised. If this
-            // chunk produced nothing at all, stop instead of re-requesting the
-            // same empty range forever; otherwise retry from the current
-            // position with a fresh ranged request.
             if (!chunkProgressed) return C.RESULT_END_OF_INPUT
             chunkRemaining = 0
             return read(buffer, offset, length)
@@ -173,7 +344,7 @@ class ChunkedStreamDataSource private constructor(
         return read
     }
 
-    override fun getUri(): android.net.Uri? = delegate.uri ?: currentSpec?.uri
+    override fun getUri(): Uri? = delegate.uri ?: currentSpec?.uri
 
     override fun getResponseHeaders(): Map<String, List<String>> = delegate.responseHeaders
 
@@ -184,19 +355,12 @@ class ChunkedStreamDataSource private constructor(
         delegate.close()
     }
 
-    /** Exclusive end of what can still be read: caller window and/or file end. */
     private fun effectiveEnd(): Long = when {
         requestedEnd != UNSET && totalLength != UNSET -> minOf(requestedEnd, totalLength)
         requestedEnd != UNSET -> requestedEnd
         else -> totalLength
     }
 
-    /**
-     * Issue the ranged request for the next chunk starting at [position] and
-     * record the extent the server actually promised. Sets [chunkRemaining]
-     * to 0 (instead of throwing) when the position is at or past the end of
-     * the file, so [read] can report a clean end of input.
-     */
     private fun openChunk() {
         val spec = checkNotNull(currentSpec)
         val end = effectiveEnd()
@@ -212,8 +376,6 @@ class ChunkedStreamDataSource private constructor(
         try {
             delegate.open(chunkSpec)
         } catch (e: HttpDataSource.InvalidResponseCodeException) {
-            // 416 means the requested start is past the end of the file (an
-            // unknown-length window that guessed too far): clean end of input.
             if (e.responseCode == 416) {
                 chunkRemaining = 0
                 return
@@ -228,8 +390,6 @@ class ChunkedStreamDataSource private constructor(
             chunkRemaining = rangeEnd.toLong() - position + 1
             total.toLongOrNull()?.let { totalLength = it }
         } else {
-            // No Content-Range (a 200 response): the delegate skips to
-            // `position` internally and will deliver up to `len` bytes.
             chunkRemaining = len
         }
     }

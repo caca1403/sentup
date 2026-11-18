@@ -183,7 +183,7 @@ internal object SpotifyMatcher {
 
 /** Fetches the public embed page. One request per import. */
 internal class SpotifyPlaylistSource {
-    private val client = OkHttpClient.Builder()
+    private val client = VpnResilientNetwork.configureForVpn(OkHttpClient.Builder())
         .connectTimeout(10, TimeUnit.SECONDS)
         .readTimeout(15, TimeUnit.SECONDS)
         .callTimeout(25, TimeUnit.SECONDS)

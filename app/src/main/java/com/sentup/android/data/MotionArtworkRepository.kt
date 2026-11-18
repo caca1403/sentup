@@ -25,7 +25,8 @@ import kotlin.coroutines.resumeWithException
 internal class MotionArtworkRepository(context: Context) {
     private val tokenFile = File(context.cacheDir, "motion-artwork-web-token")
     private val lock = Mutex()
-    private val client = OkHttpClient.Builder().connectTimeout(8, TimeUnit.SECONDS)
+    private val client = VpnResilientNetwork.configureForVpn(OkHttpClient.Builder())
+        .connectTimeout(8, TimeUnit.SECONDS)
         .readTimeout(8, TimeUnit.SECONDS).callTimeout(12, TimeUnit.SECONDS)
         .followRedirects(false).followSslRedirects(false).build()
     private data class CachedArtwork(val urls: List<String>, val until: Long)

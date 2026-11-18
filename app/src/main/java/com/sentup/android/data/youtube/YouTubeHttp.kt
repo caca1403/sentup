@@ -60,11 +60,12 @@ internal class YouTubeHttp(
 
     // Dedicated client for stream resolution. callTimeout is a hard wall-clock
     // cap enforced by OkHttp itself — unlike withTimeoutOrNull, it cannot be
-    // defeated by a thread blocked inside execute().
+    // defeated by a thread blocked inside execute(). Tuned to survive higher
+    // VPN TLS RTT while still fitting inside MusicService's resolution budget.
     val streamResolveClient = okHttpClient.newBuilder()
-        .connectTimeout(4, TimeUnit.SECONDS)
-        .readTimeout(5, TimeUnit.SECONDS)
-        .callTimeout(8, TimeUnit.SECONDS)
+        .connectTimeout(6, TimeUnit.SECONDS)
+        .readTimeout(8, TimeUnit.SECONDS)
+        .callTimeout(9, TimeUnit.SECONDS)
         .build()
 
     // The client NewPipe's downloader runs on. It needs its own callTimeout for
@@ -128,6 +129,7 @@ internal class YouTubeHttp(
     internal companion object {
         fun evictConnections() {
             sharedConnectionPool.evictAll()
+            VpnResilientNetwork.evictAllConnections()
         }
 
         // A backstop on one NewPipe request, and generous on purpose: this
@@ -170,9 +172,9 @@ internal class YouTubeHttp(
         }
         private val sharedConnectionPool = ConnectionPool(
             maxIdleConnections = 8,
-            keepAliveDuration = 5,
-            timeUnit = TimeUnit.MINUTES,
-        )
+            keepAliveDuration = 45,
+            timeUnit = TimeUnit.SECONDS,
+        ).also { VpnResilientNetwork.registerConnectionPool(it) }
 
         private fun httpCache(context: Context): Cache? {
             sharedHttpCache?.let { return it }

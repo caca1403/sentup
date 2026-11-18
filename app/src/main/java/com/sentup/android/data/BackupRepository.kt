@@ -96,6 +96,7 @@ class BackupRepository(context: Context) {
             "sentup_theme_prefs",   // every setting, palette and player style
             "saved_playlists",          // playlists kept as references, both modes
             "hidden_playlists",         // playlists the user told Sentüp not to show
+            PlaylistFolderStore.PREFS_NAME, // playlist folders in the Music Library
             "sentup_track_loudness",      // measured per-track gain
             "sentup_icon_styles",         // icon looks the user mixed themselves
             ExploreListsRepository.PREFS_NAME  // Explore lists, stored as rules

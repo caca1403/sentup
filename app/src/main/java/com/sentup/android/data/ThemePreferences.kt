@@ -923,6 +923,8 @@ class ThemePreferences(context: Context) {
         fun isNetworkMetered(context: Context): Boolean {
             val cm = context.getSystemService(Context.CONNECTIVITY_SERVICE)
                 as? android.net.ConnectivityManager ?: return false
+            val caps = cm.getNetworkCapabilities(cm.activeNetwork)
+            if (VpnResilientNetwork.isUnmeteredOrWifiVpn(caps)) return false
             return cm.isActiveNetworkMetered
         }
 
@@ -1288,14 +1290,14 @@ class ThemePreferences(context: Context) {
             return if (oldDarkMode) ThemeMode.DARK else ThemeMode.LIGHT
         }
         
-        return ThemeMode.SYSTEM
+        return ThemeMode.DARK
     }
 
     /**
-     * Get the stored AMOLED theme preference. Defaults to false.
+     * Get the stored AMOLED theme preference. Defaults to true (pure black OLED).
      */
     private fun getAmoledThemePreference(): Boolean {
-        return prefs.getBoolean(KEY_AMOLED_THEME, false)
+        return prefs.getBoolean(KEY_AMOLED_THEME, true)
     }
 
     /**

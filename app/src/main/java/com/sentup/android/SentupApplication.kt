@@ -7,6 +7,7 @@ import com.sentup.android.data.CrashReporter
 import com.sentup.android.data.LocalVideoThumbnail
 import com.sentup.android.data.LocalVideoThumbnailFetcher
 import com.sentup.android.data.NetworkChangeWatcher
+import com.sentup.android.data.VpnResilientNetwork
 import com.sentup.android.data.YouTubeRepository
 
 class SentupApplication : Application(), ImageLoaderFactory {
@@ -22,7 +23,7 @@ class SentupApplication : Application(), ImageLoaderFactory {
         // Clear rate-limit / bot-check holds and stale sockets whenever the
         // device switches networks or toggles a VPN, even when no player is open.
         networkChangeWatcher = NetworkChangeWatcher(this) {
-            YouTubeRepository.forgetConnectionVerdicts()
+            YouTubeRepository.forgetConnectionVerdicts(this)
         }.also { it.start() }
         // Reconcile the persisted periodic job with the user's current opt-in.
         // The setting handler does the same immediately when the value changes.
@@ -49,6 +50,7 @@ class SentupApplication : Application(), ImageLoaderFactory {
      */
     override fun newImageLoader(): ImageLoader =
         ImageLoader.Builder(this)
+            .okHttpClient { VpnResilientNetwork.sharedImageClient }
             .components {
                 add(LocalVideoThumbnailFetcher.Factory(this@SentupApplication))
                 add(LocalVideoThumbnailFetcher.ThumbnailKeyer())

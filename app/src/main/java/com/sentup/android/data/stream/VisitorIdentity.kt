@@ -113,6 +113,28 @@ internal class VisitorIdentity(
     fun cachedOrNull(): String? = cached ?: persisted()
 
     /**
+     * Returns an existing token, or synchronously mints one when running on a background
+     * thread (e.g. immediately after a VPN transition invalidated the prior token).
+     */
+    fun cachedOrSyncMint(): String? {
+        cachedOrNull()?.let { return it }
+        if (android.os.Looper.myLooper() == android.os.Looper.getMainLooper()) {
+            return null
+        }
+        return synchronized(syncMintLock) {
+            cachedOrNull()?.let { return@synchronized it }
+            val fresh = mintFromApi() ?: mintFromBootstrapPage()
+            if (!fresh.isNullOrEmpty()) {
+                adopt(fresh, System.currentTimeMillis())
+                KLog.i(STREAM_TAG, "visitorData minted synchronously (len=${fresh.length})")
+                fresh
+            } else {
+                cachedOrNull()
+            }
+        }
+    }
+
+    /**
      * Drop [refused] and mint a new token now, because YouTube refused it.
      *
      * Returns the new token, or null when the mint failed. A resolution that
@@ -238,7 +260,9 @@ internal class VisitorIdentity(
             .post(body.toRequestBody("application/json".toMediaType()))
             .addHeader("User-Agent", browserUserAgent)
             .build()
-        val json = quickHttp.newCall(request).execute().use { it.body?.string().orEmpty() }
+        val json = com.sentup.android.data.VpnResilientNetwork
+            .executeResilient(quickHttp, request)
+            .use { it.body?.string().orEmpty() }
         // The response URL-encodes the token's base64 padding; /player wants
         // the raw token.
         JSONObject(json)
@@ -262,7 +286,9 @@ internal class VisitorIdentity(
             .addHeader("User-Agent", browserUserAgent)
             .addHeader("Accept-Language", "en-US,en;q=0.9")
             .build()
-        val html = pageHttp.newCall(request).execute().use { it.body?.string().orEmpty() }
+        val html = com.sentup.android.data.VpnResilientNetwork
+            .executeResilient(pageHttp, request)
+            .use { it.body?.string().orEmpty() }
         BOOTSTRAP_TOKEN.find(html)
             ?.groupValues?.get(1)
             ?.replace("\\u003d", "=")
@@ -285,6 +311,7 @@ internal class VisitorIdentity(
         @Volatile private var cachedAt: Long = 0L
         @Volatile private var vetted: String? = null
         private val mutex = Mutex()
+        private val syncMintLock = Any()
 
         /**
          * Which token signed each recent `/player` response, keyed by

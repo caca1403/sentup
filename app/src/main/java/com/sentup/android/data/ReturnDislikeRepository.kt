@@ -36,7 +36,7 @@ class ReturnDislikeRepository {
         const val API_HOST = "returnyoutubedislikeapi.com"
         private const val API_BASE = "https://$API_HOST"
         private const val USER_AGENT = "Sentüp"
-        private val client = OkHttpClient.Builder()
+        private val client = VpnResilientNetwork.configureForVpn(OkHttpClient.Builder())
             .connectTimeout(6, TimeUnit.SECONDS)
             .readTimeout(6, TimeUnit.SECONDS)
             .callTimeout(8, TimeUnit.SECONDS)

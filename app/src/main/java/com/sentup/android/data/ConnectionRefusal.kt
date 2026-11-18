@@ -2,6 +2,7 @@ package com.sentup.android.data
 
 import android.content.Context
 import android.net.ConnectivityManager
+import android.net.LinkProperties
 import android.net.Network
 import android.net.NetworkCapabilities
 import androidx.media3.datasource.HttpDataSource
@@ -116,6 +117,9 @@ class NetworkChangeWatcher(context: Context, private val onChanged: () -> Unit) 
     @Volatile
     private var currentIsVpn: Boolean = false
 
+    @Volatile
+    private var currentLinkSignature: String = ""
+
     fun start() {
         if (callback != null || manager == null) return
         val active = manager.activeNetwork
@@ -123,19 +127,63 @@ class NetworkChangeWatcher(context: Context, private val onChanged: () -> Unit) 
         currentIsVpn = active
             ?.let { manager.getNetworkCapabilities(it) }
             ?.hasTransport(NetworkCapabilities.TRANSPORT_VPN) == true
+        currentLinkSignature = active
+            ?.let { manager.getLinkProperties(it) }
+            ?.let(::linkSignature)
+            .orEmpty()
+
         val watch = object : ConnectivityManager.NetworkCallback() {
+            override fun onAvailable(network: Network) {
+                val caps = manager.getNetworkCapabilities(network) ?: return
+                if (!VpnResilientNetwork.isNetworkUsable(caps)) return
+                val isVpn = caps.hasTransport(NetworkCapabilities.TRANSPORT_VPN)
+                if (network == current && isVpn == currentIsVpn) return
+                current = network
+                currentIsVpn = isVpn
+                currentLinkSignature = manager.getLinkProperties(network)?.let(::linkSignature).orEmpty()
+                onChanged()
+            }
+
             override fun onCapabilitiesChanged(network: Network, capabilities: NetworkCapabilities) {
                 if (!VpnResilientNetwork.isNetworkUsable(capabilities)) return
                 val isVpn = capabilities.hasTransport(NetworkCapabilities.TRANSPORT_VPN)
                 if (network == current && isVpn == currentIsVpn) return
                 current = network
                 currentIsVpn = isVpn
+                currentLinkSignature = manager.getLinkProperties(network)?.let(::linkSignature).orEmpty()
                 onChanged()
+            }
+
+            override fun onLinkPropertiesChanged(network: Network, linkProperties: LinkProperties) {
+                val sig = linkSignature(linkProperties)
+                if (sig.isBlank() || (network == current && sig == currentLinkSignature)) return
+                val caps = manager.getNetworkCapabilities(network) ?: return
+                if (!VpnResilientNetwork.isNetworkUsable(caps)) return
+                current = network
+                currentIsVpn = caps.hasTransport(NetworkCapabilities.TRANSPORT_VPN)
+                currentLinkSignature = sig
+                onChanged()
+            }
+
+            override fun onLost(network: Network) {
+                if (network == current) {
+                    current = null
+                    currentLinkSignature = ""
+                    onChanged()
+                }
             }
         }
         // A registration can throw at the per-app callback limit; losing the
         // auto-retry must not lose the advice.
         if (runCatching { manager.registerDefaultNetworkCallback(watch) }.isSuccess) callback = watch
+    }
+
+    private fun linkSignature(lp: LinkProperties): String = buildString {
+        append(lp.interfaceName.orEmpty())
+        append('|')
+        lp.linkAddresses.forEach { append(it.address.hostAddress.orEmpty()).append(',') }
+        append('|')
+        lp.dnsServers.forEach { append(it.hostAddress.orEmpty()).append(',') }
     }
 
     fun stop() {

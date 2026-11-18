@@ -420,7 +420,8 @@ internal class MusicBrowse(
         // Personalize the radio when logged in; anonymous works fine too.
         requestBuilder.authenticate(sessionManager.captureSession())
 
-        val response = http.okHttpClient.newCall(requestBuilder.build()).execute()
+        val response = com.sentup.android.data.VpnResilientNetwork
+            .executeResilient(http.okHttpClient, requestBuilder.build())
         val body = response.use { it.body?.string() }
         if (body.isNullOrEmpty()) return emptyList()
 

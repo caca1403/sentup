@@ -171,7 +171,7 @@ class UpdateRepository {
             val checkedAtMs: Long,
         )
         @Volatile private var cachedCheck: CachedCheck? = null
-        private val client = OkHttpClient.Builder()
+        private val client = VpnResilientNetwork.configureForVpn(OkHttpClient.Builder())
             .connectTimeout(10, TimeUnit.SECONDS)
             .readTimeout(10, TimeUnit.SECONDS)
             .callTimeout(15, TimeUnit.SECONDS)

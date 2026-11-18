@@ -1,8 +1,18 @@
 package com.sentup.android.ml
 
+import android.content.Context
 import com.sentup.android.data.VideoChapter
 import com.sentup.android.data.VttCue
+import kotlinx.coroutines.Dispatchers
+import kotlinx.coroutines.withContext
+import okhttp3.MediaType.Companion.toMediaType
+import okhttp3.OkHttpClient
+import okhttp3.Request
+import okhttp3.RequestBody.Companion.toRequestBody
+import org.json.JSONArray
+import org.json.JSONObject
 import java.util.Locale
+import java.util.concurrent.TimeUnit
 import kotlin.math.ln
 
 /**
@@ -170,4 +180,147 @@ object VideoQaEngine {
         input.lowercase(Locale.ROOT)
             .split(Regex("[^\\p{L}\\p{Nd}]+"))
             .filter { it.length >= 2 }
+
+    private val aiClient by lazy {
+        com.sentup.android.data.VpnResilientNetwork.configureForVpn(OkHttpClient.Builder())
+            .connectTimeout(15, TimeUnit.SECONDS)
+            .readTimeout(30, TimeUnit.SECONDS)
+            .build()
+    }
+
+    private const val PREFS_AI = "sentup_ai_prefs"
+    private const val KEY_GEMINI_API = "gemini_api_key"
+
+    fun getGeminiApiKey(context: Context): String =
+        context.getSharedPreferences(PREFS_AI, Context.MODE_PRIVATE)
+            .getString(KEY_GEMINI_API, "")
+            .orEmpty()
+            .trim()
+
+    fun setGeminiApiKey(context: Context, key: String) {
+        context.getSharedPreferences(PREFS_AI, Context.MODE_PRIVATE)
+            .edit()
+            .putString(KEY_GEMINI_API, key.trim())
+            .apply()
+    }
+
+    sealed interface AiAnswerResult {
+        data class Success(val text: String, val citedTimestampMs: Long?) : AiAnswerResult
+        data class Error(val message: String) : AiAnswerResult
+    }
+
+    /**
+     * Queries Gemini Flash with the video's title, chapters, description, and timestamped transcript
+     * to produce a grounded natural-language answer.
+     */
+    suspend fun askGeminiAi(
+        apiKey: String,
+        question: String,
+        title: String,
+        description: String?,
+        chapters: List<VideoChapter>,
+        cues: List<VttCue>
+    ): AiAnswerResult = withContext(Dispatchers.IO) {
+        val cleanKey = apiKey.trim()
+        if (cleanKey.isEmpty()) return@withContext AiAnswerResult.Error("API anahtarı boş.")
+
+        val contextText = buildString {
+            appendLine("Video Başlığı: $title")
+            if (chapters.isNotEmpty()) {
+                appendLine("\nBölümler:")
+                chapters.take(20).forEach { ch ->
+                    appendLine("- [${formatTimestamp(ch.startMs)}] ${ch.title}")
+                }
+            }
+            if (!description.isNullOrBlank()) {
+                appendLine("\nAçıklama:")
+                appendLine(description.take(1500))
+            }
+            if (cues.isNotEmpty()) {
+                appendLine("\nTranskript (zaman damgalı):")
+                val step = (cues.size / 160).coerceAtLeast(1)
+                cues.filterIndexed { index, _ -> index % step == 0 }
+                    .take(160)
+                    .forEach { cue ->
+                        appendLine("[${formatTimestamp(cue.startMs)}] ${cue.text.trim()}")
+                    }
+            }
+        }
+
+        val prompt = """
+            Sen bir video asistanısın. Aşağıdaki video bilgilerine dayanarak kullanıcının sorusunu net, doğru ve Türkçe (kullanıcı başka dilde sorduysa o dilde) yanıtla.
+            Yanıtında ilgili bir an varsa mutlaka [MM:SS] biçiminde zaman damgası belirt. Video içeriğinde olmayan bilgiyi uydurma.
+
+            $contextText
+
+            Kullanıcı Sorusu: $question
+        """.trimIndent()
+
+        try {
+            val payload = JSONObject().apply {
+                put(
+                    "contents",
+                    JSONArray().put(
+                        JSONObject().put(
+                            "parts",
+                            JSONArray().put(JSONObject().put("text", prompt))
+                        )
+                    )
+                )
+            }
+            val url =
+                "https://generativelanguage.googleapis.com/v1beta/models/gemini-2.5-flash:generateContent?key=$cleanKey"
+            val req = Request.Builder()
+                .url(url)
+                .post(payload.toString().toRequestBody("application/json; charset=utf-8".toMediaType()))
+                .build()
+
+            aiClient.newCall(req).execute().use { resp ->
+                val bodyStr = resp.body?.string().orEmpty()
+                if (!resp.isSuccessful) {
+                    val errMsg = runCatching {
+                        JSONObject(bodyStr).optJSONObject("error")?.optString("message")
+                    }.getOrNull()?.takeIf { it.isNotBlank() } ?: "HTTP ${resp.code}"
+                    return@withContext AiAnswerResult.Error(errMsg)
+                }
+                val root = JSONObject(bodyStr)
+                val text = root.optJSONArray("candidates")
+                    ?.optJSONObject(0)
+                    ?.optJSONObject("content")
+                    ?.optJSONArray("parts")
+                    ?.optJSONObject(0)
+                    ?.optString("text")
+                    ?.trim()
+                    .orEmpty()
+                if (text.isEmpty()) {
+                    return@withContext AiAnswerResult.Error("Boş yanıt döndü.")
+                }
+                val firstTs = parseFirstTimestampMs(text)
+                AiAnswerResult.Success(text = text, citedTimestampMs = firstTs)
+            }
+        } catch (cancelled: kotlinx.coroutines.CancellationException) {
+            throw cancelled
+        } catch (e: Exception) {
+            AiAnswerResult.Error(e.message ?: "Bağlantı hatası")
+        }
+    }
+
+    private fun formatTimestamp(ms: Long): String {
+        val totalSec = (ms / 1000L).coerceAtLeast(0L)
+        val min = totalSec / 60L
+        val sec = totalSec % 60L
+        return String.format(Locale.US, "%02d:%02d", min, sec)
+    }
+
+    private fun parseFirstTimestampMs(text: String): Long? {
+        val match = Regex("\\b(\\d{1,2}):(\\d{2})(?::(\\d{2}))?\\b").find(text) ?: return null
+        val g1 = match.groupValues[1].toLongOrNull() ?: return null
+        val g2 = match.groupValues[2].toLongOrNull() ?: return null
+        val g3 = match.groupValues[3].takeIf { it.isNotEmpty() }?.toLongOrNull()
+        return if (g3 != null) {
+            (g1 * 3600L + g2 * 60L + g3) * 1000L
+        } else {
+            (g1 * 60L + g2) * 1000L
+        }
+    }
 }

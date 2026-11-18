@@ -101,7 +101,9 @@ internal class PlaybackHistory(
                     .addHeader("X-YouTube-Client-Version", clientVersion)
                     .addHeader("X-Goog-Visitor-Id", visitorData)
                     .build()
-                return http.okHttpClient.newCall(playerRequest).execute().use { response ->
+                return com.sentup.android.data.VpnResilientNetwork
+                    .executeResilient(http.okHttpClient, playerRequest)
+                    .use { response ->
                     response.body?.string().also {
                         if (it.isNullOrEmpty()) {
                             KLog.e(YOUTUBE_TAG, "History sync: /player HTTP ${response.code} with an empty body for $videoId")

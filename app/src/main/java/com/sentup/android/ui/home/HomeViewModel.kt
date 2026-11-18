@@ -668,6 +668,7 @@ class HomeViewModel(application: Application) : AndroidViewModel(application) {
     private val downloadRepository = com.sentup.android.data.DownloadRepository.getInstance(application)
     val downloadedSongs = downloadRepository.downloadedSongs
     val downloadedVideos = downloadRepository.downloadedVideos
+    val downloadedPlaylists = downloadRepository.playlistStore.playlists
     val downloadingIds = downloadRepository.downloadingIds
     val downloadProgress = downloadRepository.downloadProgress
 
@@ -721,6 +722,11 @@ class HomeViewModel(application: Application) : AndroidViewModel(application) {
             .getSystemService(android.content.Context.CONNECTIVITY_SERVICE)
             as android.net.ConnectivityManager
         val callback = object : android.net.ConnectivityManager.NetworkCallback() {
+            override fun onAvailable(network: android.net.Network) {
+                val caps = cm.getNetworkCapabilities(network)
+                trySend(com.sentup.android.data.VpnResilientNetwork.isNetworkUsable(caps))
+            }
+
             override fun onCapabilitiesChanged(
                 network: android.net.Network,
                 caps: android.net.NetworkCapabilities,
@@ -729,7 +735,8 @@ class HomeViewModel(application: Application) : AndroidViewModel(application) {
             }
 
             override fun onLost(network: android.net.Network) {
-                trySend(false)
+                val activeCaps = cm.activeNetwork?.let { cm.getNetworkCapabilities(it) }
+                trySend(com.sentup.android.data.VpnResilientNetwork.isNetworkUsable(activeCaps))
             }
         }
         trySend(hasNetworkConnection())
@@ -3441,6 +3448,8 @@ class HomeViewModel(application: Application) : AndroidViewModel(application) {
                     videoFeedLoadedAtMs = System.currentTimeMillis()
                     videoFeedContinuation = page.continuation
                     tasteSeedOffset = 6
+                    videoInfiniteSeedIndex = 0
+                    videoDiscoveryRound = 0
                     videoFeedExhausted = false
                     rememberShown(page.videos)
                 } else {
@@ -3538,37 +3547,93 @@ class HomeViewModel(application: Application) : AndroidViewModel(application) {
      * more related videos. No-op while a load is already running or once the
      * feed is exhausted.
      */
+    private var videoInfiniteSeedIndex = 0
+    private var videoDiscoveryRound = 0
+
     fun loadMoreTrendingVideos() {
         if (!themePreferences.areVideoRecommendationsEnabled()) return
-        if (_isVideoHomeOffline.value || _isVideoLoading.value || _isVideoLoadingMore.value || videoFeedExhausted) return
+        if (_isVideoHomeOffline.value || _isVideoLoading.value || _isVideoLoadingMore.value) return
         if (_trendingVideos.value.isEmpty()) return
 
         viewModelScope.launch {
             _isVideoLoadingMore.value = true
             try {
-                val token = videoFeedContinuation
-                val newVideos: List<VideoItem>
-                if (token != null) {
-                    val page = youtubeRepository.getVideoFeedContinuation(token)
-                    videoFeedContinuation = page.continuation
-                    newVideos = page.videos
-                    if (page.videos.isEmpty() && page.continuation == null) {
-                        videoFeedExhausted = true
-                    }
-                } else {
-                    newVideos = youtubeRepository.getTasteBasedVideos(tasteSeedOffset)
-                    tasteSeedOffset += 6
-                    if (newVideos.isEmpty()) {
-                        videoFeedExhausted = true
+                val collected = mutableListOf<VideoItem>()
+                val onScreen = _trendingVideos.value.mapTo(HashSet()) { it.videoId }
+                val batchSeen = HashSet<String>(onScreen)
+
+                fun accept(items: List<VideoItem>) {
+                    items.forEach { v ->
+                        if (v.videoId.isNotBlank() && batchSeen.add(v.videoId)) {
+                            collected += v
+                        }
                     }
                 }
 
-                val onScreen = _trendingVideos.value.mapTo(HashSet()) { it.videoId }
-                val fresh = newVideos.filterNot { it.videoId in onScreen }
+                // Tier 1: official InnerTube browse continuation while available
+                val token = videoFeedContinuation
+                if (token != null) {
+                    val page = youtubeRepository.getVideoFeedContinuation(token)
+                    videoFeedContinuation = page.continuation
+                    accept(page.videos)
+                }
+
+                // Tier 2: watch history taste-seed expansion
+                if (collected.size < 8) {
+                    val taste = youtubeRepository.getTasteBasedVideos(tasteSeedOffset)
+                    if (taste.isNotEmpty()) {
+                        tasteSeedOffset += 6
+                        accept(taste)
+                    } else {
+                        tasteSeedOffset = 0
+                    }
+                }
+
+                // Tier 3: infinite related-video expansion seeded from current feed items
+                if (collected.size < 10) {
+                    val currentList = _trendingVideos.value
+                    var seedsTried = 0
+                    while (collected.size < 12 && seedsTried < 3 && currentList.isNotEmpty()) {
+                        val seed = currentList[videoInfiniteSeedIndex % currentList.size]
+                        videoInfiniteSeedIndex++
+                        seedsTried++
+                        val rel = runCatching {
+                            youtubeRepository.getRelatedVideosForFeedSeed(seed.videoId)
+                        }.getOrDefault(emptyList())
+                        accept(rel)
+                    }
+                }
+
+                // Tier 4: rotating discovery queries so scrolling never hits a dead end
+                if (collected.size < 8) {
+                    val discoveryTopics = listOf(
+                        "türkiye trend videolar 2026",
+                        "teknoloji ve yapay zeka inceleme",
+                        "bilim tarih belgesel türkçe",
+                        "popüler podcast sohbet",
+                        "yeni oyun videoları inceleme",
+                        "canlı müzik akustik performans",
+                        "otomobil spor gündem",
+                        "yazılım geliştirme tasarım",
+                        "sinema film analizleri",
+                        "eğlenceli deneyler ve icatlar"
+                    )
+                    val topic = discoveryTopics[videoDiscoveryRound % discoveryTopics.size]
+                    videoDiscoveryRound++
+                    val discovered = runCatching {
+                        youtubeRepository.searchVideos(
+                            topic,
+                            com.sentup.android.data.VideoSearchDateFilter.MONTH,
+                            com.sentup.android.data.VideoSearchSort.RELEVANCE
+                        )
+                    }.getOrDefault(emptyList())
+                    accept(discovered)
+                }
+
                 if (!themePreferences.areVideoRecommendationsEnabled()) return@launch
-                if (fresh.isNotEmpty()) {
-                    _trendingVideos.value = _trendingVideos.value + fresh
-                    rememberShown(fresh)
+                if (collected.isNotEmpty()) {
+                    _trendingVideos.value = _trendingVideos.value + collected
+                    rememberShown(collected)
                 }
             } catch (e: Exception) {
                 // Handle error silently; the next scroll will retry
@@ -3576,6 +3641,26 @@ class HomeViewModel(application: Application) : AndroidViewModel(application) {
                 _isVideoLoadingMore.value = false
             }
         }
+    }
+
+    suspend fun searchTopicTop10(query: String): List<VideoItem> {
+        if (query.isBlank()) return emptyList()
+        val rankedByViews = runCatching {
+            searchVideos(
+                query = query,
+                dateFilter = com.sentup.android.data.VideoSearchDateFilter.MONTH,
+                sort = com.sentup.android.data.VideoSearchSort.VIEW_COUNT
+            )
+        }.getOrDefault(emptyList())
+        if (rankedByViews.size >= 10) return rankedByViews.distinctBy { it.videoId }.take(10)
+        val relevanceFill = runCatching {
+            searchVideos(
+                query = query,
+                dateFilter = com.sentup.android.data.VideoSearchDateFilter.ANY,
+                sort = com.sentup.android.data.VideoSearchSort.RELEVANCE
+            )
+        }.getOrDefault(emptyList())
+        return (rankedByViews + relevanceFill).distinctBy { it.videoId }.take(10)
     }
 
     /**
@@ -3949,6 +4034,8 @@ class HomeViewModel(application: Application) : AndroidViewModel(application) {
                 val result = fresh.ifEmpty { page.videos }
                 _trendingVideos.value = result
                 videoFeedContinuation = continuation
+                videoInfiniteSeedIndex = 0
+                videoDiscoveryRound = 0
                 videoFeedExhausted = false
                 rememberShown(result)
             } catch (e: Exception) {

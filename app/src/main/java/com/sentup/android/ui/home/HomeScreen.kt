@@ -680,6 +680,7 @@ fun HomeScreen(
     var viewedPlaylistFromHome by remember {
         mutableStateOf<com.sentup.android.data.PlaylistDisplayItem?>(null)
     }
+    var viewedCustomFolderFromHome by remember { mutableStateOf<String?>(null) }
     // The video-mode counterpart, handed to VideoLibraryContent the same way.
     var viewedVideoPlaylistFromHome by remember {
         mutableStateOf<com.sentup.android.data.VideoPlaylist?>(null)
@@ -1259,6 +1260,11 @@ fun HomeScreen(
                                     onVideoModeToggle = onVideoModeToggle,
                                     showModeToggle = showModeToggle,
                                     modeToggleState = modeToggleState,
+                                    onOpenVideoPlaylist = { videoPlaylist ->
+                                        viewModel.loadPlaylistVideos(videoPlaylist.playlistId)
+                                        viewedVideoPlaylistFromHome = videoPlaylist
+                                        goToTab(3, wantVideoMode = true)
+                                    },
                                     listState = videoHomeScrollState
                                 )
                             }
@@ -1448,6 +1454,15 @@ fun HomeScreen(
                                                 onVideoModeToggle = onVideoModeToggle,
                                                 showModeToggle = showModeToggle,
                                                 modeToggleState = modeToggleState,
+                                                onOpenCustomFolder = { folderId ->
+                                                    viewedCustomFolderFromHome = folderId
+                                                    goToTab(2)
+                                                },
+                                                onOpenVideoPlaylist = { videoPlaylist ->
+                                                    viewModel.loadPlaylistVideos(videoPlaylist.playlistId)
+                                                    viewedVideoPlaylistFromHome = videoPlaylist
+                                                    goToTab(3, wantVideoMode = true)
+                                                },
                                                 listState = musicHomeScrollState
                                             )
                                         }
@@ -1579,6 +1594,8 @@ fun HomeScreen(
                                 onInitialPlaylistConsumed = { viewedPlaylistFromHome = null },
                                 initialAlbum = viewedAlbumFromPlayer,
                                 onInitialAlbumConsumed = { viewedAlbumFromPlayer = null },
+                                initialCustomFolderId = viewedCustomFolderFromHome,
+                                onInitialCustomFolderConsumed = { viewedCustomFolderFromHome = null },
                                 onStatsClick = onNavigateToStats,
                                 onOpenChannel = onOpenChannel,
                                 onSongLongPress = { song -> songOptionsTarget = song },
@@ -2448,6 +2465,8 @@ fun YourMixContent(
      * popout) hide themselves rather than offer a dead tap.
      */
     playerViewModel: PlayerViewModel? = null,
+    onOpenCustomFolder: (String) -> Unit = {},
+    onOpenVideoPlaylist: (com.sentup.android.data.VideoPlaylist) -> Unit = {},
     /** Hoisted by HomeScreen: survives tab switches, reachable by the nav bar. */
     listState: LazyListState = rememberLazyListState()
 ) {
@@ -2490,6 +2509,8 @@ fun YourMixContent(
         videoMode = videoMode,
         onVideoModeToggle = onVideoModeToggle,
         showModeToggle = showModeToggle,
+        onOpenCustomFolder = onOpenCustomFolder,
+        onOpenVideoPlaylist = onOpenVideoPlaylist,
         listState = listState
     )
 }

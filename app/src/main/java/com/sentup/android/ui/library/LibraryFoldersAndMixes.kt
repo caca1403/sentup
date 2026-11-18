@@ -53,6 +53,7 @@ import androidx.compose.material.icons.rounded.RadioButtonUnchecked
 import androidx.compose.material.icons.rounded.Search
 import androidx.compose.material.icons.rounded.Shuffle
 import androidx.compose.material.icons.rounded.TrendingUp
+import androidx.compose.material.icons.rounded.Tune
 import androidx.compose.material3.FilledTonalButton
 import androidx.compose.material3.FilledTonalIconButton
 import androidx.compose.material3.FilterChip
@@ -69,6 +70,10 @@ import androidx.compose.material3.Surface
 import androidx.compose.material3.Text
 import androidx.compose.material3.TextButton
 import androidx.compose.runtime.Composable
+import androidx.compose.runtime.getValue
+import androidx.compose.runtime.mutableStateOf
+import androidx.compose.runtime.remember
+import androidx.compose.runtime.setValue
 import androidx.compose.ui.Alignment
 import androidx.compose.ui.Modifier
 import androidx.compose.ui.draw.clip
@@ -99,7 +104,8 @@ import com.sentup.android.ui.theme.sentupCard
 enum class LibraryViewMode {
     Flow,
     Folders,
-    Mixes
+    Mixes,
+    Autonomous
 }
 
 /**
@@ -127,7 +133,7 @@ internal fun formatTrackDuration(durationMs: Long): String {
 }
 
 /**
- * Mode switcher (Flow / Folders / Smart Mixes), instant search bar, and quick filter chips.
+ * Mode switcher (Library / Folders / Spin), collapsible search bar, and quick filter chips.
  */
 @Composable
 fun LibraryModeAndSearchHeader(
@@ -139,83 +145,135 @@ fun LibraryModeAndSearchHeader(
     onFilterChange: (LibraryFilterChip) -> Unit,
     modifier: Modifier = Modifier
 ) {
+    var showSongFilters by remember { mutableStateOf(false) }
     Column(
         modifier = modifier
             .fillMaxWidth()
             .padding(horizontal = SentupGroup.inset, vertical = 4.dp),
         verticalArrangement = Arrangement.spacedBy(10.dp)
     ) {
-        SingleChoiceSegmentedButtonRow(modifier = Modifier.fillMaxWidth()) {
-            val modes = listOf(
-                Triple(LibraryViewMode.Mixes, R.string.lib_mode_mixes, Icons.Rounded.AutoAwesome),
-                Triple(LibraryViewMode.Folders, R.string.lib_mode_folders, Icons.Rounded.FolderOpen),
-                Triple(LibraryViewMode.Flow, R.string.lib_mode_flow, Icons.Rounded.LibraryMusic)
-            )
-            modes.forEachIndexed { index, (mode, labelRes, icon) ->
-                SegmentedButton(
-                    selected = viewMode == mode,
-                    onClick = { onViewModeChange(mode) },
-                    shape = SegmentedButtonDefaults.itemShape(index = index, count = modes.size),
-                    icon = {
-                        Icon(
-                            imageVector = icon,
-                            contentDescription = null,
-                            modifier = Modifier.size(16.dp)
-                        )
-                    }
-                ) {
-                    Text(
-                        text = stringResource(labelRes),
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis
-                    )
-                }
-            }
-        }
-
-        OutlinedTextField(
-            value = searchQuery,
-            onValueChange = onSearchQueryChange,
-            placeholder = { Text(stringResource(R.string.lib_search_hint), maxLines = 1, overflow = TextOverflow.Ellipsis) },
-            leadingIcon = { Icon(Icons.Rounded.Search, contentDescription = null) },
-            trailingIcon = {
-                if (searchQuery.isNotEmpty()) {
-                    IconButton(onClick = { onSearchQueryChange("") }) {
-                        Icon(Icons.Rounded.Clear, contentDescription = stringResource(R.string.lib_action_clear))
-                    }
-                }
-            },
-            singleLine = true,
-            shape = RoundedCornerShape(SentupRadii.pill),
-            colors = OutlinedTextFieldDefaults.colors(
-                focusedContainerColor = MaterialTheme.colorScheme.surfaceContainerHigh,
-                unfocusedContainerColor = MaterialTheme.colorScheme.surfaceContainerLow,
-                focusedBorderColor = MaterialTheme.colorScheme.primary.copy(alpha = 0.6f),
-                unfocusedBorderColor = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.5f)
-            ),
-            modifier = Modifier.fillMaxWidth()
-        )
-
         Row(
             modifier = Modifier
                 .fillMaxWidth()
                 .horizontalScroll(rememberScrollState()),
-            horizontalArrangement = Arrangement.spacedBy(8.dp)
+            horizontalArrangement = Arrangement.spacedBy(8.dp),
+            verticalAlignment = Alignment.CenterVertically
         ) {
-            LibraryFilterChip.entries.forEach { chip ->
-                val labelRes = when (chip) {
-                    LibraryFilterChip.All -> R.string.lib_filter_all
-                    LibraryFilterChip.Downloaded -> R.string.lib_filter_downloaded
-                    LibraryFilterChip.Liked -> R.string.lib_filter_liked
-                    LibraryFilterChip.Local -> R.string.lib_filter_local
-                    LibraryFilterChip.YouTube -> R.string.lib_filter_youtube
-                    LibraryFilterChip.Unplayed -> R.string.lib_filter_unplayed
+            val modes = listOf(
+                Triple(LibraryViewMode.Flow, stringResource(R.string.lib_mode_flow), Icons.Rounded.LibraryMusic),
+                Triple(LibraryViewMode.Folders, stringResource(R.string.lib_mode_folders), Icons.Rounded.FolderOpen),
+                Triple(LibraryViewMode.Mixes, stringResource(R.string.spin_title), Icons.Rounded.Casino),
+                Triple(LibraryViewMode.Autonomous, "Otonom", Icons.Rounded.AutoAwesome)
+            )
+            modes.forEach { (mode, labelText, icon) ->
+                val selected = viewMode == mode
+                Surface(
+                    onClick = { onViewModeChange(mode) },
+                    shape = RoundedCornerShape(SentupRadii.pill),
+                    color = if (selected) MaterialTheme.colorScheme.primary
+                    else MaterialTheme.colorScheme.surfaceContainerHigh,
+                    contentColor = if (selected) MaterialTheme.colorScheme.onPrimary
+                    else MaterialTheme.colorScheme.onSurfaceVariant,
+                    border = if (selected) null else androidx.compose.foundation.BorderStroke(
+                        1.dp,
+                        MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.35f)
+                    ),
+                    shadowElevation = if (selected) 2.dp else 0.dp
+                ) {
+                    Row(
+                        modifier = Modifier.padding(
+                            horizontal = if (selected) 16.dp else 14.dp,
+                            vertical = 9.dp
+                        ),
+                        verticalAlignment = Alignment.CenterVertically,
+                        horizontalArrangement = Arrangement.spacedBy(6.dp)
+                    ) {
+                        Icon(
+                            imageVector = icon,
+                            contentDescription = null,
+                            modifier = Modifier.size(18.dp)
+                        )
+                        Text(
+                            text = labelText,
+                            style = MaterialTheme.typography.labelLarge,
+                            fontWeight = if (selected) FontWeight.Bold else FontWeight.Medium,
+                            maxLines = 1,
+                            softWrap = false
+                        )
+                    }
                 }
-                FilterChip(
-                    selected = activeFilter == chip,
-                    onClick = { onFilterChange(chip) },
-                    label = { Text(stringResource(labelRes)) }
-                )
+            }
+        }
+
+        if (viewMode != LibraryViewMode.Mixes && viewMode != LibraryViewMode.Autonomous) {
+            OutlinedTextField(
+                value = searchQuery,
+                onValueChange = onSearchQueryChange,
+                placeholder = {
+                    Text(
+                        stringResource(R.string.lib_search_hint),
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
+                    )
+                },
+                leadingIcon = { Icon(Icons.Rounded.Search, contentDescription = null) },
+                trailingIcon = {
+                    Row(verticalAlignment = Alignment.CenterVertically) {
+                        if (searchQuery.isNotEmpty()) {
+                            IconButton(onClick = { onSearchQueryChange("") }) {
+                                Icon(
+                                    Icons.Rounded.Clear,
+                                    contentDescription = stringResource(R.string.lib_action_clear)
+                                )
+                            }
+                        }
+                        IconButton(onClick = { showSongFilters = !showSongFilters }) {
+                            Icon(
+                                Icons.Rounded.Tune,
+                                contentDescription = null,
+                                tint = if (showSongFilters || activeFilter != LibraryFilterChip.All) {
+                                    MaterialTheme.colorScheme.primary
+                                } else {
+                                    MaterialTheme.colorScheme.onSurfaceVariant
+                                }
+                            )
+                        }
+                    }
+                },
+                singleLine = true,
+                shape = RoundedCornerShape(SentupRadii.pill),
+                colors = OutlinedTextFieldDefaults.colors(
+                    focusedContainerColor = MaterialTheme.colorScheme.surfaceContainerHigh,
+                    unfocusedContainerColor = MaterialTheme.colorScheme.surfaceContainerLow,
+                    focusedBorderColor = MaterialTheme.colorScheme.primary.copy(alpha = 0.6f),
+                    unfocusedBorderColor = MaterialTheme.colorScheme.outlineVariant.copy(alpha = 0.5f)
+                ),
+                modifier = Modifier.fillMaxWidth()
+            )
+
+            AnimatedVisibility(visible = showSongFilters || activeFilter != LibraryFilterChip.All) {
+                Row(
+                    modifier = Modifier
+                        .fillMaxWidth()
+                        .horizontalScroll(rememberScrollState()),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    LibraryFilterChip.entries.forEach { chip ->
+                        val labelRes = when (chip) {
+                            LibraryFilterChip.All -> R.string.lib_filter_all
+                            LibraryFilterChip.Downloaded -> R.string.lib_filter_downloaded
+                            LibraryFilterChip.Liked -> R.string.lib_filter_liked
+                            LibraryFilterChip.Local -> R.string.lib_filter_local
+                            LibraryFilterChip.YouTube -> R.string.lib_filter_youtube
+                            LibraryFilterChip.Unplayed -> R.string.lib_filter_unplayed
+                        }
+                        FilterChip(
+                            selected = activeFilter == chip,
+                            onClick = { onFilterChange(chip) },
+                            label = { Text(stringResource(labelRes)) }
+                        )
+                    }
+                }
             }
         }
     }

@@ -76,7 +76,9 @@ import androidx.compose.runtime.getValue
 import androidx.compose.runtime.mutableFloatStateOf
 import androidx.compose.runtime.mutableStateOf
 import androidx.compose.runtime.remember
+import androidx.compose.runtime.rememberCoroutineScope
 import androidx.compose.runtime.rememberUpdatedState
+import kotlinx.coroutines.launch
 import androidx.compose.runtime.saveable.rememberSaveable
 import androidx.compose.runtime.setValue
 import androidx.compose.runtime.snapshotFlow
@@ -163,7 +165,8 @@ fun VideoHomeContent(
      * Off by default here as well as in preferences: a caller that has not
      * thought about it gets the feed that does not move on its own.
      */
-    inlinePreviews: Boolean = false
+    inlinePreviews: Boolean = false,
+    onOpenVideoPlaylist: (com.sentup.android.data.VideoPlaylist) -> Unit = {}
 ) {
     // Null when the setting is off, and then the cards read a null local and
     // draw exactly what they drew before this existed.
@@ -292,7 +295,9 @@ fun VideoHomeContent(
     // separating. Two things stop the chaining: a run that a community post
     // interrupts is not one object, and a two-column grid has no single run to
     // round off - each row there holds two cards side by side.
-    val chainedFeed = compact && !showOfflineDownloads && feedPosts.isEmpty() &&
+    var compactOverride by rememberSaveable { mutableStateOf<Boolean?>(null) }
+    val effectiveCompact = compactOverride ?: compact
+    val chainedFeed = effectiveCompact && !showOfflineDownloads && feedPosts.isEmpty() &&
         listLayout != com.sentup.android.data.ThemePreferences.VIDEO_LAYOUT_GRID
     // Which videos go either side of the Shorts shelf, worked out here rather
     // than in the list: the run's edges decide which rows round off, and a
@@ -301,19 +306,56 @@ fun VideoHomeContent(
     // isLive signal and watch history the feed settings act on, no new data.
     // 0 = everything, 1 = live only, 2 = hide what has been watched.
     var feedChip by rememberSaveable { mutableStateOf(0) }
+    var enhancedSearchQuery by rememberSaveable { mutableStateOf("") }
+    var selectedCreatorFilter by rememberSaveable { mutableStateOf<String?>(null) }
+    var videoSortMode by rememberSaveable { mutableStateOf(VideoFeedSortMode.Default) }
+    var shuffleSeed by rememberSaveable { mutableStateOf(42) }
+    val videoEnhanceScope = rememberCoroutineScope()
     val chipContext = LocalContext.current
+    val localWatchRepo = remember(chipContext) {
+        com.sentup.android.data.LocalVideoPlaylistsRepository(chipContext)
+    }
+    val vhAccountWatchlists by viewModel.videoPlaylists.collectAsState()
+    val vhLocalWatchlists by viewModel.localVideoPlaylists.collectAsState()
+    val vhSavedWatchlists by viewModel.savedVideoPlaylists.collectAsState()
+    val vhAllWatchlists = remember(vhLocalWatchlists, vhSavedWatchlists, vhAccountWatchlists) {
+        (vhLocalWatchlists.map { it.toVideoPlaylist() } + vhSavedWatchlists + vhAccountWatchlists)
+            .distinctBy { it.playlistId }
+    }
+    val quickWatchLater: (VideoItem) -> Unit = { v ->
+        videoEnhanceScope.launch {
+            val wlId = localWatchRepo.ensureWatchLater()
+            localWatchRepo.addVideo(wlId, v)
+            android.widget.Toast.makeText(
+                chipContext,
+                "${v.title} • Daha Sonra İzle'ye eklendi",
+                android.widget.Toast.LENGTH_SHORT
+            ).show()
+        }
+    }
     val chipWatchHistory by remember(chipContext) {
         com.sentup.android.data.VideoHistoryRepository(chipContext)
     }.history.collectAsState()
-    val feedVideos = feedFilter.apply(videos).let { base ->
+    val baseFilteredVideos = feedFilter.apply(videos).let { base ->
         when (feedChip) {
             1 -> base.filter { it.isLive }
             2 -> {
                 val watched = chipWatchHistory.mapTo(HashSet()) { it.videoId }
                 base.filterNot { it.videoId in watched }
             }
+            3 -> base.filter { it.duration in 1L..600L }
+            4 -> base.filter { it.duration >= 1200L }
             else -> base
         }
+    }
+    val feedVideos = remember(baseFilteredVideos, enhancedSearchQuery, selectedCreatorFilter, videoSortMode, shuffleSeed) {
+        applyEnhancedVideoFeedFilters(
+            base = baseFilteredVideos,
+            searchQuery = enhancedSearchQuery,
+            selectedCreatorFilter = selectedCreatorFilter,
+            sortMode = videoSortMode,
+            shuffleSeed = shuffleSeed
+        )
     }
     val leadingVideos = if (!shortsEnabled) feedVideos else feedVideos.take(2)
     val trailingVideos = if (!shortsEnabled) emptyList() else feedVideos.drop(2)
@@ -366,12 +408,12 @@ fun VideoHomeContent(
             // Endless feed: ask for the next page whenever the last visible
             // item is within 5 of the end. The ViewModel guards against
             // duplicate/exhausted loads, so firing on every scroll frame is fine.
-            LaunchedEffect(listState) {
+            LaunchedEffect(listState, isLoadingMore, feedVideos.size) {
                 snapshotFlow {
                     val info = listState.layoutInfo
                     (info.visibleItemsInfo.lastOrNull()?.index ?: -1) to info.totalItemsCount
                 }.collect { (lastVisible, totalCount) ->
-                    if (totalCount > 0 && lastVisible >= totalCount - 5) {
+                    if (totalCount > 0 && lastVisible >= totalCount - 8 && !isLoadingMore) {
                         if (currentRecommendationsEnabled) {
                             viewModel.loadMoreTrendingVideos()
                         } else {
@@ -449,9 +491,84 @@ fun VideoHomeContent(
                                 filled = feedChip == 2
                             )
                         }
+                        item {
+                            SentupActionPill(
+                                label = "Kısa (<10 dk)",
+                                onClick = { feedChip = 3 },
+                                filled = feedChip == 3
+                            )
+                        }
+                        item {
+                            SentupActionPill(
+                                label = "Uzun (20+ dk)",
+                                onClick = { feedChip = 4 },
+                                filled = feedChip == 4
+                            )
+                        }
+                        if (feedVideos.size > 1) {
+                            item {
+                                SentupActionPill(
+                                    label = "Rastgele Seç",
+                                    onClick = { openVideo(feedVideos.random()) },
+                                    filled = false
+                                )
+                            }
+                        }
                     }
                 }
                 
+                if (videoMode && !showOfflineDownloads) item(key = "vh_command_center") {
+                    VideoHomeCommandHeader(
+                        rawVideos = videos,
+                        filteredVideos = feedVideos,
+                        watchHistory = chipWatchHistory,
+                        subscribedChannels = subscribedChannels,
+                        watchlists = vhAllWatchlists,
+                        downloadedVideos = downloadedVideos,
+                        searchQuery = enhancedSearchQuery,
+                        onSearchQueryChange = { enhancedSearchQuery = it },
+                        selectedCreatorFilter = selectedCreatorFilter,
+                        onSelectCreatorFilter = { selectedCreatorFilter = it },
+                        sortMode = videoSortMode,
+                        onSortModeChange = { nextSort ->
+                            if (nextSort == VideoFeedSortMode.Shuffled) shuffleSeed++
+                            videoSortMode = nextSort
+                        },
+                        isCompactLayout = effectiveCompact,
+                        onToggleCompactLayout = { compactOverride = !effectiveCompact },
+                        onShufflePlay = {
+                            if (feedVideos.isNotEmpty()) openVideo(feedVideos.random())
+                        },
+                        onEnqueueAllVisible = {
+                            val enqueue = onEnqueueVideo
+                            if (enqueue != null && feedVideos.isNotEmpty()) {
+                                feedVideos.take(10).forEach { enqueue(it, false) }
+                                android.widget.Toast.makeText(
+                                    chipContext,
+                                    "${feedVideos.take(10).size} video sıraya eklendi",
+                                    android.widget.Toast.LENGTH_SHORT
+                                ).show()
+                            }
+                        },
+                        onOpenChannel = { ref -> onOpenChannel?.invoke(ref) },
+                        onOpenWatchlist = onOpenVideoPlaylist,
+                        onPlayVideo = openVideo,
+                        onPlayDownloaded = onDownloadedVideoClick,
+                        onQuickWatchLater = quickWatchLater,
+                        onLoadTopicTop10 = { topicQuery -> viewModel.searchTopicTop10(topicQuery) },
+                        onEnqueueVideoList = onEnqueueVideo?.let { enqueue ->
+                            { vids ->
+                                vids.forEach { enqueue(it, false) }
+                                android.widget.Toast.makeText(
+                                    chipContext,
+                                    "Top ${vids.size} sıraya eklendi",
+                                    android.widget.Toast.LENGTH_SHORT
+                                ).show()
+                            }
+                        }
+                    )
+                }
+
                 // Section title - changes based on whether user is logged in
                 // or recommendations are disabled (in which case subscriptions are shown).
                 if (showOfflineDownloads || recommendationsEnabled || videos.isNotEmpty()) item {
@@ -489,8 +606,22 @@ fun VideoHomeContent(
                     // Posts go in whichever run is the feed proper: after
                     // the Shorts shelf when there is one, never between the
                     // two videos above it.
+                    val spotlightVideo = if (!chainedFeed && !isLoading) leadingVideos.firstOrNull() else null
+                    val remainingLeading = if (spotlightVideo != null) leadingVideos.drop(1) else leadingVideos
+                    if (spotlightVideo != null) {
+                        item(key = "spotlight_${spotlightVideo.videoId}") {
+                            FeaturedVideoSpotlightCard(
+                                video = spotlightVideo,
+                                onPlay = { openVideo(spotlightVideo) },
+                                onLongClick = { onVideoLongPress(spotlightVideo) },
+                                onEnqueue = onEnqueueVideo?.let { enqueue ->
+                                    { enqueue(spotlightVideo, false) }
+                                }
+                            )
+                        }
+                    }
                     videoListItemsWithPosts(
-                        videos = leadingVideos,
+                        videos = remainingLeading,
                         posts = if (shortsEnabled) emptyList() else feedPosts,
                         layout = listLayout,
                         keyPrefix = "lead_",
@@ -546,6 +677,24 @@ fun VideoHomeContent(
                                 } else {
                                     Modifier
                                 }
+                            )
+                        }
+                        item(key = "vh_showcase_shelves") {
+                            VideoHomeShowcaseShelves(
+                                videos = feedVideos,
+                                onVideoClick = openVideo,
+                                onWatchLater = quickWatchLater,
+                                onEnqueueVideo = onEnqueueVideo?.let { enqueue ->
+                                    { video ->
+                                        enqueue(video, false)
+                                        android.widget.Toast.makeText(
+                                            chipContext,
+                                            "${video.title} • Sıraya eklendi",
+                                            android.widget.Toast.LENGTH_SHORT
+                                        ).show()
+                                    }
+                                },
+                                onOpenChannel = { ref -> onOpenChannel?.invoke(ref) }
                             )
                         }
                     }
@@ -650,6 +799,24 @@ fun VideoHomeContent(
                                 modifier = Modifier.size(36.dp),
                                 color = MaterialTheme.colorScheme.primary
                             )
+                        }
+                    }
+                } else if (!isOffline && !showOfflineDownloads && videos.isNotEmpty()) {
+                    item(key = "load_more_manual") {
+                        Box(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(vertical = 10.dp),
+                            contentAlignment = Alignment.Center
+                        ) {
+                            TextButton(
+                                onClick = {
+                                    if (recommendationsEnabled) viewModel.loadMoreTrendingVideos()
+                                    else viewModel.loadMoreSubscriptionMix()
+                                }
+                            ) {
+                                Text("Daha Fazla Video Yükle")
+                            }
                         }
                     }
                 }
@@ -1642,6 +1809,125 @@ private fun ResumeShelf(
                         maxLines = 2,
                         overflow = TextOverflow.Ellipsis
                     )
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun FeaturedVideoSpotlightCard(
+    video: VideoItem,
+    onPlay: () -> Unit,
+    onLongClick: () -> Unit,
+    onEnqueue: (() -> Unit)? = null
+) {
+    val shape = RoundedCornerShape(22.dp)
+    Surface(
+        shape = shape,
+        color = MaterialTheme.colorScheme.surfaceContainerHigh,
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(horizontal = SentupGroup.inset)
+            .clip(shape)
+            .combinedClickable(
+                onClick = onPlay,
+                onLongClick = onLongClick
+            )
+    ) {
+        Column(modifier = Modifier.fillMaxWidth()) {
+            Box(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .aspectRatio(16f / 9f)
+            ) {
+                com.sentup.android.ui.components.VideoThumbnail(
+                    video = video,
+                    modifier = Modifier.fillMaxSize()
+                )
+                Box(
+                    modifier = Modifier
+                        .matchParentSize()
+                        .background(
+                            androidx.compose.ui.graphics.Brush.verticalGradient(
+                                0f to Color.Transparent,
+                                0.55f to Color.Transparent,
+                                1f to Color.Black.copy(alpha = 0.72f)
+                            )
+                        )
+                )
+                Surface(
+                    color = MaterialTheme.colorScheme.primary,
+                    shape = RoundedCornerShape(SentupRadii.pill),
+                    modifier = Modifier
+                        .align(Alignment.TopStart)
+                        .padding(12.dp)
+                ) {
+                    Text(
+                        text = "ÖNE ÇIKAN",
+                        style = MaterialTheme.typography.labelSmall,
+                        fontWeight = FontWeight.Bold,
+                        color = MaterialTheme.colorScheme.onPrimary,
+                        modifier = Modifier.padding(horizontal = 10.dp, vertical = 4.dp)
+                    )
+                }
+                com.sentup.android.ui.components.VideoThumbnailBadge(
+                    video = video,
+                    modifier = Modifier
+                        .align(Alignment.BottomEnd)
+                        .padding(10.dp)
+                )
+            }
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(14.dp),
+                verticalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                Text(
+                    text = video.title,
+                    style = MaterialTheme.typography.titleMedium,
+                    fontWeight = FontWeight.Bold,
+                    maxLines = 2,
+                    overflow = TextOverflow.Ellipsis
+                )
+                val meta = listOfNotNull(
+                    video.channelName.takeIf { it.isNotBlank() },
+                    video.viewCount.takeIf { it.isNotBlank() },
+                    video.uploadedDate?.takeIf { it.isNotBlank() }
+                ).joinToString(" • ")
+                if (meta.isNotEmpty()) {
+                    Text(
+                        text = meta,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
+                    )
+                }
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    androidx.compose.material3.Button(
+                        onClick = onPlay,
+                        shape = RoundedCornerShape(SentupRadii.pill),
+                        contentPadding = PaddingValues(horizontal = 16.dp, vertical = 6.dp),
+                        modifier = Modifier.weight(1f)
+                    ) {
+                        Icon(Icons.Filled.PlayArrow, contentDescription = null, modifier = Modifier.size(18.dp))
+                        Spacer(Modifier.width(6.dp))
+                        Text("İzle")
+                    }
+                    if (onEnqueue != null) {
+                        androidx.compose.material3.FilledTonalButton(
+                            onClick = onEnqueue,
+                            shape = RoundedCornerShape(SentupRadii.pill),
+                            contentPadding = PaddingValues(horizontal = 14.dp, vertical = 6.dp)
+                        ) {
+                            Text("Sıraya Ekle")
+                        }
+                    }
                 }
             }
         }

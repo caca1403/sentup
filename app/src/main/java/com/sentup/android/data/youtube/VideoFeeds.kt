@@ -146,7 +146,7 @@ internal class VideoFeeds(
             // users can deliberately attach its release ring buffer to a bug
             // report, and these values may carry account/feed information.
             KLog.d(YOUTUBE_TAG, "Making personalized video request")
-            val response = http.okHttpClient.newCall(request).execute()
+            val response = com.sentup.android.data.VpnResilientNetwork.executeResilient(http.okHttpClient, request)
             val responseBody = response.body?.string() ?: return@withContext empty
             response.close()
 
@@ -193,6 +193,10 @@ internal class VideoFeeds(
         mixed
     }
 
+    suspend fun getRelatedVideosForFeedSeed(videoId: String): List<VideoItem> = withContext(Dispatchers.IO) {
+        getRelatedVideosLight(videoId)
+    }
+
     /**
      * Related videos for a seed video from the watch-next endpoint.
      * Far lighter than a full NewPipe StreamExtractor fetch (one JSON call,
@@ -227,8 +231,9 @@ internal class VideoFeeds(
             var nextToken: String? = null
             val actions = root.optJSONArray("onResponseReceivedActions") ?: JSONArray()
             for (i in 0 until actions.length()) {
-                val items = actions.optJSONObject(i)
-                    ?.optJSONObject("appendContinuationItemsAction")
+                val actionObj = actions.optJSONObject(i) ?: continue
+                val items = (actionObj.optJSONObject("appendContinuationItemsAction")
+                    ?: actionObj.optJSONObject("reloadContinuationItemsCommand"))
                     ?.optJSONArray("continuationItems")
                     ?: continue
                 for (j in 0 until items.length()) {

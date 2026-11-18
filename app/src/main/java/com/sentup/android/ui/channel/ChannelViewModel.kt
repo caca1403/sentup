@@ -208,6 +208,10 @@ class ChannelViewModel(application: Application) : AndroidViewModel(application)
      * lockup omitted the creator endpoint. The last form resolves the owner
      * from watch metadata and never starts or mutates playback.
      */
+    fun retry() {
+        loadedChannelId?.let { load(it, force = true) }
+    }
+
     fun load(idOrHandleOrUrl: String, force: Boolean = false) {
         if (!force && loadedChannelId == idOrHandleOrUrl) return
         loadedChannelId = idOrHandleOrUrl

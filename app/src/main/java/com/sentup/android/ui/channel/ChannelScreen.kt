@@ -366,7 +366,7 @@ private fun ChannelRoot(
     ) {
         when {
             isLoadingPage -> ChannelLoading()
-            loadFailed || header == null -> ChannelUnavailable(onBack = onBack)
+            loadFailed || header == null -> ChannelUnavailable(onRetry = viewModel::retry, onBack = onBack)
             else -> {
                 val currentHeader = header!!
                 val page = pages[selectedTab]
@@ -899,7 +899,7 @@ private fun ChannelLoading() {
  * working sends them fixing the wrong thing.
  */
 @Composable
-private fun ChannelUnavailable(onBack: () -> Unit) {
+private fun ChannelUnavailable(onRetry: () -> Unit, onBack: () -> Unit) {
     Column(
         modifier = Modifier
             .fillMaxSize()
@@ -937,18 +937,33 @@ private fun ChannelUnavailable(onBack: () -> Unit) {
             textAlign = TextAlign.Center
         )
         Spacer(Modifier.height(24.dp))
-        Surface(
-            onClick = onBack,
-            shape = CircleShape,
-            color = MaterialTheme.colorScheme.primary,
-            contentColor = MaterialTheme.colorScheme.onPrimary
-        ) {
-            Text(
-                text = stringResource(R.string.cd_back),
-                style = MaterialTheme.typography.labelLarge,
-                fontWeight = FontWeight.Bold,
-                modifier = Modifier.padding(horizontal = 24.dp, vertical = 12.dp)
-            )
+        Row(horizontalArrangement = Arrangement.spacedBy(12.dp)) {
+            Surface(
+                onClick = onRetry,
+                shape = CircleShape,
+                color = MaterialTheme.colorScheme.primary,
+                contentColor = MaterialTheme.colorScheme.onPrimary
+            ) {
+                Text(
+                    text = stringResource(R.string.action_retry),
+                    style = MaterialTheme.typography.labelLarge,
+                    fontWeight = FontWeight.Bold,
+                    modifier = Modifier.padding(horizontal = 24.dp, vertical = 12.dp)
+                )
+            }
+            Surface(
+                onClick = onBack,
+                shape = CircleShape,
+                color = MaterialTheme.colorScheme.surfaceContainerHigh,
+                contentColor = MaterialTheme.colorScheme.onSurface
+            ) {
+                Text(
+                    text = stringResource(R.string.cd_back),
+                    style = MaterialTheme.typography.labelLarge,
+                    fontWeight = FontWeight.Bold,
+                    modifier = Modifier.padding(horizontal = 24.dp, vertical = 12.dp)
+                )
+            }
         }
     }
 }

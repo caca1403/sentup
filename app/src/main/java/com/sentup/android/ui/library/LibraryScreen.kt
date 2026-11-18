@@ -58,6 +58,7 @@ import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
 import androidx.compose.material.icons.automirrored.rounded.ArrowBack
 import androidx.compose.material.icons.automirrored.rounded.ArrowForward
+import androidx.compose.material.icons.automirrored.rounded.DriveFileMove
 import androidx.compose.material.icons.automirrored.rounded.List
 import androidx.compose.material.icons.automirrored.rounded.PlaylistAdd
 import androidx.compose.material.icons.automirrored.rounded.PlaylistPlay
@@ -212,6 +213,8 @@ fun LibraryContent(
      */
     initialAlbum: String? = null,
     onInitialAlbumConsumed: () -> Unit = {},
+    initialCustomFolderId: String? = null,
+    onInitialCustomFolderConsumed: () -> Unit = {},
     onStatsClick: () -> Unit = {},
     /**
      * Long-press on a song row. Hoisted rather than handled here because the
@@ -238,6 +241,12 @@ fun LibraryContent(
 ) {
     // Navigation State
     var currentRoute by rememberSaveable { mutableStateOf(LibraryRoute.Main) }
+    val playlistFolderContext = LocalContext.current
+    val playlistFolderStore = remember(playlistFolderContext) {
+        com.sentup.android.data.PlaylistFolderStore(playlistFolderContext)
+    }
+    var selectedFolderId by rememberSaveable { mutableStateOf<String?>(null) }
+    var playlistOpenedFromFolder by rememberSaveable { mutableStateOf(false) }
 
     // Cached-in-full songs. Re-read whenever the tab comes back to its root,
     // because the cache changes as a side effect of listening: songs arrive by
@@ -330,10 +339,14 @@ fun LibraryContent(
     fun back() {
         if (currentRoute == LibraryRoute.ImportSongs || currentRoute == LibraryRoute.AddSongs) {
             currentRoute = LibraryRoute.Playlist
+        } else if (currentRoute == LibraryRoute.Playlist && playlistOpenedFromFolder && selectedFolderId != null) {
+            playlistOpenedFromFolder = false
+            currentRoute = LibraryRoute.PlaylistFolder
         } else if (returnsToCaller) {
             returnsToCaller = false
             onReturnToCaller()
         } else {
+            playlistOpenedFromFolder = false
             currentRoute = LibraryRoute.Main
         }
     }
@@ -351,7 +364,14 @@ fun LibraryContent(
                 onDownloadsClick = onDownloadsClick,
                 onNavigateToPlaylist = { playlist ->
                     selectedPlaylist = playlist
+                    playlistOpenedFromFolder = false
                     currentRoute = LibraryRoute.Playlist
+                },
+                playlistFolderStore = playlistFolderStore,
+                onNavigateToPlaylistFolder = { folderId ->
+                    selectedFolderId = folderId
+                    playlistOpenedFromFolder = false
+                    currentRoute = LibraryRoute.PlaylistFolder
                 },
                 onNavigateToArtist = { artist ->
                     selectedArtistName = artist
@@ -577,6 +597,85 @@ fun LibraryContent(
                     )
                 }
             }
+            LibraryRoute.PlaylistFolder -> {
+                val allFolders by playlistFolderStore.folders.collectAsState()
+                val activeFolder = allFolders.firstOrNull { it.id == selectedFolderId }
+                if (activeFolder != null) {
+                    val allPlaylists by viewModel.userPlaylists.collectAsState()
+                    val localIds by viewModel.localPlaylistIds.collectAsState()
+                    val savedIds by viewModel.savedPlaylistIds.collectAsState()
+                    val dlPlaylists by viewModel.downloadedPlaylists.collectAsState()
+                    val offlineIds = remember(dlPlaylists) { dlPlaylists.mapTo(mutableSetOf()) { it.id } }
+                    val isLoggedIn by viewModel.isYouTubeConnected.collectAsState()
+                    val dupErr = stringResource(R.string.pl_folder_duplicate_error)
+                    val emptyErr = stringResource(R.string.pl_folder_empty_error)
+                    PlaylistFolderDetailScreen(
+                        folder = activeFolder,
+                        allPlaylists = allPlaylists,
+                        allFolders = allFolders,
+                        localPlaylistIds = localIds,
+                        savedPlaylistIds = savedIds,
+                        offlinePlaylistIds = offlineIds,
+                        isLoggedIn = isLoggedIn,
+                        contentPadding = contentPadding,
+                        onBack = { back() },
+                        onPlaylistClick = { playlist ->
+                            selectedPlaylist = playlist
+                            playlistOpenedFromFolder = true
+                            currentRoute = LibraryRoute.Playlist
+                        },
+                        onAddPlaylistsToFolder = { ids ->
+                            playlistFolderStore.addPlaylistsToFolder(ids, activeFolder.id)
+                        },
+                        onMovePlaylistToFolder = { playlistId, targetId ->
+                            playlistFolderStore.movePlaylistToFolder(playlistId, targetId)
+                        },
+                        onCreateFolderAndMove = { playlistId, name ->
+                            val res = playlistFolderStore.createFolder(name)
+                            if (res is com.sentup.android.data.CreatePlaylistFolderResult.Created) {
+                                playlistFolderStore.movePlaylistToFolder(playlistId, res.folder.id)
+                            }
+                            res
+                        },
+                        onRenameFolder = { newName ->
+                            when {
+                                newName.trim().isEmpty() -> emptyErr
+                                !playlistFolderStore.renameFolder(activeFolder.id, newName) -> dupErr
+                                else -> null
+                            }
+                        },
+                        onDeleteFolder = {
+                            playlistFolderStore.deleteFolder(activeFolder.id)
+                            back()
+                        },
+                        onTogglePinFolder = {
+                            playlistFolderStore.togglePinFolder(activeFolder.id)
+                        },
+                        onEditPlaylist = { playlist, newName, newDesc ->
+                            if (localIds.contains(playlist.id)) {
+                                viewModel.updateLocalPlaylist(playlist.id, newName, newDesc)
+                            } else {
+                                viewModel.renameYouTubePlaylist(playlist.id, newName, newDesc)
+                            }
+                        },
+                        onDeletePlaylist = { playlist ->
+                            if (localIds.contains(playlist.id)) {
+                                viewModel.deleteLocalPlaylist(playlist.id)
+                            } else {
+                                viewModel.deleteYouTubePlaylist(playlist.id)
+                            }
+                        },
+                        onRemoveSavedPlaylist = { playlist ->
+                            viewModel.removeSavedPlaylist(playlist.id)
+                        },
+                        onHidePlaylist = { playlist ->
+                            viewModel.hidePlaylist(playlist)
+                        }
+                    )
+                } else {
+                    LaunchedEffect(Unit) { back() }
+                }
+            }
         }
     }
 
@@ -638,7 +737,8 @@ fun LibraryContent(
         // ImportSongs and AddSongs back onto the playlist, not the root the
         // peel shows, so they are not previewed either.
         previewable = currentRoute != LibraryRoute.Main && !returnsToCaller &&
-            currentRoute != LibraryRoute.ImportSongs && currentRoute != LibraryRoute.AddSongs,
+            currentRoute != LibraryRoute.ImportSongs && currentRoute != LibraryRoute.AddSongs &&
+            !(currentRoute == LibraryRoute.Playlist && playlistOpenedFromFolder),
         background = mainScreen
     ) { committedByGesture ->
     AnimatedContent(
@@ -671,7 +771,7 @@ fun LibraryContent(
 }
 
 enum class LibraryRoute {
-    Main, Playlist, Album, Artist, Stats, History, ReadyOffline,
+    Main, Playlist, PlaylistFolder, Album, Artist, Stats, History, ReadyOffline,
     /** The immersive local-playlist creation flow (PlaylistStudioScreen). */
     CreatePlaylist,
     /** "Add from your playlists" into the open local playlist (PlaylistImportScreen). */
@@ -1055,8 +1155,12 @@ private fun LibrarySingleFlow(
     onSetPlaybackSpeed: ((Float) -> Unit)? = null,
     onSeekToTimestamp: ((Song, Long) -> Unit)? = null,
     onShuffle: () -> Unit,
+    playlistFolderStore: com.sentup.android.data.PlaylistFolderStore? = null,
+    onNavigateToPlaylistFolder: (String) -> Unit = {},
+    initialCustomFolderId: String? = null,
+    onInitialCustomFolderConsumed: () -> Unit = {},
 ) {
-    var viewMode by rememberSaveable { mutableStateOf(LibraryViewMode.Mixes) }
+    var viewMode by rememberSaveable { mutableStateOf(LibraryViewMode.Flow) }
     var searchQuery by rememberSaveable { mutableStateOf("") }
     var activeFilter by rememberSaveable { mutableStateOf(com.sentup.android.data.LibraryFilterChip.All) }
     var folderSortOrder by rememberSaveable { mutableStateOf(com.sentup.android.data.FolderSortOrder.Name) }
@@ -1066,10 +1170,39 @@ private fun LibrarySingleFlow(
     var selectedSongIds by remember { mutableStateOf<Set<String>>(emptySet()) }
 
     val folderContext = LocalContext.current
+    val resolvedPlaylistFolderStore = playlistFolderStore ?: remember(folderContext) {
+        com.sentup.android.data.PlaylistFolderStore(folderContext)
+    }
+    val playlistFolders by resolvedPlaylistFolderStore.folders.collectAsState()
+    val downloadedPlaylists by viewModel.downloadedPlaylists.collectAsState()
+    val offlinePlaylistIds = remember(downloadedPlaylists) {
+        downloadedPlaylists.mapTo(mutableSetOf()) { it.id }
+    }
+    var playlistSourceFilter by rememberSaveable {
+        mutableStateOf(com.sentup.android.data.PlaylistSourceFilter.All)
+    }
+    var playlistSortOrder by rememberSaveable {
+        mutableStateOf(com.sentup.android.data.PlaylistFolderSortOrder.Default)
+    }
+    var isPlaylistGridView by rememberSaveable { mutableStateOf(true) }
+    var showCreatePlaylistFolderDialog by remember { mutableStateOf(false) }
+    var renamePlaylistFolderTarget by remember { mutableStateOf<com.sentup.android.data.PlaylistFolder?>(null) }
+    var deletePlaylistFolderTarget by remember { mutableStateOf<com.sentup.android.data.PlaylistFolder?>(null) }
+    var addPlaylistsFolderTarget by remember { mutableStateOf<com.sentup.android.data.PlaylistFolder?>(null) }
+    var movePlaylistTarget by remember { mutableStateOf<PlaylistDisplayItem?>(null) }
+
     val customFolderStore = remember(folderContext) { com.sentup.android.data.CustomFolderStore(folderContext) }
     val customFolders by customFolderStore.folders.collectAsState()
     var folderSourceTab by rememberSaveable { mutableStateOf(FolderSourceTab.Custom) }
     var currentCustomFolderId by rememberSaveable { mutableStateOf<String?>(null) }
+    LaunchedEffect(initialCustomFolderId) {
+        if (initialCustomFolderId != null) {
+            viewMode = LibraryViewMode.Folders
+            folderSourceTab = FolderSourceTab.Custom
+            currentCustomFolderId = initialCustomFolderId
+            onInitialCustomFolderConsumed()
+        }
+    }
     var showCreateFolderParentId by remember { mutableStateOf<String?>(null) }
     var isCreateFolderDialogOpen by remember { mutableStateOf(false) }
     var renameTargetFolder by remember { mutableStateOf<com.sentup.android.data.MusicFolder?>(null) }
@@ -1077,11 +1210,29 @@ private fun LibrarySingleFlow(
     var addSongsTargetFolder by remember { mutableStateOf<com.sentup.android.data.MusicFolder?>(null) }
     var audioProfileTargetFolder by remember { mutableStateOf<com.sentup.android.data.MusicFolder?>(null) }
     var autoRuleTargetFolder by remember { mutableStateOf<com.sentup.android.data.MusicFolder?>(null) }
+    var coverTargetFolder by remember { mutableStateOf<com.sentup.android.data.MusicFolder?>(null) }
     var trackToolsTargetSong by remember { mutableStateOf<Song?>(null) }
+    val folderCoverPickerLauncher = androidx.activity.compose.rememberLauncherForActivityResult(
+        contract = androidx.activity.result.contract.ActivityResultContracts.PickVisualMedia()
+    ) { pickedUri ->
+        val target = coverTargetFolder
+        if (pickedUri != null && target != null) {
+            customFolderStore.savePickedCover(target.id, pickedUri)
+            coverTargetFolder = null
+        }
+    }
     var showCleanerSheet by remember { mutableStateOf(false) }
     var showNeuralLabSheet by remember { mutableStateOf(false) }
     var showFolderExportImportDialog by remember { mutableStateOf(false) }
     var showAddSelectedToFolderDialog by remember { mutableStateOf(false) }
+    var showGenreClusterSheet by remember { mutableStateOf(false) }
+    var showAutonomousMixMaker by remember { mutableStateOf(false) }
+    var customFolderGenreFilter by remember(currentCustomFolderId) {
+        mutableStateOf<com.sentup.android.ml.GenreClassifierMlEngine.MusicGenre?>(null)
+    }
+    var inspectArtistGenreTarget by remember { mutableStateOf<String?>(null) }
+    var splitByGenreTargetFolder by remember { mutableStateOf<com.sentup.android.data.MusicFolder?>(null) }
+    var genreRefreshNonce by remember { mutableStateOf(0) }
     val trackCustomizationStore = remember(folderContext) { com.sentup.android.data.TrackCustomizationStore(folderContext) }
     val trackTrims by trackCustomizationStore.trims.collectAsState()
     val songBookmarks by trackCustomizationStore.bookmarks.collectAsState()
@@ -1141,8 +1292,122 @@ private fun LibrarySingleFlow(
     val artists = remember(librarySongs) {
         librarySongs.filterNot { isUnknownArtist(it.artist) }.groupSongsByArtist()
     }
+    val vmArtistPhotos by viewModel.artistPhotos.collectAsState()
+    val resolvedArtistPhotos = remember { mutableStateMapOf<String, String>() }
+    LaunchedEffect(artists, customFolders, vmArtistPhotos) {
+        vmArtistPhotos.forEach { (k, v) -> resolvedArtistPhotos[k] = v }
+        val targetNames = buildList {
+            artists.take(30).forEach { add(it.first) }
+            customFolders.flatMap { it.artistNames }.forEach { add(it) }
+        }.distinct()
+        if (targetNames.isEmpty()) return@LaunchedEffect
+        val cache = com.sentup.android.data.ArtistPhotoCache(folderContext)
+        val missing = mutableListOf<String>()
+        for (name in targetNames) {
+            if (resolvedArtistPhotos.containsKey(name)) continue
+            when (val hit = cache.lookup(name)) {
+                is com.sentup.android.data.ArtistPhotoCache.Lookup.Photo -> resolvedArtistPhotos[name] = hit.url
+                com.sentup.android.data.ArtistPhotoCache.Lookup.Miss -> Unit
+                com.sentup.android.data.ArtistPhotoCache.Lookup.Unknown -> missing += name
+            }
+        }
+        if (missing.isEmpty() || themePreferences.isLocalOnlyModeEnabled() || com.sentup.android.data.YouTubeRateLimit.isHeld()) {
+            return@LaunchedEffect
+        }
+        val repo = com.sentup.android.data.YouTubeRepository(folderContext)
+        for (name in missing) {
+            if (com.sentup.android.data.YouTubeRateLimit.isHeld()) break
+            val match = try {
+                repo.searchArtists(name).firstOrNull()
+                    ?.takeIf { it.name.trim().equals(name.trim(), ignoreCase = true) }
+            } catch (cancelled: kotlinx.coroutines.CancellationException) {
+                throw cancelled
+            } catch (_: Exception) {
+                null
+            }
+            val url = match?.thumbnailUrl?.takeIf { it.isNotBlank() }
+            if (url != null) {
+                cache.put(name, url)
+                resolvedArtistPhotos[name] = url
+            } else {
+                cache.put(name, null)
+            }
+        }
+    }
+    val resolvedArtistGenres = remember {
+        mutableStateMapOf<String, com.sentup.android.ml.GenreClassifierMlEngine.GenrePrediction>()
+    }
+    var isEnrichingGenres by remember { mutableStateOf(false) }
+    LaunchedEffect(artists, customFolders, librarySongs, genreRefreshNonce) {
+        val targetNames = buildList {
+            customFolders.flatMap { it.artistNames }.forEach { add(it) }
+            customFolders.flatMap { f ->
+                f.songIds.mapNotNull { librarySongsById[it]?.artist }.filterNot { isUnknownArtist(it) }
+            }.forEach { add(it) }
+            artists.take(80).forEach { add(it.first) }
+        }.distinct()
+        if (targetNames.isEmpty()) return@LaunchedEffect
+        isEnrichingGenres = true
+        try {
+            com.sentup.android.ml.GenreClassifierMlEngine.enrichArtists(
+                context = folderContext,
+                artistNames = targetNames,
+                allSongs = librarySongs,
+                folders = customFolders,
+                onProgress = { updated ->
+                    resolvedArtistGenres.putAll(updated)
+                }
+            )
+        } finally {
+            isEnrichingGenres = false
+        }
+    }
+    val snapshotArtistGenres = resolvedArtistGenres.toMap()
     val albums = remember(librarySongs) {
         librarySongs.filterNot { isUnknownAlbum(it.album) }.groupSongsByAlbum()
+    }
+    val unfolderedPlaylists = remember(playlistFolders, playlists) {
+        com.sentup.android.data.PlaylistFolderLogic.playlistsNotInFolders(playlistFolders, playlists)
+    }
+    val visiblePlaylistFolders = remember(
+        playlistFolders,
+        playlists,
+        searchQuery,
+        playlistSourceFilter,
+        playlistSortOrder,
+        localPlaylistIds,
+        savedPlaylistIds,
+        offlinePlaylistIds
+    ) {
+        com.sentup.android.data.PlaylistFolderLogic.filterAndSortFolders(
+            folders = playlistFolders,
+            allPlaylists = playlists,
+            query = searchQuery,
+            sourceFilter = playlistSourceFilter,
+            sortOrder = playlistSortOrder,
+            localPlaylistIds = localPlaylistIds,
+            savedPlaylistIds = savedPlaylistIds,
+            offlinePlaylistIds = offlinePlaylistIds
+        )
+    }
+    val visibleRootPlaylists = remember(
+        unfolderedPlaylists,
+        searchQuery,
+        playlistSourceFilter,
+        playlistSortOrder,
+        localPlaylistIds,
+        savedPlaylistIds,
+        offlinePlaylistIds
+    ) {
+        com.sentup.android.data.PlaylistFolderLogic.filterAndSortPlaylists(
+            playlists = unfolderedPlaylists,
+            query = searchQuery,
+            sourceFilter = playlistSourceFilter,
+            sortOrder = playlistSortOrder,
+            localPlaylistIds = localPlaylistIds,
+            savedPlaylistIds = savedPlaylistIds,
+            offlinePlaylistIds = offlinePlaylistIds
+        )
     }
     var showHiddenSheet by remember { mutableStateOf(false) }
     val scope = rememberCoroutineScope()
@@ -1166,6 +1431,156 @@ private fun LibrarySingleFlow(
     }
 
     Box(modifier = Modifier.fillMaxSize()) {
+        if (viewMode == LibraryViewMode.Mixes) {
+            val spinMix by viewModel.youtubeSongs.collectAsState()
+            val spinRecent by viewModel.recentlyPlayed.collectAsState()
+            val spinForYou by viewModel.discoverySongs.collectAsState()
+            val spinForYouLoading by viewModel.isDiscoveryLoading.collectAsState()
+            Column(modifier = Modifier.fillMaxSize()) {
+                LibraryModeAndSearchHeader(
+                    viewMode = viewMode,
+                    onViewModeChange = { nextMode ->
+                        viewMode = nextMode
+                        if (nextMode != LibraryViewMode.Folders) {
+                            selectionMode = false
+                            selectedSongIds = emptySet()
+                        }
+                    },
+                    searchQuery = searchQuery,
+                    onSearchQueryChange = { searchQuery = it },
+                    activeFilter = activeFilter,
+                    onFilterChange = { activeFilter = it },
+                    modifier = Modifier.padding(top = 8.dp)
+                )
+                com.sentup.android.ui.home.SpinScreen(
+                    initialSource = com.sentup.android.ui.home.SpinSource.Mix,
+                    mix = spinMix.ifEmpty { librarySongs },
+                    forYou = spinForYou,
+                    isForYouLoading = spinForYouLoading,
+                    onRequestForYou = { viewModel.loadDiscovery() },
+                    liked = likedSongs,
+                    recent = spinRecent,
+                    contentPadding = contentPadding,
+                    onPlay = { queue, start -> onPlayQueue(queue, start) },
+                    onSongLongPress = onSongLongPress,
+                    onBack = { viewMode = LibraryViewMode.Flow },
+                    embeddedInTab = true
+                )
+            }
+        } else if (viewMode == LibraryViewMode.Autonomous) {
+            val ytPool by viewModel.youtubeSongs.collectAsState()
+            val combinedPool = remember(librarySongs, ytPool, likedSongs) {
+                (librarySongs + ytPool + likedSongs).distinctBy { it.id }
+            }
+            val autonomousMixes = remember(combinedPool, downloadedIds, playCounts) {
+                com.sentup.android.data.buildLibrarySmartMixes(
+                    songs = combinedPool,
+                    downloadedIds = downloadedIds,
+                    playCounts = playCounts
+                )
+            }
+            LazyColumn(
+                state = listState,
+                modifier = Modifier.fillMaxSize(),
+                contentPadding = PaddingValues(
+                    top = 8.dp,
+                    bottom = contentPadding.calculateBottomPadding() + 120.dp
+                )
+            ) {
+                item(key = "library_mode_and_search") {
+                    LibraryModeAndSearchHeader(
+                        viewMode = viewMode,
+                        onViewModeChange = { nextMode ->
+                            viewMode = nextMode
+                            if (nextMode != LibraryViewMode.Folders) {
+                                selectionMode = false
+                                selectedSongIds = emptySet()
+                            }
+                        },
+                        searchQuery = searchQuery,
+                        onSearchQueryChange = { searchQuery = it },
+                        activeFilter = activeFilter,
+                        onFilterChange = { activeFilter = it }
+                    )
+                }
+                item(key = "autonomous_mix_studio") {
+                    val folderArtistNames = remember(customFolders) {
+                        customFolders.flatMap { it.artistNames }.distinct()
+                    }
+                    AutonomousMixStudioHeader(
+                        poolSongs = combinedPool,
+                        folderArtists = folderArtistNames,
+                        likedIds = likedIds,
+                        downloadedIds = downloadedIds,
+                        playCounts = playCounts,
+                        onOpenMixMaker = { showAutonomousMixMaker = true },
+                        onSearchArtists = { query -> viewModel.searchArtists(query) },
+                        onGenerateOnlineMix = { prompt, genreLabel, focusLabel, pickedArtists, targetCount, perArtistCount ->
+                            val safePerArtist = perArtistCount.coerceIn(1, 100)
+                            val fetched = mutableListOf<Song>()
+                            if (pickedArtists.isNotEmpty()) {
+                                pickedArtists.forEach { artistName ->
+                                    val artistTracks = LinkedHashMap<String, Song>()
+                                    viewModel.searchArtistSongs(artistName).forEach { s ->
+                                        artistTracks.putIfAbsent(s.id, s)
+                                    }
+                                    if (artistTracks.size < safePerArtist) {
+                                        viewModel.searchYouTube("$artistName şarkılar")
+                                            .sortedByDescending {
+                                                it.artist.contains(artistName, ignoreCase = true)
+                                            }
+                                            .forEach { s -> artistTracks.putIfAbsent(s.id, s) }
+                                    }
+                                    if (artistTracks.size < safePerArtist && safePerArtist > 25) {
+                                        viewModel.searchYouTube("$artistName en iyi şarkılar")
+                                            .sortedByDescending {
+                                                it.artist.contains(artistName, ignoreCase = true)
+                                            }
+                                            .forEach { s -> artistTracks.putIfAbsent(s.id, s) }
+                                    }
+                                    fetched += artistTracks.values.take(safePerArtist)
+                                }
+                            } else {
+                                val q = buildString {
+                                    if (prompt.isNotBlank()) {
+                                        append(prompt)
+                                    } else {
+                                        if (genreLabel != null) append("$genreLabel ")
+                                        append(
+                                            when (focusLabel) {
+                                                "Enerjik" -> "enerjik hit şarkılar"
+                                                "Sakin / Gece" -> "sakin chill acoustic lofi"
+                                                "Keşif" -> "yeni çıkan keşif müzikler"
+                                                else -> "en iyi mix şarkılar"
+                                            }
+                                        )
+                                    }
+                                }.trim()
+                                fetched += viewModel.searchYouTube(q)
+                            }
+                            val effectiveLimit = if (pickedArtists.isNotEmpty()) {
+                                (pickedArtists.size * safePerArtist).coerceIn(targetCount, 400)
+                            } else {
+                                targetCount.coerceIn(10, 120)
+                            }
+                            fetched.distinctBy { it.id }.shuffled().take(effectiveLimit)
+                        },
+                        onPlayMix = { queue -> onPlayQueue(queue, queue.firstOrNull()) },
+                        onShuffleMix = onShuffleQueue,
+                        onSaveAsPlaylist = { title, mixSongs ->
+                            scope.launch {
+                                viewModel.createLocalPlaylistWithSongs(title, null, mixSongs)
+                            }
+                        }
+                    )
+                }
+                smartMixesItems(
+                    mixes = autonomousMixes,
+                    onPlayMix = { mix -> onPlayQueue(mix.songs, mix.songs.firstOrNull()) },
+                    onShuffleMix = { mix -> onShuffleQueue(mix.songs) }
+                )
+            }
+        } else {
         LazyColumn(
             state = listState,
             modifier = Modifier.fillMaxSize(),
@@ -1188,22 +1603,6 @@ private fun LibrarySingleFlow(
                     onSearchQueryChange = { searchQuery = it },
                     activeFilter = activeFilter,
                     onFilterChange = { activeFilter = it }
-                )
-            }
-
-            item(key = "library_dna_card") {
-                LibraryDnaCard(
-                    dna = libraryDna,
-                    onSurpriseMe = {
-                        val unplayed = librarySongs.filter { (playCounts[it.id] ?: 0) == 0 }
-                        val pool = if (unplayed.isNotEmpty()) unplayed else librarySongs
-                        if (pool.isNotEmpty()) {
-                            onShuffleQueue(pool.shuffled())
-                        }
-                    },
-                    onOpenCleaner = { showCleanerSheet = true },
-                    onOpenNeuralLab = { showNeuralLabSheet = true },
-                    modifier = Modifier.padding(top = 6.dp, bottom = 6.dp)
                 )
             }
 
@@ -1237,6 +1636,13 @@ private fun LibrarySingleFlow(
                         likedIds = likedIds,
                         downloadedIds = downloadedIds,
                         playCounts = playCounts,
+                        artistPhotos = resolvedArtistPhotos,
+                        artistGenres = snapshotArtistGenres,
+                        isEnrichingGenres = isEnrichingGenres,
+                        selectedGenreFilter = customFolderGenreFilter,
+                        onSelectGenreFilter = { customFolderGenreFilter = it },
+                        onInspectArtistGenre = { inspectArtistGenreTarget = it },
+                        onSplitFolderByGenreRequest = { splitByGenreTargetFolder = it },
                         onNavigateFolder = { currentCustomFolderId = it },
                         onCreateFolderRequest = { parentId ->
                             showCreateFolderParentId = parentId
@@ -1254,6 +1660,7 @@ private fun LibrarySingleFlow(
                         onAddSongsRequest = { folder -> addSongsTargetFolder = folder },
                         onFolderAudioProfileRequest = { folder -> audioProfileTargetFolder = folder },
                         onFolderAutoRuleRequest = { folder -> autoRuleTargetFolder = folder },
+                        onChangeFolderCoverRequest = { folder -> coverTargetFolder = folder },
                         onPlayFolderWithProfile = { folder, queue, shuffle ->
                             folder.playbackSpeed?.let { speed -> onSetPlaybackSpeed?.invoke(speed) }
                             if (shuffle) {
@@ -1264,6 +1671,7 @@ private fun LibrarySingleFlow(
                         },
                         onOpenTrackTools = { song -> trackToolsTargetSong = song },
                         onExportImportFoldersRequest = { showFolderExportImportDialog = true },
+                        onOpenGenreClusters = { showGenreClusterSheet = true },
                         onRemoveArtistFromFolder = { folderId, artistName ->
                             customFolderStore.removeArtistFromFolder(folderId, artistName)
                         },
@@ -1317,16 +1725,49 @@ private fun LibrarySingleFlow(
                 return@LazyColumn
             }
 
-            if (viewMode == LibraryViewMode.Mixes) {
-                smartMixesItems(
-                    mixes = smartMixes,
-                    onPlayMix = { mix -> onPlayQueue(mix.songs, mix.songs.firstOrNull()) },
-                    onShuffleMix = { mix -> onShuffleQueue(mix.songs) }
-                )
-                return@LazyColumn
-            }
-
             if (searchQuery.isNotBlank() || activeFilter != com.sentup.android.data.LibraryFilterChip.All) {
+                if (searchQuery.isNotBlank() && (visiblePlaylistFolders.isNotEmpty() || visibleRootPlaylists.isNotEmpty())) {
+                    item(key = "flow_search_playlists_header") {
+                        SentupGroupHeader(
+                            text = pluralStringResource(
+                                R.plurals.n_playlists,
+                                visiblePlaylistFolders.size + visibleRootPlaylists.size,
+                                visiblePlaylistFolders.size + visibleRootPlaylists.size
+                            ),
+                            modifier = Modifier.padding(top = SentupGroup.gap)
+                        )
+                    }
+                    items(visiblePlaylistFolders, key = { "search_plfolder_" + it.id }) { folder ->
+                        val inside = com.sentup.android.data.PlaylistFolderLogic.playlistsInFolder(folder, playlists)
+                        PlaylistFolderListRow(
+                            folder = folder,
+                            playlistsInFolder = inside,
+                            onClick = { onNavigateToPlaylistFolder(folder.id) },
+                            onAddPlaylists = { addPlaylistsFolderTarget = folder },
+                            onTogglePin = { resolvedPlaylistFolderStore.togglePinFolder(folder.id) },
+                            onRename = { renamePlaylistFolderTarget = folder },
+                            onDelete = { deletePlaylistFolderTarget = folder }
+                        )
+                    }
+                    items(visibleRootPlaylists, key = { "search_pl_" + it.id }) { playlist ->
+                        val isLocal = localPlaylistIds.contains(playlist.id)
+                        val isSaved = savedPlaylistIds.contains(playlist.id)
+                        val isYouTubeEditable = !isLocal && !isSaved &&
+                            playlist.id != "RTM" && playlist.id != "LM"
+                        PlaylistListRow(
+                            playlist = playlist,
+                            isLocal = isLocal,
+                            isSaved = isSaved,
+                            isEditable = isLocal || isYouTubeEditable,
+                            onClick = { onPlaylistClick(playlist) },
+                            onMoveToFolder = { movePlaylistTarget = playlist },
+                            onHide = { onHidePlaylist(playlist) },
+                            onEditConfirmed = { name, desc -> onEditPlaylist(playlist, name, desc) },
+                            onDeleteConfirmed = { onDeletePlaylist(playlist) },
+                            onRemoveSaved = { onRemoveSavedPlaylist(playlist) }
+                        )
+                    }
+                }
                 item(key = "flow_filtered_header") {
                     SentupGroupHeader(
                         text = pluralStringResource(R.plurals.n_songs, filteredSongs.size, filteredSongs.size),
@@ -1362,71 +1803,24 @@ private fun LibrarySingleFlow(
                 return@LazyColumn
             }
 
-            // 2: quick jump. Pick what you want on top; the list scrolls to it.
-            item(key = "flow_chips") {
-                Row(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .horizontalScroll(rememberScrollState())
-                        .padding(horizontal = SentupGroup.inset, vertical = 4.dp),
-                    horizontalArrangement = Arrangement.spacedBy(8.dp)
-                ) {
-                    FilterChip(
-                        selected = false,
-                        onClick = onShuffle,
-                        leadingIcon = {
-                            Icon(
-                                Icons.Rounded.Shuffle,
-                                contentDescription = null,
-                                modifier = Modifier.size(16.dp)
-                            )
-                        },
-                        label = { Text("Karıştır") }
-                    )
-                    anchors.forEach { (label, target) ->
-                        FilterChip(
-                            selected = false,
-                            onClick = { scope.launch { listState.animateScrollToItem(target) } },
-                            label = { Text(label) }
-                        )
-                    }
-                }
+            // Quick access 2x2 grid + Stats & New Playlist pills
+            item(key = "flow_quick_access") {
+                LibraryQuickAccessGrid(
+                    likedCount = likedSongs.size,
+                    downloadCount = downloadedSongs.size,
+                    readyOfflineCount = readyOfflineCount,
+                    historyPlayCount = playCounts.values.sum(),
+                    onLikedClick = onLikedSongsClick,
+                    onDownloadsClick = onDownloadsClick,
+                    onReadyOfflineClick = onReadyOfflineClick,
+                    onHistoryClick = onNavigateToHistory,
+                    onStatsClick = onNavigateToStats,
+                    onCreatePlaylist = onCreatePlaylist,
+                    modifier = Modifier.padding(top = 6.dp, bottom = 4.dp)
+                )
             }
 
-        // 1: the analytics block, the first thing you scroll past into data.
-        item(key = "flow_insights") {
-            InsightsCard(
-                viewModel = viewModel,
-                onOpenStats = onNavigateToStats,
-                modifier = Modifier.padding(
-                    start = SentupGroup.inset,
-                    end = SentupGroup.inset,
-                    top = 4.dp,
-                    bottom = SentupGroup.gap
-                )
-            )
-        }
-
-        // A: destinations, the same grouped card the tab used to show.
-        item(key = "flow_shortcuts") {
-            LibraryShortcutsCard(
-                likedCount = likedSongs.size,
-                onLikedClick = onLikedSongsClick,
-                downloadCount = downloadedSongs.size,
-                onDownloadsClick = onDownloadsClick,
-                readyOfflineCount = readyOfflineCount,
-                readyOfflineBytes = readyOfflineBytes,
-                readyOfflineUnnamed = readyOfflineUnnamed,
-                readyOfflineHistoryDisabled = readyOfflineHistoryDisabled,
-                onReadyOfflineClick = onReadyOfflineClick,
-                historyPlayCount = playCounts.values.sum(),
-                onHistoryClick = onNavigateToHistory,
-                onStatsClick = onNavigateToStats,
-                onCreatePlaylist = onCreatePlaylist
-            )
-        }
-
-        // B: playlists, two per row.
+        // B: playlists & playlist folders (Musify-style), two per row or list view.
         item(key = "flow_playlists_header") {
             Row(
                 modifier = Modifier
@@ -1442,6 +1836,13 @@ private fun LibrarySingleFlow(
                     text = pluralStringResource(R.plurals.n_playlists, playlists.size, playlists.size),
                     modifier = Modifier.weight(1f)
                 )
+                IconButton(onClick = { showCreatePlaylistFolderDialog = true }) {
+                    Icon(
+                        imageVector = Icons.Rounded.CreateNewFolder,
+                        contentDescription = stringResource(R.string.pl_folder_create),
+                        tint = MaterialTheme.colorScheme.primary
+                    )
+                }
                 importAction()
                 if (hiddenPlaylists.isNotEmpty()) {
                     TextButton(onClick = { showHiddenSheet = true }) {
@@ -1456,7 +1857,21 @@ private fun LibrarySingleFlow(
                 }
             }
         }
-        if (playlists.isEmpty()) {
+        if (playlists.isNotEmpty() || playlistFolders.isNotEmpty()) {
+            item(key = "flow_playlists_filter_bar") {
+                PlaylistFilterAndSortBar(
+                    sourceFilter = playlistSourceFilter,
+                    onSourceFilterChange = { playlistSourceFilter = it },
+                    sortOrder = playlistSortOrder,
+                    onSortOrderChange = { playlistSortOrder = it },
+                    isGridView = isPlaylistGridView,
+                    onToggleGridView = { isPlaylistGridView = !isPlaylistGridView },
+                    showFoldersChip = playlistFolders.isNotEmpty(),
+                    modifier = Modifier.padding(top = 4.dp, bottom = 8.dp)
+                )
+            }
+        }
+        if (playlists.isEmpty() && playlistFolders.isEmpty()) {
             item(key = "flow_playlists_empty") {
                 EmptyLibraryState(
                     icon = Icons.AutoMirrored.Rounded.PlaylistAdd,
@@ -1474,57 +1889,148 @@ private fun LibrarySingleFlow(
                     }
                 )
             }
-        } else {
-            items(playlists.chunked(2), key = { row -> "pl_" + row.joinToString("|") { it.id } }) { row ->
-                Row(
+        } else if (visiblePlaylistFolders.isEmpty() && visibleRootPlaylists.isEmpty()) {
+            item(key = "flow_playlists_filtered_empty") {
+                Box(
                     modifier = Modifier
                         .fillMaxWidth()
-                        .padding(
-                            start = SentupGroup.inset,
-                            end = SentupGroup.inset,
-                            top = 4.dp,
-                            bottom = 18.dp
-                        ),
-                    horizontalArrangement = Arrangement.spacedBy(LibraryTileGap)
+                        .padding(vertical = 28.dp, horizontal = SentupGroup.inset),
+                    contentAlignment = Alignment.Center
                 ) {
-                    row.forEach { playlist ->
-                        val isLocalPlaylist = localPlaylistIds.contains(playlist.id)
-                        val isSavedPlaylist = savedPlaylistIds.contains(playlist.id)
-                        val isYouTubeEditable = !isLocalPlaylist && !isSavedPlaylist &&
-                            playlist.id != "RTM" && playlist.id != "LM"
-                        Box(Modifier.weight(1f)) {
-                            ExpressivePlaylistCard(
-                                name = playlist.name?.let { listNameLabel(it) }
-                                    ?: stringResource(R.string.untitled_song),
-                                count = playlist.itemCount,
-                                subtitle = when {
-                                    isSavedPlaylist || playlist.itemCount < 0 ->
-                                        playlist.displaySubtitle()
-                                            .ifBlank { stringResource(R.string.label_playlist) }
-                                    else -> null
-                                },
-                                thumbnailUrl = playlist.thumbnailUrl,
-                                description = playlist.description,
-                                isEditable = isLocalPlaylist || isYouTubeEditable,
-                                isSaved = isSavedPlaylist,
-                                affectsYouTubeAccount = isYouTubeEditable && isLoggedIn,
-                                onEditConfirmed = { name, description ->
-                                    onEditPlaylist(playlist, name, description)
-                                },
-                                onDeleteConfirmed = { onDeletePlaylist(playlist) },
-                                onRemoveSaved = { onRemoveSavedPlaylist(playlist) },
-                                onHide = { onHidePlaylist(playlist) },
-                                selected = LocalLibraryOpenItem.current?.playlistId == playlist.id,
-                                onClick = { onPlaylistClick(playlist) }
-                            )
-                        }
-                    }
-                    if (row.size == 1) Spacer(Modifier.weight(1f))
+                    Text(
+                        text = stringResource(R.string.pl_filter_no_matches),
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
                 }
+            }
+        } else if (isPlaylistGridView) {
+            if (visiblePlaylistFolders.isNotEmpty()) {
+                items(
+                    visiblePlaylistFolders.chunked(2),
+                    key = { row -> "plfolder_" + row.joinToString("|") { it.id } }
+                ) { row ->
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(
+                                start = SentupGroup.inset,
+                                end = SentupGroup.inset,
+                                top = 4.dp,
+                                bottom = 18.dp
+                            ),
+                        horizontalArrangement = Arrangement.spacedBy(LibraryTileGap)
+                    ) {
+                        row.forEach { folder ->
+                            val inside = com.sentup.android.data.PlaylistFolderLogic.playlistsInFolder(
+                                folder,
+                                playlists
+                            )
+                            Box(Modifier.weight(1f)) {
+                                PlaylistFolderCard(
+                                    folder = folder,
+                                    playlistsInFolder = inside,
+                                    onClick = { onNavigateToPlaylistFolder(folder.id) },
+                                    onAddPlaylists = { addPlaylistsFolderTarget = folder },
+                                    onTogglePin = { resolvedPlaylistFolderStore.togglePinFolder(folder.id) },
+                                    onRename = { renamePlaylistFolderTarget = folder },
+                                    onDelete = { deletePlaylistFolderTarget = folder }
+                                )
+                            }
+                        }
+                        if (row.size == 1) Spacer(Modifier.weight(1f))
+                    }
+                }
+            }
+            if (visibleRootPlaylists.isNotEmpty()) {
+                items(
+                    visibleRootPlaylists.chunked(2),
+                    key = { row -> "pl_" + row.joinToString("|") { it.id } }
+                ) { row ->
+                    Row(
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .padding(
+                                start = SentupGroup.inset,
+                                end = SentupGroup.inset,
+                                top = 4.dp,
+                                bottom = 18.dp
+                            ),
+                        horizontalArrangement = Arrangement.spacedBy(LibraryTileGap)
+                    ) {
+                        row.forEach { playlist ->
+                            val isLocalPlaylist = localPlaylistIds.contains(playlist.id)
+                            val isSavedPlaylist = savedPlaylistIds.contains(playlist.id)
+                            val isYouTubeEditable = !isLocalPlaylist && !isSavedPlaylist &&
+                                playlist.id != "RTM" && playlist.id != "LM"
+                            Box(Modifier.weight(1f)) {
+                                ExpressivePlaylistCard(
+                                    name = playlist.name?.let { listNameLabel(it) }
+                                        ?: stringResource(R.string.untitled_song),
+                                    count = playlist.itemCount,
+                                    subtitle = when {
+                                        isSavedPlaylist || playlist.itemCount < 0 ->
+                                            playlist.displaySubtitle()
+                                                .ifBlank { stringResource(R.string.label_playlist) }
+                                        else -> null
+                                    },
+                                    thumbnailUrl = playlist.thumbnailUrl,
+                                    description = playlist.description,
+                                    isEditable = isLocalPlaylist || isYouTubeEditable,
+                                    isSaved = isSavedPlaylist,
+                                    affectsYouTubeAccount = isYouTubeEditable && isLoggedIn,
+                                    onMoveToFolder = { movePlaylistTarget = playlist },
+                                    onEditConfirmed = { name, description ->
+                                        onEditPlaylist(playlist, name, description)
+                                    },
+                                    onDeleteConfirmed = { onDeletePlaylist(playlist) },
+                                    onRemoveSaved = { onRemoveSavedPlaylist(playlist) },
+                                    onHide = { onHidePlaylist(playlist) },
+                                    selected = LocalLibraryOpenItem.current?.playlistId == playlist.id,
+                                    onClick = { onPlaylistClick(playlist) }
+                                )
+                            }
+                        }
+                        if (row.size == 1) Spacer(Modifier.weight(1f))
+                    }
+                }
+            }
+        } else {
+            items(visiblePlaylistFolders, key = { "plfolder_row_" + it.id }) { folder ->
+                val inside = com.sentup.android.data.PlaylistFolderLogic.playlistsInFolder(folder, playlists)
+                PlaylistFolderListRow(
+                    folder = folder,
+                    playlistsInFolder = inside,
+                    onClick = { onNavigateToPlaylistFolder(folder.id) },
+                    onAddPlaylists = { addPlaylistsFolderTarget = folder },
+                    onTogglePin = { resolvedPlaylistFolderStore.togglePinFolder(folder.id) },
+                    onRename = { renamePlaylistFolderTarget = folder },
+                    onDelete = { deletePlaylistFolderTarget = folder }
+                )
+            }
+            items(visibleRootPlaylists, key = { "pl_row_" + it.id }) { playlist ->
+                val isLocalPlaylist = localPlaylistIds.contains(playlist.id)
+                val isSavedPlaylist = savedPlaylistIds.contains(playlist.id)
+                val isYouTubeEditable = !isLocalPlaylist && !isSavedPlaylist &&
+                    playlist.id != "RTM" && playlist.id != "LM"
+                PlaylistListRow(
+                    playlist = playlist,
+                    isLocal = isLocalPlaylist,
+                    isSaved = isSavedPlaylist,
+                    isEditable = isLocalPlaylist || isYouTubeEditable,
+                    onClick = { onPlaylistClick(playlist) },
+                    onMoveToFolder = { movePlaylistTarget = playlist },
+                    onHide = { onHidePlaylist(playlist) },
+                    onEditConfirmed = { name, description ->
+                        onEditPlaylist(playlist, name, description)
+                    },
+                    onDeleteConfirmed = { onDeletePlaylist(playlist) },
+                    onRemoveSaved = { onRemoveSavedPlaylist(playlist) }
+                )
             }
         }
 
-        // C: artists, two per row.
+        // C: artists, horizontal carousel with real artist photos.
         if (artists.isNotEmpty()) {
             item(key = "flow_artists_header") {
                 SentupGroupHeader(
@@ -1532,40 +2038,39 @@ private fun LibrarySingleFlow(
                     modifier = Modifier.padding(top = SentupGroup.gap)
                 )
             }
-            items(artists.chunked(2), key = { row -> "ar_" + row.joinToString("|") { it.first } }) { row ->
-                Row(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .padding(
-                            start = SentupGroup.inset,
-                            end = SentupGroup.inset,
-                            top = 4.dp,
-                            bottom = 20.dp
-                        ),
-                    horizontalArrangement = Arrangement.spacedBy(LibraryTileGap)
+            item(key = "flow_artists_rail") {
+                LazyRow(
+                    contentPadding = PaddingValues(
+                        start = SentupGroup.inset,
+                        end = SentupGroup.inset,
+                        top = 6.dp,
+                        bottom = 14.dp
+                    ),
+                    horizontalArrangement = Arrangement.spacedBy(14.dp)
                 ) {
-                    row.forEach { (artist, artistSongs) ->
-                        Box(Modifier.weight(1f)) {
+                    items(artists, key = { "ar_" + it.first }) { (artist, artistSongs) ->
+                        val fallbackArt = artistSongs.firstOrNull { it.albumArtUri != null }
+                            ?.albumArtUri?.toString()
+                            ?: artistSongs.firstOrNull { it.thumbnailUrl != null }?.thumbnailUrl
+                        val realPhoto = resolvedArtistPhotos[artist] ?: fallbackArt
+                        Box(modifier = Modifier.width(112.dp)) {
                             ArtistTile(
                                 name = artist,
                                 caption = pluralStringResource(
                                     R.plurals.n_songs, artistSongs.size, artistSongs.size
                                 ),
                                 captionIsPrimary = false,
-                                thumbnailUrl = artistSongs.firstOrNull { it.albumArtUri != null }
-                                    ?.albumArtUri?.toString()
-                                    ?: artistSongs.firstOrNull { it.thumbnailUrl != null }?.thumbnailUrl,
+                                thumbnailUrl = realPhoto,
                                 selected = LocalLibraryOpenItem.current?.artistName == artist,
                                 onClick = { onArtistClick(artist) }
                             )
                         }
                     }
-                    if (row.size == 1) Spacer(Modifier.weight(1f))
                 }
             }
         }
 
-        // D: albums, two per row.
+        // D: albums, horizontal carousel.
         if (albums.isNotEmpty()) {
             item(key = "flow_albums_header") {
                 SentupGroupHeader(
@@ -1573,22 +2078,20 @@ private fun LibrarySingleFlow(
                     modifier = Modifier.padding(top = SentupGroup.gap)
                 )
             }
-            items(albums.chunked(2), key = { row -> "al_" + row.joinToString("|") { it.first } }) { row ->
-                Row(
-                    modifier = Modifier
-                        .fillMaxWidth()
-                        .padding(
-                            start = SentupGroup.inset,
-                            end = SentupGroup.inset,
-                            top = 4.dp,
-                            bottom = 20.dp
-                        ),
-                    horizontalArrangement = Arrangement.spacedBy(LibraryTileGap)
+            item(key = "flow_albums_rail") {
+                LazyRow(
+                    contentPadding = PaddingValues(
+                        start = SentupGroup.inset,
+                        end = SentupGroup.inset,
+                        top = 6.dp,
+                        bottom = 14.dp
+                    ),
+                    horizontalArrangement = Arrangement.spacedBy(14.dp)
                 ) {
-                    row.forEach { (album, albumSongs) ->
+                    items(albums, key = { "al_" + it.first }) { (album, albumSongs) ->
                         val art = albumSongs.firstOrNull { it.albumArtUri != null }?.albumArtUri?.toString()
                             ?: albumSongs.firstOrNull { it.thumbnailUrl != null }?.thumbnailUrl
-                        Box(Modifier.weight(1f)) {
+                        Box(modifier = Modifier.width(148.dp)) {
                             ExpressivePlaylistCard(
                                 name = album,
                                 count = albumSongs.size,
@@ -1601,17 +2104,46 @@ private fun LibrarySingleFlow(
                             )
                         }
                     }
-                    if (row.size == 1) Spacer(Modifier.weight(1f))
                 }
             }
         }
 
         // E: every song, one row each.
         item(key = "flow_songs_header") {
-            SentupGroupHeader(
-                text = pluralStringResource(R.plurals.n_songs, songs.size, songs.size),
-                modifier = Modifier.padding(top = SentupGroup.gap)
-            )
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(
+                        start = SentupGroup.inset + SentupGroup.dividerInset,
+                        end = SentupGroup.inset + SentupGroup.dividerInset,
+                        top = SentupGroup.gap
+                    ),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                SentupGroupHeader(
+                    text = pluralStringResource(R.plurals.n_songs, songs.size, songs.size),
+                    modifier = Modifier.weight(1f)
+                )
+                if (songs.isNotEmpty()) {
+                    FilledTonalButton(
+                        onClick = onShuffle,
+                        shape = RoundedCornerShape(SentupRadii.pill),
+                        contentPadding = PaddingValues(horizontal = 12.dp, vertical = 4.dp),
+                        modifier = Modifier.height(34.dp)
+                    ) {
+                        Icon(
+                            Icons.Rounded.Shuffle,
+                            contentDescription = null,
+                            modifier = Modifier.size(16.dp)
+                        )
+                        Spacer(Modifier.width(6.dp))
+                        Text(
+                            text = stringResource(R.string.cd_shuffle),
+                            style = MaterialTheme.typography.labelMedium
+                        )
+                    }
+                }
+            }
         }
         items(songs, key = { "song_" + it.id }) { song ->
             SongListItem(
@@ -1621,6 +2153,7 @@ private fun LibrarySingleFlow(
                 onLongClick = onSongLongPress?.let { press -> { press(song) } },
                 onClick = { onSongClick(song) }
             )
+        }
         }
         }
 
@@ -1662,6 +2195,221 @@ private fun LibrarySingleFlow(
             hidden = hiddenPlaylists,
             onUnhide = onUnhidePlaylist,
             onDismiss = { showHiddenSheet = false }
+        )
+    }
+
+    if (showCreatePlaylistFolderDialog) {
+        val emptyErr = stringResource(R.string.pl_folder_empty_error)
+        val dupErr = stringResource(R.string.pl_folder_duplicate_error)
+        CreateOrRenamePlaylistFolderDialog(
+            isRename = false,
+            onDismiss = { showCreatePlaylistFolderDialog = false },
+            onSubmit = { name ->
+                when (resolvedPlaylistFolderStore.createFolder(name)) {
+                    is com.sentup.android.data.CreatePlaylistFolderResult.Created -> {
+                        showCreatePlaylistFolderDialog = false
+                        null
+                    }
+                    com.sentup.android.data.CreatePlaylistFolderResult.BlankName -> emptyErr
+                    com.sentup.android.data.CreatePlaylistFolderResult.DuplicateName -> dupErr
+                }
+            }
+        )
+    }
+
+    renamePlaylistFolderTarget?.let { target ->
+        val emptyErr = stringResource(R.string.pl_folder_empty_error)
+        val dupErr = stringResource(R.string.pl_folder_duplicate_error)
+        CreateOrRenamePlaylistFolderDialog(
+            initialName = target.name,
+            isRename = true,
+            onDismiss = { renamePlaylistFolderTarget = null },
+            onSubmit = { newName ->
+                when {
+                    newName.trim().isEmpty() -> emptyErr
+                    !resolvedPlaylistFolderStore.renameFolder(target.id, newName) -> dupErr
+                    else -> {
+                        renamePlaylistFolderTarget = null
+                        null
+                    }
+                }
+            }
+        )
+    }
+
+    deletePlaylistFolderTarget?.let { target ->
+        AlertDialog(
+            onDismissRequest = { deletePlaylistFolderTarget = null },
+            title = { Text(stringResource(R.string.pl_folder_delete)) },
+            text = { Text(stringResource(R.string.pl_folder_delete_confirm, target.name)) },
+            confirmButton = {
+                TextButton(
+                    onClick = {
+                        resolvedPlaylistFolderStore.deleteFolder(target.id)
+                        deletePlaylistFolderTarget = null
+                    }
+                ) {
+                    Text(stringResource(R.string.action_delete))
+                }
+            },
+            dismissButton = {
+                TextButton(onClick = { deletePlaylistFolderTarget = null }) {
+                    Text(stringResource(R.string.action_cancel))
+                }
+            }
+        )
+    }
+
+    addPlaylistsFolderTarget?.let { target ->
+        AddPlaylistsToFolderSheet(
+            targetFolder = target,
+            allPlaylists = playlists,
+            allFolders = playlistFolders,
+            onConfirmAdd = { ids ->
+                resolvedPlaylistFolderStore.addPlaylistsToFolder(ids, target.id)
+            },
+            onDismiss = { addPlaylistsFolderTarget = null }
+        )
+    }
+
+    movePlaylistTarget?.let { targetPl ->
+        MovePlaylistToFolderSheet(
+            playlist = targetPl,
+            folders = playlistFolders,
+            allPlaylists = playlists,
+            onMoveToFolder = { targetFolderId ->
+                resolvedPlaylistFolderStore.movePlaylistToFolder(targetPl.id, targetFolderId)
+            },
+            onCreateAndMove = { folderName ->
+                val res = resolvedPlaylistFolderStore.createFolder(folderName)
+                if (res is com.sentup.android.data.CreatePlaylistFolderResult.Created) {
+                    resolvedPlaylistFolderStore.movePlaylistToFolder(targetPl.id, res.folder.id)
+                }
+                res
+            },
+            onDismiss = { movePlaylistTarget = null }
+        )
+    }
+
+    if (showGenreClusterSheet) {
+        val activeOpenFolder = remember(customFolders, currentCustomFolderId) {
+            customFolders.firstOrNull { it.id == currentCustomFolderId }
+        }
+        val scopeArtists = remember(activeOpenFolder, librarySongsById) {
+            activeOpenFolder?.let { f ->
+                buildList {
+                    addAll(f.artistNames)
+                    f.songIds.mapNotNull { librarySongsById[it]?.artist }
+                        .filterNot { isUnknownArtist(it) }
+                        .forEach { add(it) }
+                }.distinct()
+            }
+        }
+        val allClusterArtists = remember(artists, customFolders, librarySongsById) {
+            buildList {
+                addAll(customFolders.flatMap { it.artistNames })
+                customFolders.flatMap { f ->
+                    f.songIds.mapNotNull { librarySongsById[it]?.artist }.filterNot { isUnknownArtist(it) }
+                }.forEach { add(it) }
+                artists.forEach { add(it.first) }
+            }.distinct()
+        }
+        GenreClusterSheet(
+            artistNames = allClusterArtists,
+            allSongs = librarySongs,
+            artistPhotos = resolvedArtistPhotos,
+            artistGenres = snapshotArtistGenres,
+            folders = customFolders,
+            scopeFolderName = activeOpenFolder?.name,
+            scopeArtistNames = scopeArtists,
+            isAnalyzing = isEnrichingGenres,
+            onCreateGenreFolder = { genreName, clusterArtists ->
+                val created = customFolderStore.createFolder(genreName, parentId = currentCustomFolderId)
+                customFolderStore.setFolderContent(
+                    folderId = created.id,
+                    artistNames = clusterArtists,
+                    albumNames = emptyList(),
+                    songIds = emptyList()
+                )
+                currentCustomFolderId = created.id
+                folderSourceTab = FolderSourceTab.Custom
+                showGenreClusterSheet = false
+            },
+            onInspectArtistGenre = { target -> inspectArtistGenreTarget = target },
+            onOpenArtist = onArtistClick,
+            onDismiss = { showGenreClusterSheet = false }
+        )
+    }
+
+    inspectArtistGenreTarget?.let { targetArtist ->
+        val artistSongs = remember(librarySongs, targetArtist) {
+            librarySongs.filter { it.artist.trim().equals(targetArtist.trim(), ignoreCase = true) }
+        }
+        val pred = snapshotArtistGenres[targetArtist]
+            ?: com.sentup.android.ml.GenreClassifierMlEngine.classifyArtist(targetArtist, artistSongs)
+        val art = resolvedArtistPhotos[targetArtist]
+            ?: artistSongs.firstNotNullOfOrNull { it.albumArtUri?.toString() ?: it.thumbnailUrl }
+        ArtistGenreInspectorDialog(
+            artistName = targetArtist,
+            prediction = pred,
+            artistPhotoUrl = art,
+            onSelectGenre = { chosenGenre ->
+                com.sentup.android.ml.GenreClassifierMlEngine.setManualArtistGenre(folderContext, targetArtist, chosenGenre)
+                genreRefreshNonce++
+                inspectArtistGenreTarget = null
+            },
+            onResetAuto = {
+                com.sentup.android.ml.GenreClassifierMlEngine.clearManualArtistGenre(folderContext, targetArtist)
+                genreRefreshNonce++
+                inspectArtistGenreTarget = null
+            },
+            onOpenArtist = { onArtistClick(targetArtist) },
+            onDismiss = { inspectArtistGenreTarget = null }
+        )
+    }
+
+    splitByGenreTargetFolder?.let { folderTarget ->
+        val splits = remember(folderTarget, librarySongs, snapshotArtistGenres) {
+            com.sentup.android.ml.GenreClassifierMlEngine.planGenreSubfolderSplit(
+                folder = folderTarget,
+                allSongs = librarySongs,
+                artistPredictions = snapshotArtistGenres
+            )
+        }
+        if (splits.size >= 2) {
+            SplitFolderByGenreDialog(
+                folder = folderTarget,
+                splits = splits,
+                onConfirmSplit = {
+                    splits.forEach { split ->
+                        val child = customFolderStore.createFolder(split.folderName, parentId = folderTarget.id)
+                        customFolderStore.setFolderContent(
+                            folderId = child.id,
+                            artistNames = split.artists,
+                            albumNames = split.albums,
+                            songIds = split.songIds
+                        )
+                    }
+                    customFolderStore.setFolderContent(
+                        folderId = folderTarget.id,
+                        artistNames = emptyList(),
+                        albumNames = emptyList(),
+                        songIds = emptyList()
+                    )
+                    customFolderGenreFilter = null
+                    splitByGenreTargetFolder = null
+                },
+                onDismiss = { splitByGenreTargetFolder = null }
+            )
+        } else {
+            splitByGenreTargetFolder = null
+        }
+    }
+
+    if (showAutonomousMixMaker) {
+        com.sentup.android.ui.home.SentupMixMakerSheet(
+            viewModel = viewModel,
+            onDismiss = { showAutonomousMixMaker = false }
         )
     }
 
@@ -1711,6 +2459,13 @@ private fun LibrarySingleFlow(
             targetFolder = target,
             allSongs = librarySongs,
             viewModel = viewModel,
+            onSeedArtistPhotos = { seeded ->
+                val cache = com.sentup.android.data.ArtistPhotoCache(folderContext)
+                seeded.forEach { (artistName, url) ->
+                    resolvedArtistPhotos[artistName] = url
+                    cache.put(artistName, url)
+                }
+            },
             onConfirm = { chosenArtists, chosenAlbums, chosenSongIds ->
                 customFolderStore.setFolderContent(
                     folderId = target.id,
@@ -1742,6 +2497,92 @@ private fun LibrarySingleFlow(
             onConfirm = { rule ->
                 customFolderStore.setFolderAutoRule(target.id, rule)
                 autoRuleTargetFolder = null
+            }
+        )
+    }
+
+    coverTargetFolder?.let { target ->
+        val folderCandidateCovers = remember(target, librarySongs, resolvedArtistPhotos) {
+            val fSongs = com.sentup.android.data.CustomFolderTree
+                .allDescendantSongs(customFolders, target.id, librarySongs, playCounts, downloadedIds)
+            buildList {
+                target.artistNames.forEach { artistName -> resolvedArtistPhotos[artistName]?.let { add(it) } }
+                fSongs.forEach { s -> (s.albumArtUri?.toString() ?: s.thumbnailUrl)?.let { add(it) } }
+            }.distinct().take(12)
+        }
+        AlertDialog(
+            onDismissRequest = { coverTargetFolder = null },
+            title = { Text("Klasör Kapak Fotoğrafı") },
+            text = {
+                Column(verticalArrangement = Arrangement.spacedBy(12.dp)) {
+                    Text(
+                        text = "\"${target.name}\" klasörü için galeriden fotoğraf seçebilir veya klasör içi kapaklardan birini atayabilirsin.",
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant
+                    )
+                    Button(
+                        onClick = {
+                            folderCoverPickerLauncher.launch(
+                                androidx.activity.result.PickVisualMediaRequest(
+                                    androidx.activity.result.contract.ActivityResultContracts.PickVisualMedia.ImageOnly
+                                )
+                            )
+                        },
+                        shape = RoundedCornerShape(SentupRadii.pill),
+                        modifier = Modifier.fillMaxWidth()
+                    ) {
+                        Icon(Icons.Rounded.Image, contentDescription = null, modifier = Modifier.size(18.dp))
+                        Spacer(Modifier.width(8.dp))
+                        Text("Galeriden Fotoğraf Seç")
+                    }
+                    if (folderCandidateCovers.isNotEmpty()) {
+                        Text(
+                            text = "Klasördeki Sanatçı / Şarkı Kapaklarından Seç",
+                            style = MaterialTheme.typography.labelMedium,
+                            fontWeight = FontWeight.SemiBold,
+                            color = MaterialTheme.colorScheme.primary
+                        )
+                        androidx.compose.foundation.lazy.LazyRow(
+                            horizontalArrangement = Arrangement.spacedBy(8.dp)
+                        ) {
+                            items(folderCandidateCovers, key = { "fcover_$it" }) { artUrl ->
+                                Box(
+                                    modifier = Modifier
+                                        .size(64.dp)
+                                        .clip(RoundedCornerShape(12.dp))
+                                        .clickable {
+                                            customFolderStore.setFolderCover(target.id, artUrl)
+                                            coverTargetFolder = null
+                                        }
+                                ) {
+                                    AsyncImage(
+                                        model = googleImageAtSize(artUrl, 200),
+                                        contentDescription = null,
+                                        contentScale = ContentScale.Crop,
+                                        modifier = Modifier.fillMaxSize()
+                                    )
+                                }
+                            }
+                        }
+                    }
+                    if (!target.coverUri.isNullOrBlank()) {
+                        OutlinedButton(
+                            onClick = {
+                                customFolderStore.setFolderCover(target.id, null)
+                                coverTargetFolder = null
+                            },
+                            shape = RoundedCornerShape(SentupRadii.pill),
+                            modifier = Modifier.fillMaxWidth()
+                        ) {
+                            Text("Özel Kapağı Kaldır (Varsayılana Dön)")
+                        }
+                    }
+                }
+            },
+            confirmButton = {
+                TextButton(onClick = { coverTargetFolder = null }) {
+                    Text(stringResource(R.string.action_close))
+                }
             }
         )
     }
@@ -1864,7 +2705,9 @@ fun LibraryMainScreen(
     onEnqueueSong: ((Song, Boolean) -> Unit)? = null,
     onSetPlaybackSpeed: ((Float) -> Unit)? = null,
     onSeekToTimestamp: ((Song, Long) -> Unit)? = null,
-    allSongsListState: LazyListState = rememberLazyListState()
+    allSongsListState: LazyListState = rememberLazyListState(),
+    playlistFolderStore: com.sentup.android.data.PlaylistFolderStore? = null,
+    onNavigateToPlaylistFolder: (String) -> Unit = {}
 ) {
     val userPlaylists by viewModel.userPlaylists.collectAsState()
     val localPlaylistIds by viewModel.localPlaylistIds.collectAsState()
@@ -2062,7 +2905,9 @@ fun LibraryMainScreen(
                             onEnqueueSong = onEnqueueSong,
                             onSetPlaybackSpeed = onSetPlaybackSpeed,
                             onSeekToTimestamp = onSeekToTimestamp,
-                            onShuffle = { onShuffleQueue(sortedSongs) }
+                            onShuffle = { onShuffleQueue(sortedSongs) },
+                            playlistFolderStore = playlistFolderStore,
+                            onNavigateToPlaylistFolder = onNavigateToPlaylistFolder
                         )
                         LibraryTab.Playlists -> {
                             PlaylistsGrid(
@@ -3131,7 +3976,7 @@ private fun ArtistTile(
         ) {
             if (!thumbnailUrl.isNullOrBlank()) {
                 AsyncImage(
-                    model = thumbnailUrl,
+                    model = com.sentup.android.data.googleImageAtSize(thumbnailUrl, 400),
                     contentDescription = null,
                     contentScale = ContentScale.Crop,
                     modifier = Modifier.fillMaxSize()
@@ -3280,6 +4125,8 @@ fun ExpressivePlaylistCard(
     onEditConfirmed: (String, String?) -> Unit = { _, _ -> },
     onDeleteConfirmed: () -> Unit = {},
     onRemoveSaved: () -> Unit = {},
+    onMoveToFolder: (() -> Unit)? = null,
+    onRemoveFromFolder: (() -> Unit)? = null,
     /** Open in the detail pane beside the Library list; see [LocalLibraryOpenItem]. */
     selected: Boolean = false,
     onClick: () -> Unit
@@ -3324,7 +4171,7 @@ fun ExpressivePlaylistCard(
         ) {
             if (thumbnailUrl != null && thumbnailUrl != "null") {
                 AsyncImage(
-                    model = thumbnailUrl,
+                    model = com.sentup.android.data.googleImageAtSize(thumbnailUrl, 400),
                     contentDescription = null,
                     contentScale = ContentScale.Crop,
                     modifier = Modifier.fillMaxSize()
@@ -3402,7 +4249,7 @@ fun ExpressivePlaylistCard(
                     overflow = TextOverflow.Ellipsis
                 )
             }
-            if (isEditable || isSaved || onHide != null) {
+            if (isEditable || isSaved || onHide != null || onMoveToFolder != null || onRemoveFromFolder != null) {
                 Box {
                     IconButton(
                         onClick = { showMenu = true },
@@ -3416,6 +4263,30 @@ fun ExpressivePlaylistCard(
                         )
                     }
                     DropdownMenu(expanded = showMenu, onDismissRequest = { showMenu = false }) {
+                        onMoveToFolder?.let { move ->
+                            DropdownMenuItem(
+                                text = { Text(stringResource(R.string.pl_folder_move_to)) },
+                                onClick = {
+                                    showMenu = false
+                                    move()
+                                },
+                                leadingIcon = {
+                                    Icon(Icons.AutoMirrored.Rounded.DriveFileMove, contentDescription = null)
+                                }
+                            )
+                        }
+                        onRemoveFromFolder?.let { remove ->
+                            DropdownMenuItem(
+                                text = { Text(stringResource(R.string.pl_folder_remove_from)) },
+                                onClick = {
+                                    showMenu = false
+                                    remove()
+                                },
+                                leadingIcon = {
+                                    Icon(Icons.Rounded.FolderOff, contentDescription = null)
+                                }
+                            )
+                        }
                         // Hiding is offered on every card, including the ones
                         // with nothing else in this menu: the synthesized
                         // Supermix and Your Likes entries cannot be renamed,
@@ -3515,7 +4386,7 @@ fun ExpressivePlaylistCard(
     }
 }
 @Composable
-private fun EditPlaylistDialog(
+internal fun EditPlaylistDialog(
     initialName: String,
     initialDescription: String?,
     onDismiss: () -> Unit,

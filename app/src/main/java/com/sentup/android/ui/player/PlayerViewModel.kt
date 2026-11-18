@@ -1433,6 +1433,18 @@ class PlayerViewModel(private val context: Context) : ViewModel() {
         }
     }
 
+    fun skipNextTrack() {
+        controller?.let {
+            if (it.hasNextMediaItem()) it.seekToNextMediaItem() else it.seekToNext()
+        }
+    }
+
+    fun skipPreviousTrack() {
+        controller?.let {
+            if (it.hasPreviousMediaItem()) it.seekToPreviousMediaItem() else it.seekToPrevious()
+        }
+    }
+
     /**
      * Pause music playback without touching the queue. Also cancels a pending
      * playWhenReady while a track is still buffering, so a song that finishes

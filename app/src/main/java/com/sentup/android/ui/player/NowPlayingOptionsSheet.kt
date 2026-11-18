@@ -24,6 +24,7 @@ import androidx.compose.material.icons.automirrored.rounded.VolumeOff
 import androidx.compose.material.icons.automirrored.rounded.VolumeUp
 import androidx.compose.material.icons.rounded.AccountCircle
 import androidx.compose.material.icons.rounded.Album
+import androidx.compose.material.icons.rounded.AutoAwesome
 import androidx.compose.material.icons.rounded.Bedtime
 import androidx.compose.material.icons.rounded.Movie
 import androidx.compose.material.icons.rounded.Download
@@ -151,6 +152,7 @@ fun NowPlayingOptionsSheet(
     onWatchAsVideo: (() -> Unit)? = null,
 ) {
     var showPlaylists by remember { mutableStateOf(false) }
+    var showAskSong by remember { mutableStateOf(false) }
 
     // The account's playlists are a network read, and seven of the eight styles
     // never asked for them - their picker listed local playlists only. Asking
@@ -163,6 +165,27 @@ fun NowPlayingOptionsSheet(
         // tap on, and a menu that changed palette halfway through it would be
         // the worst of both.
         SongPlaylistPicker(song = song, viewModel = viewModel, onDismiss = onDismiss)
+        return
+    }
+
+    if (showAskSong) {
+        val genrePred = remember(song) {
+            com.sentup.android.ml.GenreClassifierMlEngine.classifySong(song)
+        }
+        val songDesc = buildString {
+            appendLine("Şarkı: ${song.title}")
+            appendLine("Sanatçı: ${song.artist}")
+            if (song.album.isNotBlank()) appendLine("Albüm: ${song.album}")
+            appendLine("Algılanan Tür (ML): ${genrePred.genre.displayNameTr}")
+        }
+        com.sentup.android.ui.video.VideoQaSheet(
+            title = "${song.title} — ${song.artist}",
+            description = songDesc,
+            chapters = emptyList(),
+            cues = emptyList(),
+            onSeekToMs = { ms -> viewModel.seekTo(ms) },
+            onDismiss = { showAskSong = false }
+        )
         return
     }
 
@@ -329,6 +352,14 @@ fun NowPlayingOptionsSheet(
             val watchAsVideo = onWatchAsVideo?.takeIf { song.hasWatchableVideo(context) }
             val canRefreshStream = song.source == SongSource.YOUTUBE
             val utilities = buildList<@Composable (Modifier) -> Unit> {
+                add { modifier ->
+                    OptionUtility(
+                        icon = Icons.Rounded.AutoAwesome,
+                        label = "Şarkıya Sor",
+                        modifier = modifier,
+                        onClick = { showAskSong = true }
+                    )
+                }
                 // First, because it is the only one here that changes what the
                 // app is doing rather than what it knows.
                 if (watchAsVideo != null) add { modifier ->

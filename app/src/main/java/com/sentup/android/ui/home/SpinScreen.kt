@@ -256,7 +256,7 @@ internal fun SpinOverlay(
 
 @OptIn(ExperimentalMaterial3ExpressiveApi::class)
 @Composable
-private fun SpinScreen(
+internal fun SpinScreen(
     initialSource: SpinSource,
     mix: List<Song>,
     forYou: List<Song>,
@@ -268,6 +268,7 @@ private fun SpinScreen(
     onPlay: (List<Song>, Song) -> Unit,
     onSongLongPress: ((Song) -> Unit)?,
     onBack: () -> Unit,
+    embeddedInTab: Boolean = false,
 ) {
     val haptics = rememberSentupHaptics()
     val scope = rememberCoroutineScope()
@@ -374,26 +375,28 @@ private fun SpinScreen(
         Row(
             modifier = Modifier
                 .fillMaxWidth()
-                .windowInsetsPadding(WindowInsets.statusBars)
-                .padding(start = 12.dp, end = 20.dp, top = 8.dp),
+                .then(if (embeddedInTab) Modifier else Modifier.windowInsetsPadding(WindowInsets.statusBars))
+                .padding(start = if (embeddedInTab) 20.dp else 12.dp, end = 20.dp, top = 8.dp),
             verticalAlignment = Alignment.CenterVertically
         ) {
-            FilledIconButton(
-                onClick = onBack,
-                shape = CircleShape,
-                colors = IconButtonDefaults.filledIconButtonColors(
-                    containerColor = MaterialTheme.colorScheme.surfaceContainerHigh,
-                    contentColor = MaterialTheme.colorScheme.onSurface
-                ),
-                modifier = Modifier.size(44.dp)
-            ) {
-                Icon(
-                    Icons.AutoMirrored.Filled.ArrowBack,
-                    contentDescription = stringResource(R.string.cd_back),
-                    modifier = Modifier.size(22.dp)
-                )
+            if (!embeddedInTab) {
+                FilledIconButton(
+                    onClick = onBack,
+                    shape = CircleShape,
+                    colors = IconButtonDefaults.filledIconButtonColors(
+                        containerColor = MaterialTheme.colorScheme.surfaceContainerHigh,
+                        contentColor = MaterialTheme.colorScheme.onSurface
+                    ),
+                    modifier = Modifier.size(44.dp)
+                ) {
+                    Icon(
+                        Icons.AutoMirrored.Filled.ArrowBack,
+                        contentDescription = stringResource(R.string.cd_back),
+                        modifier = Modifier.size(22.dp)
+                    )
+                }
+                Spacer(Modifier.width(14.dp))
             }
-            Spacer(Modifier.width(14.dp))
             Column(
                 modifier = Modifier
                     .weight(1f)

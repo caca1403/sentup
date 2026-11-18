@@ -38,7 +38,7 @@ internal interface RemoteLyricsProvider {
 }
 
 internal class LyricsHttpClient {
-    private val client = OkHttpClient.Builder()
+    private val client = VpnResilientNetwork.configureForVpn(OkHttpClient.Builder())
         .connectTimeout(7, TimeUnit.SECONDS)
         .readTimeout(7, TimeUnit.SECONDS)
         .callTimeout(9, TimeUnit.SECONDS)

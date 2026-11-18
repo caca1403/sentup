@@ -42,7 +42,7 @@ internal class WebApi(
                 .put("hl", apiHl())
                 .put("gl", http.contentRegion())
                 .apply {
-                    http.visitorIdentity.cachedOrNull()?.let { put("visitorData", it) }
+                    http.visitorIdentity.cachedOrSyncMint()?.let { put("visitorData", it) }
                 }
         )
 
@@ -68,12 +68,14 @@ internal class WebApi(
             .addHeader("X-YouTube-Client-Name", "1")
             .addHeader("X-YouTube-Client-Version", WEB_VERSION)
 
-        http.visitorIdentity.cachedOrNull()?.let { builder.addHeader("X-Goog-Visitor-Id", it) }
+        http.visitorIdentity.cachedOrSyncMint()?.let { builder.addHeader("X-Goog-Visitor-Id", it) }
 
         builder.authenticate(currentSession, "https://www.youtube.com")
 
         return try {
-            http.okHttpClient.newCall(builder.build()).execute().use { response ->
+            com.sentup.android.data.VpnResilientNetwork
+                .executeResilient(http.okHttpClient, builder.build())
+                .use { response ->
                 if (response.isSuccessful) {
                     response.body?.string()?.also { http.noteSessionState(it, currentSession) }
                 } else {
@@ -111,7 +113,7 @@ internal class WebApi(
         val session = sessionManager.captureSession()
         val url = "https://www.youtube.com/youtubei/v1/browse?key=$INNER_TUBE_API_KEY"
 
-        val visitorData = http.visitorIdentity.cachedOrNull()
+        val visitorData = http.visitorIdentity.cachedOrSyncMint()
 
         // Built through JSONObject rather than string interpolation so the
         // optional visitorData cannot produce malformed JSON.
@@ -148,7 +150,9 @@ internal class WebApi(
             .build()
 
         return try {
-            http.okHttpClient.newCall(request).execute().use { response ->
+            com.sentup.android.data.VpnResilientNetwork
+                .executeResilient(http.okHttpClient, request)
+                .use { response ->
                 // This used to return the body whatever the status, so a 429
                 // was handed to the parsers as a string, parsed to nothing, and
                 // surfaced as empty content - indistinguishable from a real

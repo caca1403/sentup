@@ -43,6 +43,7 @@ import androidx.compose.material.icons.rounded.FavoriteBorder
 import androidx.compose.material.icons.rounded.FilterAlt
 import androidx.compose.material.icons.rounded.History
 import androidx.compose.material.icons.rounded.MoreVert
+import androidx.compose.material.icons.rounded.Person
 import androidx.compose.material.icons.rounded.PlayArrow
 import androidx.compose.material.icons.rounded.PushPin
 import androidx.compose.material.icons.rounded.Refresh
@@ -169,6 +170,7 @@ fun ExploreContent(
     val listLayout = LocalVideoListLayout.current
 
     var showFilters by rememberSaveable { mutableStateOf(false) }
+    var filtersInitialTab by rememberSaveable { mutableStateOf(0) }
     var nameRequest by remember { mutableStateOf<NameRequest?>(null) }
 
     // Hoisted out of the callbacks below because those are plain function
@@ -214,10 +216,15 @@ fun ExploreContent(
     )
 
     if (showFilters) {
-        ExploreFilterSheet(
+        val matchingCount = remember(shelves) { shelves.sumOf { it.videos.size } }
+        ModernExploreRulesSheet(
             rules = rules,
             channels = channels,
+            matchingVideoCount = matchingCount,
+            initialTab = filtersInitialTab,
+            onSearchChannels = viewModel::searchChannels,
             onRulesChange = viewModel::updateRules,
+            onResetRules = viewModel::resetRules,
             onSaveAsList = {
                 showFilters = false
                 nameRequest = NameRequest(NameAction.SAVE_RULES)
@@ -242,58 +249,105 @@ fun ExploreContent(
             verticalArrangement = Arrangement.spacedBy(12.dp)
         ) {
             item(key = "explore_header") {
-                ExploreHeader(
+                val totalExploreVideos = remember(shelves) {
+                    shelves.sumOf { it.videos.size }
+                }
+                val firstShelfVideos = remember(shelves) {
+                    shelves.flatMap { it.videos }.distinctBy { it.videoId }
+                }
+                ExploreHeroBanner(
+                    videoCount = totalExploreVideos,
+                    rulesSummary = "${groupingLabel(rules.grouping)} • ${ageLabel(rules.freshness)} • ${lengthLabel(rules.length)}",
                     isDirty = selectedListId != null && viewModel.isDirty(),
+                    onPlayAll = if (firstShelfVideos.isNotEmpty() && onPlayShelf != null) {
+                        { onPlayShelf(firstShelfVideos, "Keşfet") }
+                    } else null,
                     onSaveToList = viewModel::saveToOpenList,
-                    onOpenFilters = { showFilters = true },
+                    onOpenFilters = {
+                        filtersInitialTab = 0
+                        showFilters = true
+                    },
+                    onOpenChannelsPicker = {
+                        filtersInitialTab = 2
+                        showFilters = true
+                    },
+                    selectedChannelCount = rules.channelIds.size,
                     onNewList = { nameRequest = NameRequest(NameAction.NEW_LIST) },
                     onSaveAsList = { nameRequest = NameRequest(NameAction.SAVE_RULES) },
                     onResetRules = viewModel::resetRules
                 )
             }
 
-            // Empty-by-default & tutorial when no custom Explore list exists yet.
-            if (lists.isEmpty() && selectedListId == null) {
-                item(key = "explore_tutorial_card") {
-                    Surface(
-                        shape = RoundedCornerShape(24.dp),
-                        color = MaterialTheme.colorScheme.surfaceContainerHigh,
-                        modifier = Modifier
-                            .fillMaxWidth()
-                            .padding(horizontal = 16.dp, vertical = 8.dp)
-                    ) {
-                        Column(
-                            modifier = Modifier.padding(20.dp),
-                            verticalArrangement = Arrangement.spacedBy(10.dp)
-                        ) {
-                            Icon(
-                                imageVector = Icons.Rounded.AutoAwesome,
-                                contentDescription = null,
-                                tint = MaterialTheme.colorScheme.primary,
-                                modifier = Modifier.size(32.dp)
-                            )
-                            Text(
-                                text = stringResource(R.string.explore_tutorial_title),
-                                style = MaterialTheme.typography.titleLarge,
-                                fontWeight = FontWeight.Bold
-                            )
-                            Text(
-                                text = stringResource(R.string.explore_tutorial_sub),
-                                style = MaterialTheme.typography.bodyMedium,
-                                color = MaterialTheme.colorScheme.onSurfaceVariant
-                            )
-                            Text(stringResource(R.string.explore_tutorial_step1), style = MaterialTheme.typography.bodySmall)
-                            Text(stringResource(R.string.explore_tutorial_step2), style = MaterialTheme.typography.bodySmall)
-                            Text(stringResource(R.string.explore_tutorial_step3), style = MaterialTheme.typography.bodySmall)
-                            Spacer(Modifier.height(4.dp))
-                            Button(
-                                onClick = { showFilters = true },
-                                shape = RoundedCornerShape(999.dp),
-                                modifier = Modifier.fillMaxWidth()
-                            ) {
-                                Text(stringResource(R.string.explore_tutorial_cta))
+            item(key = "explore_quick_modes") {
+                LazyRow(
+                    contentPadding = PaddingValues(horizontal = 16.dp),
+                    horizontalArrangement = Arrangement.spacedBy(10.dp)
+                ) {
+                    item {
+                        ExploreVisualPresetTile(
+                            title = "Tümü",
+                            subtitle = "Genel akış",
+                            icon = Icons.Rounded.AutoAwesome,
+                            selected = rules.freshness == ExploreFreshness.ANY && rules.length == ExploreLength.ANY,
+                            containerColor = MaterialTheme.colorScheme.surfaceContainerHigh,
+                            onClick = { viewModel.resetRules() }
+                        )
+                    }
+                    item {
+                        ExploreVisualPresetTile(
+                            title = "Son 24 Saat",
+                            subtitle = "En taze",
+                            icon = Icons.Rounded.Whatshot,
+                            selected = rules.freshness == ExploreFreshness.TODAY,
+                            containerColor = MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.72f),
+                            onClick = { viewModel.updateRules(rules.copy(freshness = ExploreFreshness.TODAY)) }
+                        )
+                    }
+                    item {
+                        ExploreVisualPresetTile(
+                            title = "Kısa (<10 dk)",
+                            subtitle = "Hızlı izle",
+                            icon = Icons.Rounded.Schedule,
+                            selected = rules.length == ExploreLength.SHORT,
+                            containerColor = MaterialTheme.colorScheme.secondaryContainer.copy(alpha = 0.78f),
+                            onClick = { viewModel.updateRules(rules.copy(length = ExploreLength.SHORT)) }
+                        )
+                    }
+                    item {
+                        ExploreVisualPresetTile(
+                            title = "Derinlemesine",
+                            subtitle = "20+ dakika",
+                            icon = Icons.Rounded.VideoLibrary,
+                            selected = rules.length == ExploreLength.LONG,
+                            containerColor = MaterialTheme.colorScheme.tertiaryContainer.copy(alpha = 0.72f),
+                            onClick = { viewModel.updateRules(rules.copy(length = ExploreLength.LONG)) }
+                        )
+                    }
+                    item {
+                        ExploreVisualPresetTile(
+                            title = if (rules.channelIds.isNotEmpty()) "Kanallar (${rules.channelIds.size})" else "Kanallar",
+                            subtitle = "Kanal seç",
+                            icon = Icons.Rounded.Person,
+                            selected = rules.channelIds.isNotEmpty(),
+                            containerColor = MaterialTheme.colorScheme.secondaryContainer.copy(alpha = 0.72f),
+                            onClick = {
+                                filtersInitialTab = 2
+                                showFilters = true
                             }
-                        }
+                        )
+                    }
+                    item {
+                        ExploreVisualPresetTile(
+                            title = "Kurallar",
+                            subtitle = "Özelleştir",
+                            icon = Icons.Rounded.Tune,
+                            selected = false,
+                            containerColor = MaterialTheme.colorScheme.surfaceContainerHighest,
+                            onClick = {
+                                filtersInitialTab = 0
+                                showFilters = true
+                            }
+                        )
                     }
                 }
             }
@@ -326,7 +380,10 @@ fun ExploreContent(
             }
 
             item(key = "explore_chips") {
-                ExploreFilterBar(rules = rules, onOpenFilters = { showFilters = true })
+                ExploreFilterBar(rules = rules, onOpenFilters = {
+                    filtersInitialTab = 0
+                    showFilters = true
+                })
             }
 
             if (shelves.isEmpty()) {
@@ -399,6 +456,193 @@ fun ExploreContent(
 // --------------------------------------------------------------------
 // Header
 // --------------------------------------------------------------------
+
+@Composable
+private fun ExploreHeroBanner(
+    videoCount: Int,
+    rulesSummary: String,
+    isDirty: Boolean,
+    onPlayAll: (() -> Unit)?,
+    onSaveToList: () -> Unit,
+    onOpenFilters: () -> Unit,
+    onOpenChannelsPicker: () -> Unit = {},
+    selectedChannelCount: Int = 0,
+    onNewList: () -> Unit,
+    onSaveAsList: () -> Unit,
+    onResetRules: () -> Unit
+) {
+    var menuOpen by remember { mutableStateOf(false) }
+    Surface(
+        shape = RoundedCornerShape(24.dp),
+        color = MaterialTheme.colorScheme.primaryContainer.copy(alpha = 0.42f),
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(horizontal = 16.dp, vertical = 6.dp)
+    ) {
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(16.dp),
+            verticalArrangement = Arrangement.spacedBy(12.dp)
+        ) {
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                verticalAlignment = Alignment.CenterVertically
+            ) {
+                Surface(
+                    shape = CircleShape,
+                    color = MaterialTheme.colorScheme.primary,
+                    modifier = Modifier.size(40.dp)
+                ) {
+                    Box(contentAlignment = Alignment.Center) {
+                        Icon(
+                            imageVector = Icons.Rounded.AutoAwesome,
+                            contentDescription = null,
+                            tint = MaterialTheme.colorScheme.onPrimary,
+                            modifier = Modifier.size(22.dp)
+                        )
+                    }
+                }
+                Spacer(Modifier.width(12.dp))
+                Column(modifier = Modifier.weight(1f)) {
+                    Text(
+                        text = stringResource(R.string.explore_title),
+                        style = MaterialTheme.typography.headlineSmall,
+                        fontWeight = FontWeight.Bold,
+                        color = MaterialTheme.colorScheme.onSurface
+                    )
+                    Text(
+                        text = if (videoCount > 0) "$videoCount video • $rulesSummary" else rulesSummary,
+                        style = MaterialTheme.typography.bodySmall,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        maxLines = 1,
+                        overflow = TextOverflow.Ellipsis
+                    )
+                }
+                Box {
+                    IconButton(onClick = { menuOpen = true }) {
+                        Icon(
+                            Icons.Rounded.MoreVert,
+                            contentDescription = stringResource(R.string.explore_menu)
+                        )
+                    }
+                    DropdownMenu(expanded = menuOpen, onDismissRequest = { menuOpen = false }) {
+                        DropdownMenuItem(
+                            text = { Text(stringResource(R.string.explore_new_list)) },
+                            leadingIcon = { Icon(Icons.Rounded.Add, contentDescription = null) },
+                            onClick = { menuOpen = false; onNewList() }
+                        )
+                        DropdownMenuItem(
+                            text = { Text(stringResource(R.string.explore_save_as_list)) },
+                            leadingIcon = { Icon(Icons.Rounded.ContentCopy, contentDescription = null) },
+                            onClick = { menuOpen = false; onSaveAsList() }
+                        )
+                        DropdownMenuItem(
+                            text = { Text(stringResource(R.string.explore_reset_rules)) },
+                            leadingIcon = { Icon(Icons.Rounded.Refresh, contentDescription = null) },
+                            onClick = { menuOpen = false; onResetRules() }
+                        )
+                    }
+                }
+            }
+
+            Row(
+                modifier = Modifier.fillMaxWidth(),
+                horizontalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                if (onPlayAll != null) {
+                    Button(
+                        onClick = onPlayAll,
+                        shape = RoundedCornerShape(999.dp),
+                        contentPadding = PaddingValues(horizontal = 16.dp, vertical = 8.dp),
+                        modifier = Modifier.weight(1f)
+                    ) {
+                        Icon(Icons.Rounded.PlayArrow, contentDescription = null, modifier = Modifier.size(18.dp))
+                        Spacer(Modifier.width(6.dp))
+                        Text("Tümünü Oynat", maxLines = 1, overflow = TextOverflow.Ellipsis)
+                    }
+                }
+                androidx.compose.material3.FilledTonalButton(
+                    onClick = onOpenChannelsPicker,
+                    shape = RoundedCornerShape(999.dp),
+                    contentPadding = PaddingValues(horizontal = 12.dp, vertical = 8.dp)
+                ) {
+                    Icon(Icons.Rounded.Person, contentDescription = null, modifier = Modifier.size(18.dp))
+                    Spacer(Modifier.width(4.dp))
+                    Text(if (selectedChannelCount > 0) "Kanallar ($selectedChannelCount)" else "Kanallar")
+                }
+                androidx.compose.material3.FilledTonalButton(
+                    onClick = onOpenFilters,
+                    shape = RoundedCornerShape(999.dp),
+                    contentPadding = PaddingValues(horizontal = 14.dp, vertical = 8.dp),
+                    modifier = if (onPlayAll == null) Modifier.weight(1f) else Modifier
+                ) {
+                    Icon(Icons.Rounded.Tune, contentDescription = null, modifier = Modifier.size(18.dp))
+                    Spacer(Modifier.width(6.dp))
+                    Text("Kurallar")
+                }
+                if (isDirty) {
+                    androidx.compose.material3.FilledTonalButton(
+                        onClick = onSaveToList,
+                        shape = RoundedCornerShape(999.dp),
+                        contentPadding = PaddingValues(horizontal = 14.dp, vertical = 8.dp)
+                    ) {
+                        Icon(Icons.Rounded.Check, contentDescription = null, modifier = Modifier.size(18.dp))
+                        Spacer(Modifier.width(4.dp))
+                        Text("Kaydet")
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun ExploreVisualPresetTile(
+    title: String,
+    subtitle: String,
+    icon: ImageVector,
+    selected: Boolean,
+    containerColor: androidx.compose.ui.graphics.Color,
+    onClick: () -> Unit
+) {
+    Surface(
+        onClick = onClick,
+        shape = RoundedCornerShape(18.dp),
+        color = containerColor,
+        border = if (selected) androidx.compose.foundation.BorderStroke(
+            2.dp,
+            MaterialTheme.colorScheme.primary
+        ) else null,
+        modifier = Modifier.width(136.dp)
+    ) {
+        Column(
+            modifier = Modifier.padding(12.dp),
+            verticalArrangement = Arrangement.spacedBy(6.dp)
+        ) {
+            Icon(
+                imageVector = icon,
+                contentDescription = null,
+                tint = if (selected) MaterialTheme.colorScheme.primary else MaterialTheme.colorScheme.onSurfaceVariant,
+                modifier = Modifier.size(22.dp)
+            )
+            Text(
+                text = title,
+                style = MaterialTheme.typography.titleSmall,
+                fontWeight = FontWeight.Bold,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis
+            )
+            Text(
+                text = subtitle,
+                style = MaterialTheme.typography.labelSmall,
+                color = MaterialTheme.colorScheme.onSurfaceVariant,
+                maxLines = 1,
+                overflow = TextOverflow.Ellipsis
+            )
+        }
+    }
+}
 
 @Composable
 private fun ExploreHeader(

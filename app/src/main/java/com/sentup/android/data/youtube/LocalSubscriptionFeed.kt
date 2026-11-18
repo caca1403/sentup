@@ -183,7 +183,9 @@ internal class LocalSubscriptionFeed(
                 .addHeader("User-Agent", BROWSER_USER_AGENT)
                 .apply { feedCacheControl(forceFresh)?.let { cacheControl(it) } }
                 .build()
-            val body = http.okHttpClient.newCall(request).execute().use { response ->
+            val body = com.sentup.android.data.VpnResilientNetwork
+                .executeResilient(http.okHttpClient, request)
+                .use { response ->
                 if (!response.isSuccessful) {
                     // 429 is a verdict on this device, not on this channel, and
                     // it is the one code the browse fallback must not answer:

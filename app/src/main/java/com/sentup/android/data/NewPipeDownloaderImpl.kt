@@ -60,7 +60,7 @@ class NewPipeDownloaderImpl(
         }
 
         try {
-            val response = client.newCall(requestBuilder.build()).execute()
+            val response = VpnResilientNetwork.executeResilient(client, requestBuilder.build())
             
             if (response.code == 429) {
                 // Record it before throwing. This was the only place in the app

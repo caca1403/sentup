@@ -48,7 +48,9 @@ class LastFmRepository private constructor(private val context: Context) {
     internal val recordingGeneration get() = generation
     private var operation: Job? = null
     private var retryAfter = 0L
-    private val client = OkHttpClient.Builder().callTimeout(25, TimeUnit.SECONDS).build()
+    private val client = VpnResilientNetwork.configureForVpn(OkHttpClient.Builder())
+        .callTimeout(25, TimeUnit.SECONDS)
+        .build()
     private val mutable = MutableStateFlow(snapshot())
     val state = mutable.asStateFlow()
     private val privacyPreferences = ThemePreferences(context)

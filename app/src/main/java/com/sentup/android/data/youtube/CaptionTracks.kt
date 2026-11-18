@@ -98,7 +98,9 @@ internal class CaptionTracks(
                 .url(track.vttUrl)
                 .addHeader("User-Agent", BROWSER_USER_AGENT)
                 .build()
-            http.okHttpClient.newCall(request).execute().use { response ->
+            com.sentup.android.data.VpnResilientNetwork
+                .executeResilient(http.okHttpClient, request)
+                .use { response ->
                 if (!response.isSuccessful) {
                     KLog.w(
                         YOUTUBE_TAG,

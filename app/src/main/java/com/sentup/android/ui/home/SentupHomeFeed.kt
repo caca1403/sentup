@@ -28,6 +28,8 @@ import androidx.compose.foundation.lazy.LazyListState
 import androidx.compose.foundation.lazy.LazyRow
 import androidx.compose.foundation.lazy.items
 import androidx.compose.foundation.lazy.rememberLazyListState
+import androidx.compose.foundation.pager.HorizontalPager
+import androidx.compose.foundation.pager.rememberPagerState
 import androidx.compose.foundation.shape.CircleShape
 import androidx.compose.foundation.shape.RoundedCornerShape
 import androidx.compose.material.icons.Icons
@@ -38,6 +40,7 @@ import androidx.compose.material.icons.rounded.Favorite
 import androidx.compose.material.icons.rounded.Insights
 import androidx.compose.material.icons.rounded.Pause
 import androidx.compose.material.icons.rounded.PlayArrow
+import androidx.compose.material.icons.rounded.PushPin
 import androidx.compose.material.icons.rounded.Radio
 import androidx.compose.material.icons.rounded.Settings
 import androidx.compose.material.icons.rounded.Shuffle
@@ -196,6 +199,8 @@ internal fun SentupHomeFeed(
      * already owns the instance and can pass it through.
      */
     playerViewModel: com.sentup.android.ui.player.PlayerViewModel? = null,
+    onOpenCustomFolder: (String) -> Unit = {},
+    onOpenVideoPlaylist: (com.sentup.android.data.VideoPlaylist) -> Unit = {},
     /** Opens the listening statistics page; the weekly strip's destination. */
     onStatsClick: () -> Unit = {}
 ) {
@@ -220,6 +225,7 @@ internal fun SentupHomeFeed(
     val popoutSong = remember { mutableStateOf<Song?>(null) }
     val artistOptions = remember { mutableStateOf<TopArtist?>(null) }
     var popoutLikedTick by remember { mutableIntStateOf(0) }
+    var showAutonomousMixSheet by remember { mutableStateOf(false) }
 
     val openSongPreview: (Song) -> Unit = { song ->
         if (playerViewModel != null) {
@@ -263,6 +269,8 @@ internal fun SentupHomeFeed(
     // Home personalisation: which lists the user pinned to the front, kept in
     // its own prefs file so it survives (and does not touch) theme storage.
     var showMixMaker by remember { mutableStateOf(false) }
+    val pinStore = remember(context) { HomePinStore(context) }
+    val pinsSnapshot by pinStore.snapshot.collectAsState()
     val pinPrefs = remember(context) {
         context.getSharedPreferences("sentup_home_pins", android.content.Context.MODE_PRIVATE)
     }
@@ -270,9 +278,9 @@ internal fun SentupHomeFeed(
         mutableStateOf(pinPrefs.getString("pinned", "").orEmpty().split(",").filter { it.isNotBlank() })
     }
     val togglePin: (String) -> Unit = { id ->
+        pinStore.togglePlaylist(id)
         val next = if (id in pinnedIds) pinnedIds - id else (pinnedIds + id)
         pinnedIds = next
-        pinPrefs.edit().putString("pinned", next.joinToString(",")).apply()
     }
     val serverMixes = remember(musicBrowse) {
         musicBrowse[BROWSE_HOME]?.shelves.orEmpty()
@@ -403,6 +411,34 @@ internal fun SentupHomeFeed(
         }
     }
 
+    var showPinManager by remember { mutableStateOf(false) }
+    var sonicFilter by androidx.compose.runtime.saveable.rememberSaveable { mutableStateOf(HomeSonicFilter.All) }
+
+    val customFolderStore = remember(context) { com.sentup.android.data.CustomFolderStore(context) }
+    val customFolders by customFolderStore.folders.collectAsState()
+    val playlistFolderStore = remember(context) { com.sentup.android.data.PlaylistFolderStore(context) }
+    val playlistFolders by playlistFolderStore.folders.collectAsState()
+    val statsRepoForHome = remember(context) { com.sentup.android.data.StatsRepository(context) }
+    val statsPlayCounts by androidx.compose.runtime.produceState(
+        initialValue = emptyMap<String, Int>(),
+        key1 = statsRepoForHome
+    ) {
+        value = runCatching { statsRepoForHome.loadHistory() }
+            .getOrDefault(emptyList())
+            .groupingBy { it.songId }
+            .eachCount()
+    }
+    val accountWatchlists by viewModel.videoPlaylists.collectAsState()
+    val localWatchlists by viewModel.localVideoPlaylists.collectAsState()
+    val savedWatchlists by viewModel.savedVideoPlaylists.collectAsState()
+    val allWatchlists = remember(accountWatchlists, localWatchlists, savedWatchlists) {
+        (localWatchlists.map { it.toVideoPlaylist() } + savedWatchlists + accountWatchlists)
+            .distinctBy { it.playlistId }
+    }
+    val sleepEndsAtMs = playerViewModel?.sleepTimerEndsAt?.collectAsState()?.value
+    val sleepEndOfTrack = playerViewModel?.sleepTimerEndOfTrack?.collectAsState()?.value ?: false
+    val offlineSongIds = remember(offlineSongs) { offlineSongs.mapTo(HashSet()) { it.id } }
+
     ExpressivePullToRefresh(
         // Placeholders already say "loading" on first load; the spinner is
         // only for a refresh the user asked for.
@@ -447,24 +483,174 @@ internal fun SentupHomeFeed(
                             canStartRadio = playerViewModel != null && radioSeed != null,
                             onShuffleLiked = { playerViewModel?.playQueueShuffled(likedSongs) },
                             onRadio = { radioSeed?.let { playerViewModel?.playSongRadio(it) } },
-                            onDownloads = onDownloadsClick,
-                            onMakeMix = { showMixMaker = true }
+                            onDownloads = onDownloadsClick
                         )
-                        if (showMixMaker) {
-                            SentupMixMakerSheet(viewModel = viewModel, onDismiss = { showMixMaker = false })
+                    }
+
+                    // Pinned Folders, Playlists/Watchlists & UNLIMITED Artists Hub
+                    item(key = "feed-pin-hub") {
+                        val musicPool = remember(songs, likedSongs, recentlyPlayed, offlineSongs) {
+                            (songs + likedSongs + recentlyPlayed + offlineSongs).distinctBy { it.id }
+                        }
+                        HomePinHubSection(
+                            pins = pinsSnapshot,
+                            customFolders = customFolders,
+                            playlistFolders = playlistFolders,
+                            musicPlaylists = (ownPlaylists + mixes).distinctBy { it.id },
+                            videoWatchlists = allWatchlists,
+                            allSongs = musicPool,
+                            artistPhotos = artistPhotos,
+                            onOpenPinManager = { showPinManager = true },
+                            onOpenCustomFolder = { folder -> onOpenCustomFolder(folder.id) },
+                            onPlayCustomFolder = { folder ->
+                                val fSongs = com.sentup.android.data.CustomFolderTree
+                                    .resolveFolderSongs(folder, musicPool, statsPlayCounts, offlineSongIds)
+                                if (fSongs.isNotEmpty()) {
+                                    playerViewModel?.playQueue(fSongs, fSongs.first()) ?: onSongClick(fSongs.first())
+                                } else {
+                                    onOpenCustomFolder(folder.id)
+                                }
+                            },
+                            onPlayPlaylistFolder = { pFolder ->
+                                val contained = com.sentup.android.data.PlaylistFolderLogic
+                                    .playlistsInFolder(pFolder, (ownPlaylists + mixes).distinctBy { it.id })
+                                val firstPl = contained.firstOrNull()
+                                if (firstPl != null) {
+                                    onPlaylistClick(firstPl)
+                                }
+                            },
+                            onOpenMusicPlaylist = onPlaylistClick,
+                            onOpenWatchlist = onOpenVideoPlaylist,
+                            onOpenArtist = { artistName -> viewModel.requestArtistPage(artistName) },
+                            onArtistRadio = { artistName ->
+                                shelfScope.launch {
+                                    val artistSongs = runCatching { viewModel.searchArtistSongs(artistName) }
+                                        .getOrDefault(emptyList())
+                                    if (artistSongs.isNotEmpty()) {
+                                        playerViewModel?.playQueueShuffled(artistSongs)
+                                            ?: onSongClick(artistSongs.first())
+                                    } else {
+                                        viewModel.requestArtistPage(artistName)
+                                    }
+                                }
+                            },
+                            onUnpinCustomFolder = { pinStore.toggleCustomFolder(it) },
+                            onUnpinPlaylistFolder = { pinStore.togglePlaylistFolder(it) },
+                            onUnpinWatchlist = { pinStore.toggleWatchlist(it) },
+                            onUnpinMusicPlaylist = togglePin,
+                            onUnpinArtist = { pinStore.toggleArtist(it) }
+                        )
+                    }
+
+                    // Live Audio Control Console (Lens filter, Speed, Sleep Timer, Energy mix, Artist-Spaced, Offline Vault)
+                    item(key = "feed-pro-console") {
+                        if (!isInitialLoading) {
+                            val combinedAll = remember(songs, likedSongs, recentlyPlayed, offlineSongs) {
+                                (songs + likedSongs + recentlyPlayed + offlineSongs).distinctBy { it.id }
+                            }
+                            MusicHomeProControlDeck(
+                                currentSong = currentSong,
+                                isPlaying = isPlayingNow,
+                                sleepEndsAtMs = sleepEndsAtMs,
+                                sleepEndOfTrack = sleepEndOfTrack,
+                                selectedFilter = sonicFilter,
+                                onFilterChange = { sonicFilter = it },
+                                onPlayPause = { playerViewModel?.togglePlayPause() },
+                                onNext = { playerViewModel?.skipNextTrack() },
+                                onPrevious = { playerViewModel?.skipPreviousTrack() },
+                                onSetSpeed = { spd -> playerViewModel?.setPlaybackSpeed(spd, persist = true) },
+                                onStartSleepMinutes = { mins ->
+                                    playerViewModel?.startSleepTimer(mins)
+                                    android.widget.Toast.makeText(
+                                        context,
+                                        "Uyku zamanlayıcı $mins dk olarak ayarlandı",
+                                        android.widget.Toast.LENGTH_SHORT
+                                    ).show()
+                                },
+                                onStartSleepEndOfTrack = {
+                                    playerViewModel?.startSleepTimerEndOfTrack()
+                                    android.widget.Toast.makeText(
+                                        context,
+                                        "Müzik bu şarkının sonunda duracak",
+                                        android.widget.Toast.LENGTH_SHORT
+                                    ).show()
+                                },
+                                onCancelSleep = { playerViewModel?.cancelSleepTimer() },
+                                onLaunchEnergyMix = { level ->
+                                    val targetFilter = when (level) {
+                                        0 -> HomeSonicFilter.Calm
+                                        2 -> HomeSonicFilter.Energetic
+                                        else -> HomeSonicFilter.All
+                                    }
+                                    val queue = filterSongsForHomeLens(combinedAll, targetFilter, offlineSongIds)
+                                        .shuffled()
+                                        .take(25)
+                                    if (queue.isNotEmpty()) {
+                                        playerViewModel?.playQueue(queue, queue.first())
+                                            ?: onSongClick(queue.first())
+                                    }
+                                },
+                                onLaunchArtistSpaced = {
+                                    val spaced = com.sentup.android.data.SmartMixRules
+                                        .artistSpaced(combinedAll, System.nanoTime())
+                                    if (spaced.isNotEmpty()) {
+                                        playerViewModel?.playQueue(spaced, spaced.first())
+                                            ?: onSongClick(spaced.first())
+                                    }
+                                },
+                                onLaunchOfflineVault = {
+                                    if (offlineSongs.isNotEmpty()) {
+                                        playerViewModel?.playQueueShuffled(offlineSongs)
+                                            ?: onOfflineSongClick(offlineSongs.first())
+                                    }
+                                },
+                                offlineCount = offlineSongs.size
+                            )
                         }
                     }
 
-                    item(key = "feed-insights") {
-                        Column(
-                            modifier = Modifier.padding(
-                                start = SentupGroup.inset,
-                                end = SentupGroup.inset,
-                                top = SentupGroup.gap,
-                                bottom = SentupGroup.gap
+                    // Playable moods + instant 1-tap Vibe Radios right at the top.
+                    item(key = "feed-moods") {
+                        if (!isInitialLoading && playerViewModel != null) {
+                            val builtInVibes = listOf(
+                                "Odaklan" to "deep focus ambient instrumental music",
+                                "Antrenman" to "workout gym high energy hype mix",
+                                "Gece Sürüşü" to "night drive synthwave chill mix",
+                                "Anadolu Rock" to "anadolu rock en iyi şarkılar",
+                                "Enerji" to "upbeat energetic pop rock hits",
+                                "Rahatla" to "acoustic lofi chill relax"
                             )
-                        ) {
-                            InsightsCard(viewModel = viewModel, onOpenStats = onStatsClick)
+                            LazyRow(
+                                modifier = Modifier.padding(top = 8.dp),
+                                contentPadding = PaddingValues(
+                                    start = FEED_RAIL_START,
+                                    end = SentupGroup.inset
+                                ),
+                                horizontalArrangement = Arrangement.spacedBy(8.dp)
+                            ) {
+                                items(moodTiles, key = { "mood_" + it.browseId + "_" + it.title }) { mood ->
+                                    SentupQuickCapsule(
+                                        icon = Icons.Rounded.Category,
+                                        label = mood.title,
+                                        onClick = { playMood(mood) }
+                                    )
+                                }
+                                items(builtInVibes, key = { "vibe_" + it.first }) { (label, query) ->
+                                    SentupQuickCapsule(
+                                        icon = Icons.Rounded.AutoAwesome,
+                                        label = label,
+                                        onClick = {
+                                            shelfScope.launch {
+                                                val found = runCatching { viewModel.searchYouTube(query) }
+                                                    .getOrDefault(emptyList())
+                                                if (found.isNotEmpty()) {
+                                                    playerViewModel.playQueue(found, found.first())
+                                                }
+                                            }
+                                        }
+                                    )
+                                }
+                            }
                         }
                     }
 
@@ -491,6 +677,53 @@ internal fun SentupHomeFeed(
                                 onPlayClick = onPlayClick,
                                 onSpinClick = onSpinClick
                             )
+                        }
+                    }
+
+                    val browseFeedSongs = listOf(BROWSE_HOME, BROWSE_NEW, BROWSE_CHARTS).flatMap { key ->
+                        musicBrowse[key]?.shelves.orEmpty().flatMap { shelf ->
+                            shelf.items.filterIsInstance<com.sentup.android.data.MusicShelfItem.Track>().map { it.song }
+                        }
+                    }
+
+                    // Speed Dial ("Hızlı Başlat") 3-column instant play cover grid.
+                    item(key = "feed-speed-dial") {
+                        if (!isInitialLoading) {
+                            val dialSongs = (recentlyPlayed + likedSongs + songs + browseFeedSongs)
+                                .distinctBy { it.id }
+                                .filter { feedCoverModel(it) != null }
+                                .take(6)
+                            if (dialSongs.size >= 3) {
+                                FeedSpeedDialGrid(
+                                    title = "Hızlı Başlat",
+                                    songs = dialSongs,
+                                    onSongClick = onSongClick,
+                                    onSongLongClick = openSongPreview
+                                )
+                            }
+                        }
+                    }
+
+                    // Quick Picks ("Hızlı Seçimler") 4-row swipeable HorizontalPager.
+                    item(key = "feed-quick-picks") {
+                        if (!isInitialLoading) {
+                            val rawPicks = (discoverySongs + browseFeedSongs + songs + recentlyPlayed)
+                                .distinctBy { it.id }
+                            val picksPool = filterSongsForHomeLens(rawPicks, sonicFilter, offlineSongIds)
+                                .take(20)
+                            if (picksPool.size >= 4) {
+                                FeedQuickPicksPager(
+                                    title = "Hızlı Seçimler",
+                                    songs = picksPool,
+                                    onPlayAll = {
+                                        playerViewModel?.playQueue(picksPool, picksPool.first())
+                                    },
+                                    onSongClick = { song ->
+                                        playerViewModel?.playQueue(picksPool, song) ?: onSongClick(song)
+                                    },
+                                    onSongLongClick = openSongPreview
+                                )
+                            }
                         }
                     }
 
@@ -690,23 +923,6 @@ internal fun SentupHomeFeed(
                         }
                     }
 
-                    // The smart mixes - the lists YouTube Music does not build.
-                    item(key = "feed-smart") {
-                        if (!isInitialLoading && playerViewModel != null) {
-                            val tiles = smartMixes.map { mix ->
-                                SmartTile(
-                                    title = mix.title,
-                                    reason = mix.reason,
-                                    tracks = mix.tracks,
-                                    onPlay = {
-                                        playerViewModel?.playQueue(mix.tracks, mix.tracks.first())
-                                    }
-                                )
-                            }
-                            if (tiles.isNotEmpty()) FeedSmartShelf(tiles = tiles, onSave = saveMix)
-                        }
-                    }
-
                     // YouTube Music's own home page, shelf for shelf. It ships
                     // a page of personalised carousels - quick picks, forgotten
                     // listens, mood mixes - and re-deriving three shelves from
@@ -734,30 +950,17 @@ internal fun SentupHomeFeed(
                         )
                     }
 
-                    // Playable moods: tapping one plays YouTube Music's own
-                    // mood page straight away, no intermediate screen.
-                    item(key = "feed-moods") {
-                        if (!isInitialLoading && moodTiles.isNotEmpty() && playerViewModel != null) {
-                            Column(
-                                modifier = Modifier.fillMaxWidth().padding(top = SentupGroup.gap)
-                            ) {
-                                SentupGroupHeader(text = stringResource(R.string.home_moods_title))
-                                LazyRow(
-                                    contentPadding = PaddingValues(
-                                        start = FEED_RAIL_START,
-                                        end = SentupGroup.inset
-                                    ),
-                                    horizontalArrangement = Arrangement.spacedBy(10.dp)
-                                ) {
-                                    items(moodTiles, key = { "mood_" + it.browseId + "_" + it.title }) { mood ->
-                                        SentupQuickCapsule(
-                                            icon = Icons.Rounded.Category,
-                                            label = mood.title,
-                                            onClick = { playMood(mood) }
-                                        )
-                                    }
-                                }
-                            }
+                    // Analytics moved below music shelves so the Home screen leads with music.
+                    item(key = "feed-insights") {
+                        Column(
+                            modifier = Modifier.padding(
+                                start = SentupGroup.inset,
+                                end = SentupGroup.inset,
+                                top = SentupGroup.gap,
+                                bottom = SentupGroup.gap
+                            )
+                        ) {
+                            InsightsCard(viewModel = viewModel, onOpenStats = onStatsClick)
                         }
                     }
 
@@ -891,6 +1094,87 @@ internal fun SentupHomeFeed(
                         }
                     }
 
+                    item(key = "feed-pro-shelves") {
+                        if (!isInitialLoading) {
+                            val combinedMusicPool = remember(songs, likedSongs, recentlyPlayed, offlineSongs) {
+                                (songs + likedSongs + recentlyPlayed + offlineSongs).distinctBy { it.id }
+                            }
+                            MusicHomeProShelves(
+                                allSongs = combinedMusicPool,
+                                likedSongs = likedSongs,
+                                recentlyPlayed = recentlyPlayed,
+                                playCounts = statsPlayCounts,
+                                customFolders = customFolders,
+                                topArtists = topArtists,
+                                artistPhotos = artistPhotos,
+                                videoWatchlists = allWatchlists,
+                                pins = pinsSnapshot,
+                                weekMinutes = weekSummary.value?.first ?: 0L,
+                                weekTopArtist = weekSummary.value?.second,
+                                onSongClick = onSongClick,
+                                onSongLongClick = { s -> openSongPreview(s) },
+                                onPlayQueue = { queue, start ->
+                                    if (queue.isNotEmpty()) {
+                                        playerViewModel?.playQueue(queue, start ?: queue.first())
+                                            ?: onSongClick(start ?: queue.first())
+                                    }
+                                },
+                                onShuffleQueue = { queue ->
+                                    if (queue.isNotEmpty()) {
+                                        playerViewModel?.playQueueShuffled(queue)
+                                            ?: onSongClick(queue.first())
+                                    }
+                                },
+                                onOpenCustomFolder = { folder -> onOpenCustomFolder(folder.id) },
+                                onPlayCustomFolder = { folder ->
+                                    val fSongs = com.sentup.android.data.CustomFolderTree
+                                        .resolveFolderSongs(folder, combinedMusicPool, statsPlayCounts, offlineSongIds)
+                                    if (fSongs.isNotEmpty()) {
+                                        playerViewModel?.playQueue(fSongs, fSongs.first())
+                                            ?: onSongClick(fSongs.first())
+                                    } else {
+                                        onOpenCustomFolder(folder.id)
+                                    }
+                                },
+                                onStartArtistRadio = { artistName ->
+                                    shelfScope.launch {
+                                        val tracks = runCatching { viewModel.searchArtistSongs(artistName) }
+                                            .getOrDefault(emptyList())
+                                        if (tracks.isNotEmpty()) {
+                                            playerViewModel?.playQueueShuffled(tracks)
+                                                ?: onSongClick(tracks.first())
+                                        } else {
+                                            viewModel.requestArtistPage(artistName)
+                                        }
+                                    }
+                                },
+                                onOpenWatchlist = onOpenVideoPlaylist,
+                                onTogglePinWatchlist = { wlId -> pinStore.toggleWatchlist(wlId) },
+                                onOpenStats = onStatsClick,
+                                onSaveDurationMix = { title, mixTracks ->
+                                    saveMix(
+                                        com.sentup.android.data.SmartMixRules.Built(
+                                            id = "dur_${System.currentTimeMillis()}",
+                                            title = title,
+                                            reason = "",
+                                            tracks = mixTracks
+                                        )
+                                    )
+                                },
+                                onRunSeedDiscovery = { query ->
+                                    shelfScope.launch {
+                                        val found = runCatching { viewModel.searchYouTube(query) }
+                                            .getOrDefault(emptyList())
+                                        if (found.isNotEmpty()) {
+                                            playerViewModel?.playQueue(found, found.first())
+                                                ?: onSongClick(found.first())
+                                        }
+                                    }
+                                }
+                            )
+                        }
+                    }
+
                     item(key = "feed-bottom") {
                         Spacer(Modifier.height(48.dp))
                     }
@@ -924,6 +1208,60 @@ internal fun SentupHomeFeed(
             onMore = onSongLongPress?.let { f -> { popoutSong.value = null; f(song) } },
             onDismiss = { popoutSong.value = null }
         )
+    }
+
+    if (showAutonomousMixSheet) {
+        androidx.compose.material3.ModalBottomSheet(
+            onDismissRequest = { showAutonomousMixSheet = false },
+            containerColor = MaterialTheme.colorScheme.surfaceContainerLow,
+            contentColor = MaterialTheme.colorScheme.onSurface
+        ) {
+            Column(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(bottom = 28.dp)
+            ) {
+                val fallbackPool = (recentlyPlayedState + songs).distinctBy { it.id }
+                val tiles = if (smartMixes.isNotEmpty()) {
+                    smartMixes.map { mix ->
+                        SmartTile(
+                            title = mix.title,
+                            reason = mix.reason,
+                            tracks = mix.tracks,
+                            onPlay = {
+                                showAutonomousMixSheet = false
+                                playerViewModel?.playQueue(mix.tracks, mix.tracks.first())
+                            }
+                        )
+                    }
+                } else if (fallbackPool.isNotEmpty()) {
+                    listOf(
+                        SmartTile(
+                            title = "Otonom Karışım",
+                            reason = "${fallbackPool.size} şarkılık anlık karışım",
+                            tracks = fallbackPool.shuffled().take(25),
+                            onPlay = {
+                                val q = fallbackPool.shuffled().take(25)
+                                showAutonomousMixSheet = false
+                                if (q.isNotEmpty()) playerViewModel?.playQueue(q, q.first())
+                            }
+                        )
+                    )
+                } else {
+                    emptyList()
+                }
+                if (tiles.isNotEmpty()) {
+                    FeedSmartShelf(tiles = tiles, onSave = saveMix)
+                } else {
+                    Text(
+                        text = "Otonom karışım oluşturmak için birkaç şarkı dinleyin veya YouTube'a bağlanın.",
+                        style = MaterialTheme.typography.bodyMedium,
+                        color = MaterialTheme.colorScheme.onSurfaceVariant,
+                        modifier = Modifier.padding(24.dp)
+                    )
+                }
+            }
+        }
     }
 
     artistOptions.value?.let { artist ->
@@ -963,8 +1301,39 @@ internal fun SentupHomeFeed(
                         }
                     )
                 }
+                val isArtistPinned = pinsSnapshot.artists.any {
+                    it.name.equals(artist.name, ignoreCase = true)
+                }
+                SentupDivider()
+                SentupRow(
+                    title = if (isArtistPinned) "Ana Sayfadan Kaldır" else "Ana Sayfaya Sabitle (Sınırsız)",
+                    icon = Icons.Rounded.PushPin,
+                    onClick = {
+                        pinStore.toggleArtist(artist.name, artistPhotos[artist.name])
+                        artistOptions.value = null
+                    }
+                )
             }
         }
+    }
+
+    if (showPinManager) {
+        HomePinManagerSheet(
+            pins = pinsSnapshot,
+            customFolders = customFolders,
+            playlistFolders = playlistFolders,
+            musicPlaylists = (playlists).distinctBy { it.id },
+            videoWatchlists = allWatchlists,
+            topArtists = topArtists,
+            artistPhotos = artistPhotos,
+            onSearchArtists = { query -> viewModel.searchArtists(query) },
+            onToggleCustomFolder = { pinStore.toggleCustomFolder(it) },
+            onTogglePlaylistFolder = { pinStore.togglePlaylistFolder(it) },
+            onToggleWatchlist = { pinStore.toggleWatchlist(it) },
+            onToggleMusicPlaylist = togglePin,
+            onToggleArtist = { name, thumb -> pinStore.toggleArtist(name, thumb) },
+            onDismiss = { showPinManager = false }
+        )
     }
 }
 
@@ -1180,7 +1549,8 @@ private fun FeedHero(
     isLoading: Boolean,
     skeletonAlpha: Float,
     onPlayClick: () -> Unit,
-    onSpinClick: () -> Unit
+    onSpinClick: () -> Unit,
+    onAutonomousMixClick: (() -> Unit)? = null
 ) {
     val shape = RoundedCornerShape(SentupRadii.panel)
     val first = songs.firstOrNull()
@@ -1196,16 +1566,11 @@ private fun FeedHero(
             .height(FEED_HERO_HEIGHT)
     ) {
         if (cover != null) {
-            // Deliberately bigger than the panel and pinned to the top-left:
-            // the cover is a surface the card is cut out of, not a thumbnail
-            // inside a box. The card's own clip does the cropping.
             AsyncImage(
                 model = cover,
                 contentDescription = null,
                 contentScale = ContentScale.Crop,
-                modifier = Modifier
-                    .align(Alignment.TopStart)
-                    .requiredSize(330.dp)
+                modifier = Modifier.fillMaxSize()
             )
         } else {
             Box(
@@ -1214,52 +1579,87 @@ private fun FeedHero(
                     .background(
                         Brush.verticalGradient(
                             listOf(
-                                scheme.primaryContainer.copy(alpha = 0.45f),
-                                scheme.secondaryContainer.copy(alpha = 0.25f)
+                                scheme.primaryContainer.copy(alpha = 0.55f),
+                                scheme.secondaryContainer.copy(alpha = 0.30f)
                             )
                         )
                     )
             )
         }
 
-        // The scrim is the typography's safety: no headline sits on a random
-        // cover without it.
+        // Rich multi-stop scrim so artwork glows behind crisp foreground typography.
         Box(
             modifier = Modifier
                 .matchParentSize()
                 .background(
                     Brush.verticalGradient(
-                        0f to Color.Black.copy(alpha = 0.05f),
-                        0.45f to Color.Black.copy(alpha = 0.38f),
-                        1f to Color.Black.copy(alpha = 0.80f)
+                        0f to Color.Black.copy(alpha = 0.18f),
+                        0.40f to Color.Black.copy(alpha = 0.45f),
+                        1f to Color.Black.copy(alpha = 0.88f)
                     )
                 )
         )
 
         Column(modifier = Modifier.align(Alignment.BottomStart)) {
-            Column(modifier = Modifier.padding(start = 22.dp, end = 22.dp)) {
-                if (isLoading) {
-                    SkeletonTextLine(width = 168.dp, height = 24.dp, alpha = skeletonAlpha)
-                    Spacer(Modifier.height(8.dp))
-                    SkeletonTextLine(width = 120.dp, height = 13.dp, alpha = skeletonAlpha)
-                } else {
-                    Text(
-                        text = stringResource(R.string.your_mix_line1) + " " +
-                            stringResource(R.string.your_mix_line2),
-                        fontSize = 28.sp,
-                        fontWeight = FontWeight.Bold,
-                        color = Color.White,
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis
+            Row(
+                modifier = Modifier
+                    .fillMaxWidth()
+                    .padding(horizontal = 20.dp),
+                verticalAlignment = Alignment.CenterVertically,
+                horizontalArrangement = Arrangement.spacedBy(14.dp)
+            ) {
+                if (cover != null && !isLoading) {
+                    AsyncImage(
+                        model = cover,
+                        contentDescription = null,
+                        contentScale = ContentScale.Crop,
+                        modifier = Modifier
+                            .size(74.dp)
+                            .clip(RoundedCornerShape(14.dp))
+                            .border(
+                                1.dp,
+                                Color.White.copy(alpha = 0.28f),
+                                RoundedCornerShape(14.dp)
+                            )
                     )
-                    Spacer(Modifier.height(4.dp))
-                    Text(
-                        text = feedHeroArtists(songs),
-                        style = MaterialTheme.typography.bodyMedium,
-                        color = Color.White.copy(alpha = 0.85f),
-                        maxLines = 1,
-                        overflow = TextOverflow.Ellipsis
-                    )
+                }
+                Column(modifier = Modifier.weight(1f)) {
+                    if (isLoading) {
+                        SkeletonTextLine(width = 168.dp, height = 24.dp, alpha = skeletonAlpha)
+                        Spacer(Modifier.height(8.dp))
+                        SkeletonTextLine(width = 120.dp, height = 13.dp, alpha = skeletonAlpha)
+                    } else {
+                        androidx.compose.material3.Surface(
+                            color = MaterialTheme.colorScheme.primary.copy(alpha = 0.88f),
+                            shape = RoundedCornerShape(SentupRadii.pill)
+                        ) {
+                            Text(
+                                text = "SENİN İÇİN SEÇİLDİ",
+                                style = MaterialTheme.typography.labelSmall,
+                                fontWeight = FontWeight.Bold,
+                                color = MaterialTheme.colorScheme.onPrimary,
+                                modifier = Modifier.padding(horizontal = 8.dp, vertical = 3.dp)
+                            )
+                        }
+                        Spacer(Modifier.height(6.dp))
+                        Text(
+                            text = stringResource(R.string.your_mix_line1) + " " +
+                                stringResource(R.string.your_mix_line2),
+                            fontSize = 24.sp,
+                            fontWeight = FontWeight.Bold,
+                            color = Color.White,
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis
+                        )
+                        Spacer(Modifier.height(2.dp))
+                        Text(
+                            text = feedHeroArtists(songs),
+                            style = MaterialTheme.typography.bodyMedium,
+                            color = Color.White.copy(alpha = 0.85f),
+                            maxLines = 1,
+                            overflow = TextOverflow.Ellipsis
+                        )
+                    }
                 }
             }
 
@@ -1315,8 +1715,7 @@ private fun FeedQuickCapsules(
     canStartRadio: Boolean,
     onShuffleLiked: () -> Unit,
     onRadio: () -> Unit,
-    onDownloads: () -> Unit,
-    onMakeMix: () -> Unit
+    onDownloads: () -> Unit
 ) {
     LazyRow(
         modifier = Modifier.padding(top = 6.dp),
@@ -1349,13 +1748,6 @@ private fun FeedQuickCapsules(
                 icon = Icons.Rounded.Download,
                 label = stringResource(R.string.cd_downloads),
                 onClick = onDownloads
-            )
-        }
-        item(key = "caps-otonom") {
-            SentupQuickCapsule(
-                icon = Icons.Rounded.AutoAwesome,
-                label = stringResource(R.string.capsule_otonom),
-                onClick = onMakeMix
             )
         }
     }
@@ -2339,6 +2731,201 @@ private fun FeedSmartShelf(
                         maxLines = 2,
                         overflow = TextOverflow.Ellipsis
                     )
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun FeedSpeedDialGrid(
+    title: String,
+    songs: List<Song>,
+    onSongClick: (Song) -> Unit,
+    onSongLongClick: ((Song) -> Unit)?
+) {
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(top = SentupGroup.gap)
+    ) {
+        SentupGroupHeader(text = title)
+        Column(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(horizontal = SentupGroup.inset),
+            verticalArrangement = Arrangement.spacedBy(8.dp)
+        ) {
+            songs.chunked(3).forEach { row ->
+                Row(
+                    modifier = Modifier.fillMaxWidth(),
+                    horizontalArrangement = Arrangement.spacedBy(8.dp)
+                ) {
+                    row.forEach { song ->
+                        val cover = feedCoverModel(song)
+                        Box(
+                            modifier = Modifier
+                                .weight(1f)
+                                .height(106.dp)
+                                .clip(RoundedCornerShape(14.dp))
+                                .background(MaterialTheme.colorScheme.surfaceContainerHigh)
+                                .combinedClickable(
+                                    onClick = { onSongClick(song) },
+                                    onLongClick = { onSongLongClick?.invoke(song) }
+                                )
+                        ) {
+                            if (cover != null) {
+                                AsyncImage(
+                                    model = cover,
+                                    contentDescription = song.title,
+                                    contentScale = ContentScale.Crop,
+                                    modifier = Modifier.fillMaxSize()
+                                )
+                            }
+                            Box(
+                                modifier = Modifier
+                                    .fillMaxWidth()
+                                    .align(Alignment.BottomStart)
+                                    .background(
+                                        Brush.verticalGradient(
+                                            colors = listOf(
+                                                Color.Transparent,
+                                                MaterialTheme.colorScheme.scrim.copy(alpha = 0.8f)
+                                            )
+                                        )
+                                    )
+                                    .padding(horizontal = 8.dp, vertical = 6.dp)
+                            ) {
+                                Text(
+                                    text = song.title,
+                                    style = MaterialTheme.typography.labelMedium,
+                                    fontWeight = FontWeight.SemiBold,
+                                    color = Color.White,
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis
+                                )
+                            }
+                        }
+                    }
+                    repeat(3 - row.size) {
+                        Spacer(modifier = Modifier.weight(1f))
+                    }
+                }
+            }
+        }
+    }
+}
+
+@Composable
+private fun FeedQuickPicksPager(
+    title: String,
+    songs: List<Song>,
+    onPlayAll: () -> Unit,
+    onSongClick: (Song) -> Unit,
+    onSongLongClick: ((Song) -> Unit)?
+) {
+    val pages = remember(songs) { songs.chunked(4) }
+    if (pages.isEmpty()) return
+    val pagerState = rememberPagerState(pageCount = { pages.size })
+
+    Column(
+        modifier = Modifier
+            .fillMaxWidth()
+            .padding(top = SentupGroup.gap)
+    ) {
+        Row(
+            modifier = Modifier
+                .fillMaxWidth()
+                .padding(end = SentupGroup.inset),
+            verticalAlignment = Alignment.CenterVertically
+        ) {
+            SentupGroupHeader(
+                text = title,
+                modifier = Modifier.weight(1f)
+            )
+            androidx.compose.material3.FilledTonalButton(
+                onClick = onPlayAll,
+                shape = RoundedCornerShape(SentupRadii.pill),
+                contentPadding = PaddingValues(horizontal = 12.dp, vertical = 4.dp),
+                modifier = Modifier.height(32.dp)
+            ) {
+                Icon(
+                    imageVector = Icons.Rounded.PlayArrow,
+                    contentDescription = null,
+                    modifier = Modifier.size(16.dp)
+                )
+                Spacer(Modifier.width(4.dp))
+                Text(
+                    text = "Tümünü Çal",
+                    style = MaterialTheme.typography.labelMedium
+                )
+            }
+        }
+        HorizontalPager(
+            state = pagerState,
+            contentPadding = PaddingValues(horizontal = SentupGroup.inset),
+            pageSpacing = 12.dp,
+            modifier = Modifier.fillMaxWidth()
+        ) { pageIndex ->
+            val pageSongs = pages[pageIndex]
+            Column(
+                modifier = Modifier.fillMaxWidth(),
+                verticalArrangement = Arrangement.spacedBy(8.dp)
+            ) {
+                pageSongs.forEach { song ->
+                    val cover = feedCoverModel(song)
+                    androidx.compose.material3.Surface(
+                        shape = RoundedCornerShape(12.dp),
+                        color = MaterialTheme.colorScheme.surfaceContainerLow,
+                        modifier = Modifier
+                            .fillMaxWidth()
+                            .clip(RoundedCornerShape(12.dp))
+                            .combinedClickable(
+                                onClick = { onSongClick(song) },
+                                onLongClick = { onSongLongClick?.invoke(song) }
+                            )
+                    ) {
+                        Row(
+                            modifier = Modifier
+                                .fillMaxWidth()
+                                .padding(horizontal = 10.dp, vertical = 8.dp),
+                            verticalAlignment = Alignment.CenterVertically,
+                            horizontalArrangement = Arrangement.spacedBy(10.dp)
+                        ) {
+                            Box(
+                                modifier = Modifier
+                                    .size(48.dp)
+                                    .clip(RoundedCornerShape(10.dp))
+                                    .background(MaterialTheme.colorScheme.surfaceContainerHigh),
+                                contentAlignment = Alignment.Center
+                            ) {
+                                if (cover != null) {
+                                    AsyncImage(
+                                        model = cover,
+                                        contentDescription = null,
+                                        contentScale = ContentScale.Crop,
+                                        modifier = Modifier.fillMaxSize()
+                                    )
+                                }
+                            }
+                            Column(modifier = Modifier.weight(1f)) {
+                                Text(
+                                    text = song.title,
+                                    style = MaterialTheme.typography.bodyMedium,
+                                    fontWeight = FontWeight.SemiBold,
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis
+                                )
+                                Text(
+                                    text = feedArtistLabel(song),
+                                    style = MaterialTheme.typography.bodySmall,
+                                    color = MaterialTheme.colorScheme.onSurfaceVariant,
+                                    maxLines = 1,
+                                    overflow = TextOverflow.Ellipsis
+                                )
+                            }
+                        }
+                    }
                 }
             }
         }

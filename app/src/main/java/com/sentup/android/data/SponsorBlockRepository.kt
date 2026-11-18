@@ -33,7 +33,7 @@ import kotlinx.coroutines.suspendCancellableCoroutine
  */
 class SponsorBlockRepository {
 
-    private val client = OkHttpClient.Builder()
+    private val client = VpnResilientNetwork.configureForVpn(OkHttpClient.Builder())
         .connectTimeout(6, TimeUnit.SECONDS)
         .readTimeout(6, TimeUnit.SECONDS)
         .callTimeout(8, TimeUnit.SECONDS)

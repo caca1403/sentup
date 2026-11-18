@@ -44,7 +44,9 @@ internal class StreamProbe(
                 .addHeader("User-Agent", userAgentForStreamUrl(url, browserUserAgent))
                 .addHeader("Range", "bytes=$offset-$offset")
                 .build()
-            http.newCall(request).execute().use { response ->
+            com.sentup.android.data.VpnResilientNetwork
+                .executeResilient(http, request)
+                .use { response ->
                 when (response.code) {
                     206 -> true
                     403 -> false

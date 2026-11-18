@@ -174,14 +174,29 @@ class ExploreViewModel(application: Application) : AndroidViewModel(application)
      * the account feed is holding. A name remembered by the candidates is
      * better than a bare id, so the feed wins where the two disagree.
      */
+    private var accountPickerChannels: List<LocalSubscription> = emptyList()
+
     private fun publishChannels() {
         val byName = mutableMapOf<String, LocalSubscription>()
+        accountPickerChannels.forEach { acc ->
+            byName[acc.channelId] = acc
+        }
         subscriptionFeedCache.read()?.videos?.forEach { video ->
             val id = video.channelId
             if (!id.isNullOrBlank()) {
                 byName[id] = LocalSubscription(
                     channelId = id,
                     name = video.channelName,
+                    avatarUrl = video.channelIconUrl
+                )
+            }
+        }
+        candidatesBySource.values.flatten().forEach { video ->
+            val id = video.channelId
+            if (!id.isNullOrBlank() && id !in byName) {
+                byName[id] = LocalSubscription(
+                    channelId = id,
+                    name = video.channelName.ifBlank { id },
                     avatarUrl = video.channelIconUrl
                 )
             }
@@ -197,8 +212,40 @@ class ExploreViewModel(application: Application) : AndroidViewModel(application)
         _channels.value = byName.values.sortedBy { it.name.lowercase() }
     }
 
+    suspend fun searchChannels(query: String): List<LocalSubscription> {
+        val trimmed = query.trim()
+        if (trimmed.length < 2) return emptyList()
+        return runCatching {
+            youtubeRepository.searchChannels(trimmed).map { ch ->
+                LocalSubscription(
+                    channelId = ch.channelId,
+                    name = ch.name.ifBlank { ch.channelId },
+                    avatarUrl = ch.avatarUrl,
+                    handle = ch.handle
+                )
+            }
+        }.getOrDefault(emptyList())
+    }
+
     init {
         publishChannels()
+        if (sessionManager.isLoggedIn()) {
+            viewModelScope.launch {
+                val remote = runCatching { youtubeRepository.getSubscribedChannels() }
+                    .getOrDefault(emptyList())
+                if (remote.isNotEmpty()) {
+                    accountPickerChannels = remote.map { ch ->
+                        LocalSubscription(
+                            channelId = ch.channelId,
+                            name = ch.name.ifBlank { ch.channelId },
+                            avatarUrl = ch.avatarUrl,
+                            handle = ch.handle
+                        )
+                    }
+                    publishChannels()
+                }
+            }
+        }
         _rules.value = listsRepository.find(listsRepository.selectedListId.value)?.rules ?: DEFAULT_RULES
         viewModelScope.launch {
             ProfileManager(app).activeProfileId
@@ -523,6 +570,7 @@ class ExploreViewModel(application: Application) : AndroidViewModel(application)
             _rules.value.sources.flatMap { candidatesBySource[it].orEmpty() }
                 .distinctBy { it.videoId }
         )
+        publishChannels()
         _shelves.value = ExploreEngine.build(
             videos = visible,
             rules = _rules.value,

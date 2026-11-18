@@ -143,7 +143,11 @@ class MusicService : MediaLibraryService() {
     // Cache for resolved stream URIs. googlevideo URLs die after ~6h (their
     // `expire` param) and on network/IP changes, so each entry carries an
     // expiry and is dropped instead of being replayed as a guaranteed 403.
-    private class CachedUri(val uri: String, val expiresAtMs: Long)
+    private class CachedUri(
+        val uri: String,
+        val expiresAtMs: Long,
+        val networkEpoch: Long = com.sentup.android.data.VpnResilientNetwork.currentEpoch()
+    )
     private val uriCache = java.util.Collections.synchronizedMap(
         BoundedLruMap<String, CachedUri>(MAX_RESOLVED_URI_ENTRIES)
     )
@@ -1573,11 +1577,13 @@ class MusicService : MediaLibraryService() {
         // 2. Cache (Memory) — only while the underlying googlevideo URL is
         // still valid; expired entries are re-resolved instead of replayed.
         uriCache[videoId]?.let { cached ->
-            if (cached.expiresAtMs > System.currentTimeMillis()) {
+            if (cached.networkEpoch == com.sentup.android.data.VpnResilientNetwork.currentEpoch() &&
+                cached.expiresAtMs > System.currentTimeMillis()
+            ) {
                 KLog.d(TAG, "Resolution: Found cached URI for $videoId")
                 return buildMediaItemWithUri(originalItem, Uri.parse(cached.uri))
             }
-            KLog.d(TAG, "Resolution: Cached URI expired for $videoId, re-resolving")
+            KLog.d(TAG, "Resolution: Cached URI expired or network changed for $videoId, re-resolving")
             uriCache.remove(videoId)
         }
 

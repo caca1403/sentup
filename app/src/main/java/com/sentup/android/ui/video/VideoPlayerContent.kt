@@ -1531,7 +1531,7 @@ fun VideoPlayerContent(
             ?: stringResource(R.string.vpc_smooth_motion_measuring)
     }
     val playbackSettingsContent: @Composable () -> Unit = {
-        PlayerSettingsSections(
+        ModernVideoPlaybackSettings(
             isLoading = isLoading,
             qualities = selectableQualities,
             currentQuality = currentQuality,
@@ -1600,17 +1600,10 @@ fun VideoPlayerContent(
                 showPlaybackSettings = false
                 showVideoPageForVerticalLive = false
             },
-            // Fullscreen only: the portrait box fits by design and has no zoom
-            // to toggle, and a crop past MAX_ACCEPTABLE_CROP hides the row
-            // rather than offering a switch that does nothing.
             showZoomToFill = isFullscreen && zoomToFillAvailable,
             zoomToFillActive = isZoomedToFill,
-            // Kept open like the timed-comments switch: the video stays
-            // visible beside the panel, so the crop change answers instantly.
             onZoomToFillChanged = { isZoomedToFill = it },
             showListenAsMusic = showListenAsMusic,
-            // The migration tears the player down, so the settings close
-            // behind it the way the channel hand-off already does.
             onListenAsMusic = {
                 showPlaybackSettings = false
                 onListenAsMusic()
@@ -1622,7 +1615,11 @@ fun VideoPlayerContent(
             videoShaders = videoShaders,
             videoShadersInstalled = videoShadersInstalled,
             onVideoShadersPreview = viewModel::previewVideoShaders,
-            onVideoShadersChanged = viewModel::setVideoShaders
+            onVideoShadersChanged = viewModel::setVideoShaders,
+            speedLabel = { spd ->
+                val scaled = kotlin.math.round(spd * 100f) / 100f
+                if (scaled % 1f == 0f) "${scaled.toInt()}x" else "${scaled}x"
+            }
         )
     }
 
@@ -2274,7 +2271,7 @@ private fun PlayerSettingsSections(
  * that is the one value people want to land on exactly.
  */
 @Composable
-private fun SpeedDeck(
+internal fun SpeedDeck(
     playbackSpeed: Float,
     speedLabel: (Float) -> String,
     onSpeedPreview: (Float) -> Unit,
@@ -2928,7 +2925,7 @@ internal fun formatChapterTime(millis: Long): String {
  */
 @OptIn(ExperimentalMaterial3ExpressiveApi::class)
 @Composable
-private fun ShaderDeck(
+internal fun ShaderDeck(
     settings: VideoShaderCustomization,
     installed: Boolean,
     onPreview: (VideoShaderCustomization) -> Unit,

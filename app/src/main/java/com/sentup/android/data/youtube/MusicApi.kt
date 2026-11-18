@@ -177,13 +177,13 @@ internal class MusicApi(
         session: YouTubeSession?,
         retryTransient: Boolean,
     ): String? {
-        val visitor = http.visitorIdentity.cachedOrNull()
+        val visitor = http.visitorIdentity.cachedOrSyncMint()
         // Copied rather than mutated: several callers keep their payload around
         // and reuse it for a second attempt of their own, and a context stamped
         // into it once would ride along into that second body.
         val payload = JSONObject(body.toString())
         payload.optJSONObject("context")?.let { existing ->
-            http.visitorIdentity.cachedOrNull()?.let { visitorId ->
+            http.visitorIdentity.cachedOrSyncMint()?.let { visitorId ->
                 existing.optJSONObject("client")?.put("visitorData", visitorId)
             }
         } ?: payload.put("context", musicContext())
@@ -205,7 +205,9 @@ internal class MusicApi(
                 .authenticate(session)
 
             try {
-                http.okHttpClient.newCall(request.build()).execute().use { response ->
+                com.sentup.android.data.VpnResilientNetwork
+                    .executeResilient(http.okHttpClient, request.build())
+                    .use { response ->
                     val text = response.body?.string().orEmpty()
                     if (response.isSuccessful) {
                         if (text.isNotBlank()) {
@@ -231,6 +233,14 @@ internal class MusicApi(
                 }
             } catch (e: CancellationException) {
                 throw e
+            } catch (e: java.io.IOException) {
+                if (retryTransient && attempt < 1) {
+                    attempt++
+                    Thread.sleep(350L)
+                    continue
+                }
+                KLog.e(YOUTUBE_TAG, "Music $endpoint I/O failed", e)
+                return null
             } catch (e: Exception) {
                 KLog.e(YOUTUBE_TAG, "Music $endpoint request failed", e)
                 return null

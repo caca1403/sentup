@@ -149,15 +149,18 @@ class YouTubeRepository(private val context: Context) {
         fun isBotCheckVerdictActive(): Boolean = BotCheckVerdict.isActive()
 
         /**
-         * The device moved to a different network, so the verdicts YouTube
+         * The device moved to a different network or toggled VPN, so the verdicts YouTube
          * passed on the old address no longer describe this one: drop the
-         * bot-check verdict, the 429 hold and every ladder resolved under the
-         * old address. The caller remints visitorData on the new one.
+         * bot-check verdict, the 429 hold, every cached stream ladder, stale DNS/pools,
+         * and (when [context] is supplied) the IP-associated visitorData.
          */
-        fun forgetConnectionVerdicts() {
+        fun forgetConnectionVerdicts(context: Context? = null) {
             BotCheckVerdict.reset()
             YouTubeRateLimit.clear()
             VideoStreamResolutionCache.clear()
+            if (context != null) {
+                VisitorIdentity.forget(context)
+            }
             YouTubeHttp.evictConnections()
         }
 
@@ -358,6 +361,9 @@ class YouTubeRepository(private val context: Context) {
 
     suspend fun getVideoFeedContinuation(continuation: String): VideoFeedPage =
         videoFeeds.getVideoFeedContinuation(continuation)
+
+    suspend fun getRelatedVideosForFeedSeed(videoId: String): List<VideoItem> =
+        videoFeeds.getRelatedVideosForFeedSeed(videoId)
 
     suspend fun getSubscriptionsFeedPage(): VideoFeedPage = videoFeeds.getSubscriptionsFeedPage()
 

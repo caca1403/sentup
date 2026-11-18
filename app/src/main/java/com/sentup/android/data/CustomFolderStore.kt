@@ -49,6 +49,7 @@ data class MusicFolder(
     val playbackSpeed: Float? = null,
     val eqPreset: FolderEqPreset? = null,
     val autoRule: FolderAutoRule? = null,
+    val coverUri: String? = null,
     val createdAt: Long = System.currentTimeMillis()
 )
 
@@ -211,7 +212,8 @@ object CustomFolderTree {
  */
 class CustomFolderStore(context: Context) {
 
-    private val prefs = context.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
+    private val appContext = context.applicationContext
+    private val prefs = appContext.getSharedPreferences(PREFS_NAME, Context.MODE_PRIVATE)
     private val json = Json { ignoreUnknownKeys = true; encodeDefaults = true }
 
     private val _folders = MutableStateFlow(loadFolders())
@@ -338,6 +340,30 @@ class CustomFolderStore(context: Context) {
             } else folder
         })
     }
+
+    fun setFolderCover(folderId: String, coverUri: String?) {
+        val cleaned = coverUri?.trim()?.takeIf { it.isNotEmpty() }
+        save(_folders.value.map { folder ->
+            if (folder.id == folderId) {
+                folder.copy(coverUri = cleaned)
+            } else folder
+        })
+    }
+
+    /** Copies a picked gallery image into internal app storage so permissions never expire. */
+    fun savePickedCover(folderId: String, sourceUri: android.net.Uri): String? = runCatching {
+        val coverDir = java.io.File(appContext.filesDir, "folder_covers").apply { mkdirs() }
+        coverDir.listFiles()?.forEach { old ->
+            if (old.name.startsWith("${folderId}_")) old.delete()
+        }
+        val dest = java.io.File(coverDir, "${folderId}_${System.currentTimeMillis()}.jpg")
+        appContext.contentResolver.openInputStream(sourceUri)?.use { input ->
+            dest.outputStream().use { output -> input.copyTo(output) }
+        } ?: return null
+        val savedUri = android.net.Uri.fromFile(dest).toString()
+        setFolderCover(folderId, savedUri)
+        savedUri
+    }.getOrNull()
 
     fun moveFolder(folderId: String, newParentId: String?): Boolean {
         if (!CustomFolderTree.canMoveFolder(_folders.value, folderId, newParentId)) return false

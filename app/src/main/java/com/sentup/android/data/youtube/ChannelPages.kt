@@ -78,12 +78,17 @@ internal class ChannelPages(
      */
     suspend fun getChannelPage(channelId: String): ChannelPage? = withContext(Dispatchers.IO) {
         try {
-            val raw = webApi.postWatchApi(
-                "browse",
-                JSONObject().put("context", webApi.webContext()).put("browseId", channelId)
-            ) ?: return@withContext null
-            val root = JSONObject(raw)
-            val header = parseChannelHeader(root, channelId) ?: return@withContext null
+            val payload = JSONObject().put("context", webApi.webContext()).put("browseId", channelId)
+            var raw = webApi.postWatchApi("browse", payload)
+            var root = raw?.let(::JSONObject)
+            var header = root?.let { parseChannelHeader(it, channelId) }
+            if (header == null && sessionManager.isLoggedIn()) {
+                val anonPayload = JSONObject().put("context", webApi.webContext()).put("browseId", channelId)
+                raw = webApi.postWatchApi("browse", anonPayload, session = null)
+                root = raw?.let(::JSONObject)
+                header = root?.let { parseChannelHeader(it, channelId) }
+            }
+            if (root == null || header == null) return@withContext null
             val tabs = parseChannelTabs(root)
             val selected = parseSelectedTab(root)
             val selectedKind = selected?.first ?: ChannelTabKind.HOME
